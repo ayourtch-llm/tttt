@@ -2,6 +2,7 @@ mod error;
 mod handler;
 pub mod notification;
 mod protocol;
+pub mod proxy;
 mod server;
 mod tools;
 

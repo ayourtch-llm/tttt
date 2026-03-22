@@ -26,11 +26,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run as a standalone MCP server (for integration with AI agents)
+    /// Run as an MCP server (for integration with AI agents)
     McpServer {
         /// Working directory for sessions
         #[arg(short, long)]
         workdir: Option<PathBuf>,
+
+        /// Connect to a running tttt instance via Unix socket (proxy mode).
+        /// When set, tool calls are forwarded to the TUI's shared SessionManager.
+        #[arg(short, long)]
+        connect: Option<String>,
     },
 
     /// Attach to a running tttt instance as a viewer
@@ -45,8 +50,12 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.subcommand {
-        Some(Commands::McpServer { workdir }) => {
-            run_standalone_mcp_server(workdir);
+        Some(Commands::McpServer { workdir, connect }) => {
+            if let Some(socket_path) = connect {
+                run_proxy_mcp_server(&socket_path);
+            } else {
+                run_standalone_mcp_server(workdir);
+            }
         }
         Some(Commands::Attach { socket }) => {
             run_attach(socket);
@@ -81,6 +90,17 @@ fn run_tui(cli: Cli) {
         eprintln!("Warning: failed to initialize loggers: {}", e);
     }
 
+    // Start MCP proxy socket listener
+    match app.start_mcp_listener() {
+        Ok(path) => {
+            eprintln!("MCP socket: {}", path);
+            eprintln!("Use with: tttt mcp-server --connect {}", path);
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to start MCP listener: {}", e);
+        }
+    }
+
     // Start viewer socket listener
     match app.start_viewer_listener() {
         Ok(path) => {
@@ -107,8 +127,11 @@ fn run_tui(cli: Cli) {
         std::process::exit(1);
     }
 
-    // Clean up socket
+    // Clean up sockets
     if let Some(ref path) = app.socket_path {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Some(ref path) = app.mcp_socket_path {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -147,6 +170,20 @@ fn find_tttt_socket() -> Option<String> {
         }
     }
     None
+}
+
+/// Proxy MCP server mode — forwards JSON-RPC between Claude (stdio) and tttt TUI (socket).
+fn run_proxy_mcp_server(socket_path: &str) {
+    use tttt_mcp::proxy::run_proxy;
+
+    let stdin = std::io::stdin().lock();
+    let stdout = std::io::stdout().lock();
+    let reader = std::io::BufReader::new(stdin);
+
+    if let Err(e) = run_proxy(reader, stdout, socket_path) {
+        eprintln!("MCP proxy error: {}", e);
+        std::process::exit(1);
+    }
 }
 
 /// Standalone MCP server mode — runs on stdin/stdout with its own session manager.

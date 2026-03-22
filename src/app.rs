@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tttt_log::{Direction, LogEvent, LogSink, MultiLogger, SqliteLogger, TextLogger};
+use tttt_mcp::notification::NotificationRegistry;
 use tttt_pty::{PtySession, RealPty, SessionManager, SessionStatus};
 use tttt_scheduler::{Scheduler, SchedulerEvent};
 use std::os::unix::net::UnixListener;
@@ -96,6 +97,7 @@ pub struct App {
     pane_renderer: PaneRenderer,
     logger: MultiLogger,
     scheduler: Scheduler,
+    notifications: NotificationRegistry,
     active_session: Option<String>,
     session_order: Vec<String>,
     screen_cols: u16,
@@ -106,6 +108,10 @@ pub struct App {
     viewer_clients: Vec<ViewerClient>,
     /// Path to the viewer socket.
     pub socket_path: Option<String>,
+    /// Unix socket listener for MCP proxy connections.
+    mcp_listener: Option<UnixListener>,
+    /// Path to the MCP proxy socket.
+    pub mcp_socket_path: Option<String>,
     /// Whether the server terminal needs a render.
     server_render_dirty: bool,
     /// When the current dirty burst started (for max latency cap).
@@ -127,6 +133,7 @@ impl App {
             pane_renderer: PaneRenderer::new(pty_cols, pty_rows, 1, 1),
             logger: MultiLogger::new(),
             scheduler: Scheduler::new(),
+            notifications: NotificationRegistry::new(),
             active_session: None,
             session_order: Vec::new(),
             screen_cols: cols,
@@ -134,6 +141,8 @@ impl App {
             viewer_listener: None,
             viewer_clients: Vec::new(),
             socket_path: None,
+            mcp_listener: None,
+            mcp_socket_path: None,
             server_render_dirty: false,
             first_dirty_time: None,
             last_pty_data_time: None,
@@ -147,6 +156,18 @@ impl App {
     }
 
     /// Start listening for viewer connections on a Unix socket.
+    /// Start the MCP proxy socket listener.
+    /// Returns the socket path that `tttt mcp-server --connect` should use.
+    pub fn start_mcp_listener(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+        let path = format!("/tmp/tttt-mcp-{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
+        self.mcp_socket_path = Some(path.clone());
+        self.mcp_listener = Some(listener);
+        Ok(path)
+    }
+
     pub fn start_viewer_listener(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         let path = format!("/tmp/tttt-{}.sock", std::process::id());
         // Clean up stale socket
@@ -156,6 +177,30 @@ impl App {
         self.socket_path = Some(path.clone());
         self.viewer_listener = Some(listener);
         Ok(path)
+    }
+
+    /// Generate a temporary MCP config file for the root agent.
+    /// Returns the path to the config file.
+    pub fn generate_mcp_config(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let mcp_socket = self.mcp_socket_path.as_ref()
+            .ok_or("MCP listener not started")?;
+
+        // Find our own binary path
+        let tttt_bin = std::env::current_exe()
+            .unwrap_or_else(|_| std::path::PathBuf::from("tttt"));
+
+        let config = serde_json::json!({
+            "mcpServers": {
+                "tttt": {
+                    "command": tttt_bin.to_string_lossy(),
+                    "args": ["mcp-server", "--connect", mcp_socket]
+                }
+            }
+        });
+
+        let config_path = format!("/tmp/tttt-mcp-config-{}.json", std::process::id());
+        std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+        Ok(config_path)
     }
 
     pub fn init_loggers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -173,9 +218,26 @@ impl App {
     pub fn launch_root(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         let pty_cols = self.screen_cols.saturating_sub(self.config.sidebar_width);
         let pty_rows = self.screen_rows.saturating_sub(1);
-        let args: Vec<&str> = self.config.root_args.iter().map(|s| s.as_str()).collect();
+
+        // If MCP socket is available, generate config and inject --mcp-config
+        // for agents that support it (e.g., claude)
+        let mut args: Vec<String> = self.config.root_args.clone();
+        let mut mcp_config_path: Option<String> = None;
+        if self.mcp_socket_path.is_some() {
+            if let Ok(config_path) = self.generate_mcp_config() {
+                mcp_config_path = Some(config_path.clone());
+                // Check if the command looks like claude and inject --mcp-config
+                let cmd = &self.config.root_command;
+                if cmd.contains("claude") && !args.iter().any(|a| a.contains("mcp-config")) {
+                    args.push("--mcp-config".to_string());
+                    args.push(config_path);
+                }
+            }
+        }
+
+        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let backend = RealPty::spawn_with_cwd(
-            &self.config.root_command, &args, Some(&self.config.work_dir), pty_cols, pty_rows,
+            &self.config.root_command, &args_refs, Some(&self.config.work_dir), pty_cols, pty_rows,
         )?;
         let mut mgr = self.sessions.lock().unwrap();
         let id = mgr.generate_id();
@@ -320,6 +382,9 @@ impl App {
                 }
             }
 
+            // Accept new MCP proxy connections (each runs in its own thread)
+            self.accept_mcp_connections();
+
             // Accept new viewer connections
             self.accept_viewer_connections();
 
@@ -347,6 +412,35 @@ impl App {
                             }
                         }
                     }
+                }
+            }
+
+            // Check notification watchers against all sessions
+            let pending_injections = {
+                let mgr = self.sessions.lock().unwrap();
+                let ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
+                let mut injections = Vec::new();
+                for sid in &ids {
+                    if let Ok(session) = mgr.get(sid) {
+                        let screen_text = session.get_screen();
+                        for inj in self.notifications.check_session(sid, &screen_text) {
+                            injections.push((inj.target_session_id, inj.text));
+                        }
+                    }
+                }
+                injections
+            };
+            // Perform injections (separate lock scope)
+            if !pending_injections.is_empty() {
+                let mut mgr = self.sessions.lock().unwrap();
+                for (target_id, text) in &pending_injections {
+                    if let Ok(session) = mgr.get_mut(target_id) {
+                        let _ = session.send_raw(text.as_bytes());
+                    }
+                    let _ = self.logger.log_event(&LogEvent::new(
+                        target_id.clone(), Direction::Meta,
+                        format!("[NOTIFICATION] {}", text).into_bytes(),
+                    ));
                 }
             }
 
@@ -557,6 +651,41 @@ impl App {
                     if let Ok(session) = mgr.get_mut(session_id) {
                         let _ = session.send_keys(&job.command);
                     }
+                }
+            }
+        }
+    }
+
+    // === MCP proxy management ===
+
+    fn accept_mcp_connections(&mut self) {
+        if let Some(ref listener) = self.mcp_listener {
+            loop {
+                match listener.accept() {
+                    Ok((stream, _addr)) => {
+                        // Each MCP proxy client gets its own thread with a
+                        // CompositeToolHandler backed by the shared session manager.
+                        let sessions = self.sessions.clone();
+                        let work_dir = self.config.work_dir.clone();
+                        std::thread::spawn(move || {
+                            use tttt_mcp::proxy::handle_proxy_client;
+                            use tttt_mcp::{PtyToolHandler, SchedulerToolHandler, CompositeToolHandler};
+                            use tttt_scheduler::Scheduler;
+
+                            let pty_handler = PtyToolHandler::new(sessions, work_dir);
+                            let scheduler_handler = SchedulerToolHandler::new_owned(Scheduler::new());
+                            let mut composite = CompositeToolHandler::new();
+                            composite.add_handler(Box::new(pty_handler));
+                            composite.add_handler(Box::new(scheduler_handler));
+
+                            if let Err(e) = handle_proxy_client(stream, &mut composite, "tttt") {
+                                // Client disconnected or error — normal
+                                let _ = e;
+                            }
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
                 }
             }
         }
