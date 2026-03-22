@@ -32,6 +32,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 # Install Claude Code CLI via npm
 RUN npm install -g @anthropic-ai/claude-code
 
+# Install OpenAI Codex CLI via npm
+RUN npm install -g @openai/codex
+
 # Copy apchat from ghcr.io
 COPY --from=ghcr.io/ayourtch-llm/apchat:latest /usr/local/bin/apchat /usr/local/bin/apchat
 
