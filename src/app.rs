@@ -252,6 +252,27 @@ impl App {
         Ok(id)
     }
 
+    /// Create a new PTY session with the default shell.
+    pub fn create_session(&mut self, stdout_fd: i32) -> Result<(), Box<dyn std::error::Error>> {
+        let pty_cols = self.screen_cols.saturating_sub(self.config.sidebar_width);
+        let pty_rows = self.screen_rows.saturating_sub(1);
+
+        let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let tttt_pid = std::process::id();
+        let backend = RealPty::spawn_with_cwd_and_env(
+            &default_shell, &[], Some(&self.config.work_dir), pty_cols, pty_rows,
+            [("TTTT_PID".to_string(), tttt_pid.to_string())],
+        )?;
+        let mut mgr = self.sessions.lock().unwrap();
+        let id = mgr.generate_id();
+        let session = PtySession::new(id.clone(), backend, default_shell, pty_cols, pty_rows);
+        mgr.add_session(session)?;
+        drop(mgr);
+        self.session_order.push(id.clone());
+        self.switch_to_session(&id, stdout_fd)?;
+        Ok(())
+    }
+
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let _terminal_state = TerminalState::enter_raw_mode();
         let winch = Arc::new(AtomicBool::new(false));
@@ -504,6 +525,9 @@ impl App {
                 }
             }
             InputEvent::Detach => return Ok(false),
+            InputEvent::CreateTerminal => {
+                self.create_session(stdout_fd)?;
+            }
         }
         Ok(true)
     }

@@ -42,6 +42,8 @@ pub enum InputEvent {
     PrefixEscape,
     /// Detach / quit.
     Detach,
+    /// Create a new terminal session.
+    CreateTerminal,
 }
 
 /// State machine for parsing input with prefix-key awareness.
@@ -99,6 +101,12 @@ impl InputParser {
                             events.push(InputEvent::PassThrough(std::mem::take(&mut passthrough)));
                         }
                         events.push(InputEvent::Detach);
+                    }
+                    b'c' | b'C' => {
+                        if !passthrough.is_empty() {
+                            events.push(InputEvent::PassThrough(std::mem::take(&mut passthrough)));
+                        }
+                        events.push(InputEvent::CreateTerminal);
                     }
                     b if b == self.config.prefix_key => {
                         // Double prefix = send literal prefix key
@@ -273,6 +281,20 @@ mod tests {
         let mut p = parser();
         let events = p.process(&input(&[]));
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_prefix_then_c_create_terminal() {
+        let mut p = parser();
+        let events = p.process(&input(&[0x1c, b'c']));
+        assert_eq!(events, vec![InputEvent::CreateTerminal]);
+    }
+
+    #[test]
+    fn test_prefix_then_C_create_terminal_uppercase() {
+        let mut p = parser();
+        let events = p.process(&input(&[0x1c, b'C']));
+        assert_eq!(events, vec![InputEvent::CreateTerminal]);
     }
 
     #[test]
