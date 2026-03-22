@@ -609,8 +609,13 @@ impl App {
             }
         }
 
-        // Remove disconnected clients
+        // Remove disconnected clients and resize if any were removed
+        let count_before = self.viewer_clients.len();
         self.viewer_clients.retain(|c| c.connected);
+        if self.viewer_clients.len() < count_before {
+            // A client disconnected — resize PTY back up if possible
+            self.resize_pty_to_min();
+        }
 
         Ok(())
     }
