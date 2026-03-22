@@ -31,16 +31,52 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Clear screen
     write_fd(stdout_fd, clear_screen().as_bytes());
 
+    // Tell server our terminal size immediately so PTY can be resized
+    {
+        let msg = ClientMsg::Resize { cols: term_cols, rows: term_rows };
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.write_all(&encode_message(&msg));
+        let _ = stream.set_nonblocking(true);
+    }
+
+    // Register SIGWINCH handler for terminal resize
+    let winch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _ = signal_hook::flag::register(libc::SIGWINCH, std::sync::Arc::clone(&winch));
+
+    let mut cur_cols = term_cols;
+    let mut cur_rows = term_rows;
+
     // Virtual screen: absorbs all server updates instantly.
     // Only flushed to real terminal when socket is idle.
-    let mut virtual_screen = vt100::Parser::new(term_rows, term_cols, 0);
-    let mut renderer = PaneRenderer::new(term_cols, term_rows, 1, 1);
+    let mut virtual_screen = vt100::Parser::new(cur_rows, cur_cols, 0);
+    let mut renderer = PaneRenderer::new(cur_cols, cur_rows, 1, 1);
     let mut last_cursor = (0u16, 0u16);
     let mut virtual_dirty = false;
 
     let mut read_buf = Vec::new();
 
     loop {
+        // Handle terminal resize
+        if winch.load(std::sync::atomic::Ordering::Relaxed) {
+            winch.store(false, std::sync::atomic::Ordering::Relaxed);
+            let (new_cols, new_rows) = terminal_size();
+            if new_cols != cur_cols || new_rows != cur_rows {
+                cur_cols = new_cols;
+                cur_rows = new_rows;
+                // Resize virtual screen and renderer
+                virtual_screen = vt100::Parser::new(cur_rows, cur_cols, 0);
+                renderer = PaneRenderer::new(cur_cols, cur_rows, 1, 1);
+                renderer.invalidate();
+                virtual_dirty = true;
+                // Tell server about new size
+                let msg = ClientMsg::Resize { cols: cur_cols, rows: cur_rows };
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.write_all(&encode_message(&msg));
+                let _ = stream.set_nonblocking(true);
+                // Clear screen
+                write_fd(stdout_fd, clear_screen().as_bytes());
+            }
+        }
         let stdin_pfd = PollFd::new(
             unsafe { BorrowedFd::borrow_raw(stdin_fd) },
             PollFlags::POLLIN,

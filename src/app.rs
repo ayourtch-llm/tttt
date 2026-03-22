@@ -595,6 +595,9 @@ impl App {
                             let pty_cols = cols.saturating_sub(self.config.sidebar_width);
                             let pty_rows = rows.saturating_sub(1);
                             self.viewer_clients[i].renderer.resize(pty_cols, pty_rows);
+                            self.viewer_clients[i].invalidate();
+                            // Resize PTY to minimum across all clients (tmux behavior)
+                            self.resize_pty_to_min();
                         }
                         protocol::ClientMsg::Detach => {
                             self.viewer_clients[i].send_goodbye();
@@ -610,6 +613,45 @@ impl App {
         self.viewer_clients.retain(|c| c.connected);
 
         Ok(())
+    }
+
+    /// Resize the PTY to the minimum size across the main terminal and all connected viewers.
+    /// This is the tmux behavior: all clients see the same (smallest) size.
+    fn resize_pty_to_min(&mut self) {
+        let sidebar = self.config.sidebar_width;
+        // Start with main terminal size
+        let mut min_cols = self.screen_cols.saturating_sub(sidebar);
+        let mut min_rows = self.screen_rows.saturating_sub(1);
+
+        // Find minimum across all connected viewers
+        for client in &self.viewer_clients {
+            if !client.connected {
+                continue;
+            }
+            let c = client.cols.saturating_sub(sidebar);
+            let r = client.rows.saturating_sub(1);
+            min_cols = min_cols.min(c);
+            min_rows = min_rows.min(r);
+        }
+
+        // Resize all sessions
+        let mut mgr = self.sessions.lock().unwrap();
+        let ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
+        for id in ids {
+            if let Ok(session) = mgr.get_mut(&id) {
+                let _ = session.resize(min_cols, min_rows);
+            }
+        }
+        drop(mgr);
+
+        // Resize main pane renderer
+        self.pane_renderer.resize(min_cols, min_rows);
+
+        // Resize all viewer renderers and invalidate
+        for client in &mut self.viewer_clients {
+            client.renderer.resize(min_cols, min_rows);
+            client.invalidate();
+        }
     }
 
     fn update_viewers(&mut self) {
