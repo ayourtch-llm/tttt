@@ -22,6 +22,9 @@ pub struct ViewerClient {
     pub read_buf: Vec<u8>,
     /// Whether this client is still connected.
     pub connected: bool,
+    /// Last cursor position sent (to avoid redundant updates).
+    last_cursor_row: u16,
+    last_cursor_col: u16,
 }
 
 impl ViewerClient {
@@ -38,10 +41,13 @@ impl ViewerClient {
             renderer: PaneRenderer::new(pty_cols, pty_rows, 1, 1),
             read_buf: Vec::new(),
             connected: true,
+            last_cursor_row: 0,
+            last_cursor_col: 0,
         }
     }
 
     /// Send a screen update to the client.
+    /// Returns true if data was sent, false if no changes or error.
     pub fn send_screen_update(
         &mut self,
         screen: &vt100::Screen,
@@ -50,6 +56,14 @@ impl ViewerClient {
     ) -> bool {
         let ansi_data = self.renderer.render(screen);
         let (tr, tc) = self.renderer.cursor_terminal_position(cursor_row, cursor_col);
+
+        // Skip sending if nothing changed (empty ansi_data AND same cursor)
+        if ansi_data.is_empty() && tr == self.last_cursor_row && tc == self.last_cursor_col {
+            return true;
+        }
+        self.last_cursor_row = tr;
+        self.last_cursor_col = tc;
+
         let msg = ServerMsg::ScreenUpdate {
             ansi_data,
             cursor_row: tr,

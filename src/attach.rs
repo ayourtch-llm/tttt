@@ -12,16 +12,14 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = UnixStream::connect(socket_path)?;
     stream.set_nonblocking(true)?;
 
-    eprintln!("Connected to tttt at {}", socket_path);
-
-    // Enter raw terminal mode
+    // Enter raw terminal mode BEFORE any output
     let _raw = RawMode::enter();
 
     let stdout_fd = std::io::stdout().as_raw_fd();
     let stdin_fd = std::io::stdin().as_raw_fd();
     let stream_fd = stream.as_raw_fd();
 
-    // Clear screen
+    // Clear screen (must be after raw mode entry)
     write_fd(stdout_fd, clear_screen().as_bytes());
 
     let mut read_buf = Vec::new();
@@ -74,7 +72,7 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 let mut tmp = [0u8; 65536];
                 match stream.read(&mut tmp) {
                     Ok(0) => {
-                        eprintln!("\nServer disconnected.");
+                        break; // server disconnected
                         break;
                     }
                     Ok(n) => {
@@ -86,7 +84,7 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
             if let Some(flags) = fds[1].revents() {
                 if flags.contains(PollFlags::POLLHUP) {
-                    eprintln!("\nServer disconnected.");
+                    break; // server disconnected
                     break;
                 }
             }
@@ -113,8 +111,7 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     // TODO: render sidebar
                 }
                 ServerMsg::Goodbye => {
-                    eprintln!("\nServer shutting down.");
-                    break;
+                    break; // server shutting down
                 }
             }
         }

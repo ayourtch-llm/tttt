@@ -897,6 +897,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "tempfile",
  "toml",
  "tttt-log",
  "tttt-mcp",

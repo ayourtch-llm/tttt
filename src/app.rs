@@ -521,19 +521,35 @@ impl App {
 
     fn accept_viewer_connections(&mut self) {
         if let Some(ref listener) = self.viewer_listener {
-            // Accept all pending connections
             loop {
                 match listener.accept() {
                     Ok((stream, _addr)) => {
+                        // Get the PTY dimensions from the active session
+                        let (pty_cols, pty_rows) = {
+                            let mgr = self.sessions.lock().unwrap();
+                            self.active_session
+                                .as_ref()
+                                .and_then(|id| mgr.get(id).ok())
+                                .map(|s| {
+                                    let m = s.metadata();
+                                    (m.cols, m.rows)
+                                })
+                                .unwrap_or((
+                                    self.screen_cols.saturating_sub(self.config.sidebar_width),
+                                    self.screen_rows.saturating_sub(1),
+                                ))
+                        };
+
                         let mut client = ViewerClient::new(
                             stream,
-                            80, // default, client will send resize
-                            24,
+                            pty_cols + self.config.sidebar_width, // total cols
+                            pty_rows + 1, // total rows
                             self.config.sidebar_width,
                         );
-                        // Set the viewer to watch the root session
+                        // Override renderer to match actual PTY dimensions
+                        client.renderer = PaneRenderer::new(pty_cols, pty_rows, 1, 1);
                         client.active_session = self.active_session.clone();
-                        client.invalidate(); // force full screen on first render
+                        client.invalidate();
                         self.viewer_clients.push(client);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
