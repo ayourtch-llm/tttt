@@ -10,7 +10,7 @@ fn make_real_server(
     let reader = BufReader::new(Cursor::new(input.as_bytes().to_vec()));
     let writer = Vec::new();
     let manager: SessionManager<RealPty> = SessionManager::new();
-    let handler = PtyToolHandler::new(manager, std::path::PathBuf::from("/tmp"));
+    let handler = PtyToolHandler::new_owned(manager, std::path::PathBuf::from("/tmp"));
     McpServer::new(reader, writer, handler)
 }
 
@@ -51,7 +51,7 @@ fn test_mcp_launch_real_pty() {
 
     let result = extract_tool_result(&serde_json::to_value(&resp).unwrap());
     assert_eq!(result["session_id"], "pty-1");
-    assert_eq!(server.handler().manager().session_count(), 1);
+    assert_eq!(server.handler().manager().lock().unwrap().session_count(), 1);
 }
 
 #[test]

@@ -152,7 +152,7 @@ mod tests {
         let reader = std::io::BufReader::new(Cursor::new(input.as_bytes().to_vec()));
         let writer = Vec::new();
         let manager: SessionManager<MockPty> = SessionManager::new();
-        let handler = PtyToolHandler::new(manager, std::path::PathBuf::from("/tmp"));
+        let handler = PtyToolHandler::new_owned(manager, std::path::PathBuf::from("/tmp"));
         McpServer::new(reader, writer, handler)
     }
 

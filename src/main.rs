@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run as an MCP server (for integration with AI agents)
+    /// Run as a standalone MCP server (for integration with AI agents)
     McpServer {
         /// Working directory for sessions
         #[arg(short, long)]
@@ -38,7 +38,7 @@ fn main() {
 
     match cli.subcommand {
         Some(Commands::McpServer { workdir }) => {
-            run_mcp_server(workdir);
+            run_standalone_mcp_server(workdir);
         }
         None => {
             run_tui(cli);
@@ -64,11 +64,23 @@ fn run_tui(cli: Cli) {
         config.work_dir = dir;
     }
 
+    let work_dir = config.work_dir.clone();
     let mut app = app::App::new(config);
 
     if let Err(e) = app.init_loggers() {
         eprintln!("Warning: failed to initialize loggers: {}", e);
     }
+
+    // Start the MCP server thread with the shared session manager.
+    // The MCP server listens on a Unix socket that the root agent can connect to.
+    // For now, we also support the `tttt mcp-server` standalone mode for stdio.
+    let shared_sessions = app.shared_sessions();
+    let _mcp_thread = std::thread::spawn(move || {
+        // The MCP server thread will be activated when we implement
+        // the pipe-based connection from the root agent.
+        // For now, just hold the shared reference.
+        let _sessions = shared_sessions;
+    });
 
     match app.launch_root() {
         Ok(id) => {
@@ -86,7 +98,8 @@ fn run_tui(cli: Cli) {
     }
 }
 
-fn run_mcp_server(workdir: Option<PathBuf>) {
+/// Standalone MCP server mode — runs on stdin/stdout with its own session manager.
+fn run_standalone_mcp_server(workdir: Option<PathBuf>) {
     use tttt_mcp::{McpServer, PtyToolHandler};
     use tttt_pty::{RealPty, SessionManager};
 
@@ -95,7 +108,7 @@ fn run_mcp_server(workdir: Option<PathBuf>) {
     });
 
     let manager: SessionManager<RealPty> = SessionManager::new();
-    let handler = PtyToolHandler::new(manager, work_dir);
+    let handler = PtyToolHandler::new_owned(manager, work_dir);
 
     let stdin = std::io::stdin().lock();
     let stdout = std::io::stdout().lock();

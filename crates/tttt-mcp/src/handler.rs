@@ -1,5 +1,6 @@
 use crate::error::{McpError, Result};
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
 use tttt_pty::{MockPty, PtyBackend, PtySession, SessionManager};
 
 /// Trait for handling MCP tool calls.
@@ -11,16 +12,20 @@ pub trait ToolHandler: Send {
     fn tool_definitions(&self) -> Vec<Value>;
 }
 
-/// Handles PTY-related tool calls by delegating to a SessionManager.
+/// Shared session manager type used by both the TUI and MCP server.
+pub type SharedSessionManager<B> = Arc<Mutex<SessionManager<B>>>;
+
+/// Handles PTY-related tool calls by delegating to a shared SessionManager.
 pub struct PtyToolHandler<B: PtyBackend> {
-    manager: SessionManager<B>,
+    manager: SharedSessionManager<B>,
     work_dir: std::path::PathBuf,
     default_cols: u16,
     default_rows: u16,
 }
 
 impl<B: PtyBackend> PtyToolHandler<B> {
-    pub fn new(manager: SessionManager<B>, work_dir: std::path::PathBuf) -> Self {
+    /// Create a new handler with a shared session manager.
+    pub fn new(manager: SharedSessionManager<B>, work_dir: std::path::PathBuf) -> Self {
         Self {
             manager,
             work_dir,
@@ -29,26 +34,28 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         }
     }
 
-    /// Access the session manager.
-    pub fn manager(&self) -> &SessionManager<B> {
+    /// Create a handler that owns its own session manager (convenience for standalone use).
+    pub fn new_owned(manager: SessionManager<B>, work_dir: std::path::PathBuf) -> Self {
+        Self::new(Arc::new(Mutex::new(manager)), work_dir)
+    }
+
+    /// Access the shared session manager.
+    pub fn manager(&self) -> &SharedSessionManager<B> {
         &self.manager
     }
 
-    /// Access the session manager mutably.
-    pub fn manager_mut(&mut self) -> &mut SessionManager<B> {
-        &mut self.manager
-    }
-
     fn handle_pty_list(&self) -> Result<Value> {
-        let sessions = self.manager.list();
+        let mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let sessions = mgr.list();
         Ok(json!(sessions))
     }
 
-    fn handle_pty_get_screen(&mut self, args: &Value) -> Result<Value> {
+    fn handle_pty_get_screen(&self, args: &Value) -> Result<Value> {
         let session_id = args["session_id"]
             .as_str()
             .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
-        let session = self.manager.get_mut(session_id)?;
+        let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let session = mgr.get_mut(session_id)?;
         session.pump()?;
         let contents = session.get_screen();
         let cursor = session.cursor_position();
@@ -58,7 +65,7 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         }))
     }
 
-    fn handle_pty_send_keys(&mut self, args: &Value) -> Result<Value> {
+    fn handle_pty_send_keys(&self, args: &Value) -> Result<Value> {
         let session_id = args["session_id"]
             .as_str()
             .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
@@ -67,7 +74,8 @@ impl<B: PtyBackend> PtyToolHandler<B> {
             .ok_or_else(|| McpError::InvalidParams("keys required".to_string()))?;
         let raw = args["raw"].as_bool().unwrap_or(false);
 
-        let session = self.manager.get_mut(session_id)?;
+        let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let session = mgr.get_mut(session_id)?;
         if raw {
             session.send_keys(keys)?;
         } else {
@@ -77,24 +85,26 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         Ok(json!({"status": "ok"}))
     }
 
-    fn handle_pty_kill(&mut self, args: &Value) -> Result<Value> {
+    fn handle_pty_kill(&self, args: &Value) -> Result<Value> {
         let session_id = args["session_id"]
             .as_str()
             .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
-        self.manager.kill_session(session_id)?;
+        let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        mgr.kill_session(session_id)?;
         Ok(json!({"status": "ok"}))
     }
 
-    fn handle_pty_get_cursor(&mut self, args: &Value) -> Result<Value> {
+    fn handle_pty_get_cursor(&self, args: &Value) -> Result<Value> {
         let session_id = args["session_id"]
             .as_str()
             .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
-        let session = self.manager.get(session_id)?;
+        let mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let session = mgr.get(session_id)?;
         let (row, col) = session.cursor_position();
         Ok(json!({"row": row, "col": col}))
     }
 
-    fn handle_pty_resize(&mut self, args: &Value) -> Result<Value> {
+    fn handle_pty_resize(&self, args: &Value) -> Result<Value> {
         let session_id = args["session_id"]
             .as_str()
             .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
@@ -104,19 +114,21 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         let rows = args["rows"]
             .as_u64()
             .ok_or_else(|| McpError::InvalidParams("rows required".to_string()))? as u16;
-        let session = self.manager.get_mut(session_id)?;
+        let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let session = mgr.get_mut(session_id)?;
         session.resize(cols, rows)?;
         Ok(json!({"status": "ok"}))
     }
 
-    fn handle_pty_set_scrollback(&mut self, args: &Value) -> Result<Value> {
+    fn handle_pty_set_scrollback(&self, args: &Value) -> Result<Value> {
         let session_id = args["session_id"]
             .as_str()
             .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
         let lines = args["lines"]
             .as_u64()
             .ok_or_else(|| McpError::InvalidParams("lines required".to_string()))? as usize;
-        let session = self.manager.get_mut(session_id)?;
+        let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let session = mgr.get_mut(session_id)?;
         session.set_scrollback(lines);
         Ok(json!({"status": "ok"}))
     }
@@ -124,22 +136,23 @@ impl<B: PtyBackend> PtyToolHandler<B> {
 
 impl PtyToolHandler<MockPty> {
     /// Launch a session using MockPty (for testing).
-    pub fn handle_pty_launch_mock(&mut self, args: &Value) -> Result<Value> {
+    pub fn handle_pty_launch_mock(&self, args: &Value) -> Result<Value> {
         let cols = args["cols"].as_u64().unwrap_or(self.default_cols as u64) as u16;
         let rows = args["rows"].as_u64().unwrap_or(self.default_rows as u64) as u16;
         let command = args["command"].as_str().unwrap_or("bash").to_string();
 
-        let id = self.manager.generate_id();
+        let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let id = mgr.generate_id();
         let mock = MockPty::new(cols, rows);
         let session = PtySession::new(id.clone(), mock, command, cols, rows);
-        self.manager.add_session(session)?;
+        mgr.add_session(session)?;
         Ok(json!({"session_id": id}))
     }
 }
 
 impl PtyToolHandler<tttt_pty::RealPty> {
     /// Launch a real PTY session.
-    pub fn handle_pty_launch_real(&mut self, args: &Value) -> Result<Value> {
+    pub fn handle_pty_launch_real(&self, args: &Value) -> Result<Value> {
         let cols = args["cols"].as_u64().unwrap_or(self.default_cols as u64) as u16;
         let rows = args["rows"].as_u64().unwrap_or(self.default_rows as u64) as u16;
         let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
@@ -162,9 +175,10 @@ impl PtyToolHandler<tttt_pty::RealPty> {
             cols,
             rows,
         )?;
-        let id = self.manager.generate_id();
+        let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let id = mgr.generate_id();
         let session = PtySession::new(id.clone(), backend, command.to_string(), cols, rows);
-        self.manager.add_session(session)?;
+        mgr.add_session(session)?;
         Ok(json!({"session_id": id}))
     }
 }
@@ -257,34 +271,32 @@ mod tests {
     use serde_json::json;
 
     fn make_handler() -> PtyToolHandler<MockPty> {
-        let manager = SessionManager::new();
-        PtyToolHandler::new(manager, std::path::PathBuf::from("/tmp"))
+        PtyToolHandler::new_owned(SessionManager::new(), std::path::PathBuf::from("/tmp"))
     }
 
     fn make_handler_with_session() -> PtyToolHandler<MockPty> {
-        let mut handler = make_handler();
-        handler
-            .handle_pty_launch_mock(&json!({}))
-            .unwrap();
+        let handler = make_handler();
+        handler.handle_pty_launch_mock(&json!({})).unwrap();
         handler
     }
 
     #[test]
     fn test_pty_launch_mock() {
-        let mut handler = make_handler();
+        let handler = make_handler();
         let result = handler.handle_pty_launch_mock(&json!({})).unwrap();
         assert!(result["session_id"].is_string());
-        assert_eq!(handler.manager().session_count(), 1);
+        assert_eq!(handler.manager().lock().unwrap().session_count(), 1);
     }
 
     #[test]
     fn test_pty_launch_custom_dims() {
-        let mut handler = make_handler();
+        let handler = make_handler();
         let result = handler
             .handle_pty_launch_mock(&json!({"cols": 120, "rows": 40}))
             .unwrap();
         let id = result["session_id"].as_str().unwrap();
-        let session = handler.manager().get(id).unwrap();
+        let mgr = handler.manager().lock().unwrap();
+        let session = mgr.get(id).unwrap();
         let meta = session.metadata();
         assert_eq!(meta.cols, 120);
         assert_eq!(meta.rows, 40);
@@ -299,15 +311,16 @@ mod tests {
 
     #[test]
     fn test_pty_list_with_sessions() {
-        let mut handler = make_handler_with_session();
+        let handler = make_handler_with_session();
         let result = handler.handle_pty_list().unwrap();
         assert_eq!(result.as_array().unwrap().len(), 1);
     }
 
     #[test]
     fn test_pty_send_keys() {
-        let mut handler = make_handler_with_session();
-        let id = handler.manager().list()[0].id.clone();
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
         let result = handler.handle_tool_call(
             "pty_send_keys",
             &json!({"session_id": id, "keys": "hello"}),
@@ -317,8 +330,9 @@ mod tests {
 
     #[test]
     fn test_pty_send_keys_raw() {
-        let mut handler = make_handler_with_session();
-        let id = handler.manager().list()[0].id.clone();
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
         let result = handler.handle_tool_call(
             "pty_send_keys",
             &json!({"session_id": id, "keys": "hello", "raw": true}),
@@ -335,8 +349,9 @@ mod tests {
 
     #[test]
     fn test_pty_get_screen() {
-        let mut handler = make_handler_with_session();
-        let id = handler.manager().list()[0].id.clone();
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
         let result = handler
             .handle_tool_call("pty_get_screen", &json!({"session_id": id}))
             .unwrap();
@@ -346,18 +361,20 @@ mod tests {
 
     #[test]
     fn test_pty_kill() {
-        let mut handler = make_handler_with_session();
-        let id = handler.manager().list()[0].id.clone();
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
         handler
             .handle_tool_call("pty_kill", &json!({"session_id": id}))
             .unwrap();
-        assert_eq!(handler.manager().session_count(), 0);
+        assert_eq!(handler.manager().lock().unwrap().session_count(), 0);
     }
 
     #[test]
     fn test_pty_get_cursor() {
-        let mut handler = make_handler_with_session();
-        let id = handler.manager().list()[0].id.clone();
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
         let result = handler
             .handle_tool_call("pty_get_cursor", &json!({"session_id": id}))
             .unwrap();
@@ -367,12 +384,14 @@ mod tests {
 
     #[test]
     fn test_pty_resize() {
-        let mut handler = make_handler_with_session();
-        let id = handler.manager().list()[0].id.clone();
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
         handler
             .handle_tool_call("pty_resize", &json!({"session_id": id, "cols": 100, "rows": 50}))
             .unwrap();
-        let session = handler.manager().get(&id).unwrap();
+        let mgr = handler.manager().lock().unwrap();
+        let session = mgr.get(&id).unwrap();
         let meta = session.metadata();
         assert_eq!(meta.cols, 100);
         assert_eq!(meta.rows, 50);
@@ -380,8 +399,9 @@ mod tests {
 
     #[test]
     fn test_pty_set_scrollback() {
-        let mut handler = make_handler_with_session();
-        let id = handler.manager().list()[0].id.clone();
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
         handler
             .handle_tool_call("pty_set_scrollback", &json!({"session_id": id, "lines": 5000}))
             .unwrap();
@@ -400,7 +420,7 @@ mod tests {
         let handler = make_handler();
         composite.add_handler(Box::new(handler));
         let defs = composite.tool_definitions();
-        assert_eq!(defs.len(), 8); // 8 PTY tools
+        assert_eq!(defs.len(), 8);
     }
 
     #[test]
@@ -419,5 +439,23 @@ mod tests {
         composite.add_handler(Box::new(handler));
         let result = composite.handle_tool_call("nonexistent", &json!({}));
         assert!(matches!(result.unwrap_err(), McpError::ToolNotFound(_)));
+    }
+
+    /// Test that two references to the same handler share state.
+    #[test]
+    fn test_shared_manager() {
+        let shared: SharedSessionManager<MockPty> =
+            Arc::new(Mutex::new(SessionManager::new()));
+
+        let handler = PtyToolHandler::<MockPty>::new(shared.clone(), std::path::PathBuf::from("/tmp"));
+
+        // Launch via handler
+        handler.handle_pty_launch_mock(&json!({})).unwrap();
+
+        // Should be visible through the shared reference
+        assert_eq!(shared.lock().unwrap().session_count(), 1);
+
+        // And through the handler's own reference
+        assert_eq!(handler.manager().lock().unwrap().session_count(), 1);
     }
 }
