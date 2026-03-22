@@ -179,6 +179,29 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 write_fd(stdout_fd, &output);
             }
 
+            // Fill right margin with gray dots if PTY is narrower than terminal
+            let (vrows, vcols) = virtual_screen.screen().size();
+            if vcols < cur_cols {
+                // Gray foreground (dim), dot character
+                let dot_attr = "\x1b[2;90m"; // dim + bright black (gray)
+                let reset = "\x1b[0m";
+                let dots: String = ".".repeat((cur_cols - vcols) as usize);
+                for row in 0..vrows.min(cur_rows) {
+                    write_fd(
+                        stdout_fd,
+                        format!(
+                            "\x1b[{};{}H{}{}{}",
+                            row + 1,
+                            vcols + 1,
+                            dot_attr,
+                            dots,
+                            reset
+                        )
+                        .as_bytes(),
+                    );
+                }
+            }
+
             let new_cursor = (last_cursor.0 + 1, last_cursor.1 + 1);
             write_fd(
                 stdout_fd,
