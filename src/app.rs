@@ -597,7 +597,7 @@ impl App {
                             self.viewer_clients[i].renderer.resize(pty_cols, pty_rows);
                             self.viewer_clients[i].invalidate();
                             // Resize PTY to minimum across all clients (tmux behavior)
-                            self.resize_pty_to_min();
+                            self.resize_pty_to_min_and_redraw(_stdout_fd);
                         }
                         protocol::ClientMsg::Detach => {
                             self.viewer_clients[i].send_goodbye();
@@ -614,15 +614,15 @@ impl App {
         self.viewer_clients.retain(|c| c.connected);
         if self.viewer_clients.len() < count_before {
             // A client disconnected — resize PTY back up if possible
-            self.resize_pty_to_min();
+            self.resize_pty_to_min_and_redraw(_stdout_fd);
         }
 
         Ok(())
     }
 
     /// Resize the PTY to the minimum size across the main terminal and all connected viewers.
-    /// This is the tmux behavior: all clients see the same (smallest) size.
-    fn resize_pty_to_min(&mut self) {
+    /// Clears the main terminal and forces a full redraw to remove stale content.
+    fn resize_pty_to_min_and_redraw(&mut self, stdout_fd: i32) {
         let sidebar = self.config.sidebar_width;
         // Start with main terminal size
         let mut min_cols = self.screen_cols.saturating_sub(sidebar);
@@ -649,8 +649,23 @@ impl App {
         }
         drop(mgr);
 
-        // Resize main pane renderer
+        // Resize main pane renderer and invalidate for full redraw
         self.pane_renderer.resize(min_cols, min_rows);
+
+        // Clear main terminal to remove stale content from the old wider PTY
+        let _ = write_all(stdout_fd, clear_screen().as_bytes());
+
+        // Force full redraw of active session on main terminal
+        {
+            let mut mgr = self.sessions.lock().unwrap();
+            if let Some(ref id) = self.active_session.clone() {
+                if let Ok(session) = mgr.get_mut(id) {
+                    let pane_output = self.pane_renderer.render(session.screen().screen());
+                    let _ = write_all(stdout_fd, &pane_output);
+                }
+            }
+        }
+        let _ = self.render_sidebar(stdout_fd);
 
         // Resize all viewer renderers and invalidate
         for client in &mut self.viewer_clients {
