@@ -33,7 +33,10 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Tell server our terminal size immediately so PTY can be resized
     {
-        let msg = ClientMsg::Resize { cols: term_cols, rows: term_rows };
+        let msg = ClientMsg::Resize {
+            cols: term_cols,
+            rows: term_rows,
+        };
         let _ = stream.set_nonblocking(false);
         let _ = stream.write_all(&encode_message(&msg));
         let _ = stream.set_nonblocking(true);
@@ -55,6 +58,112 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut read_buf = Vec::new();
 
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum PasteMode {
+        None,
+        StartEsc,
+        StartBracket,
+        Start2,
+        Start0,
+        InPaste,
+        EndEsc,
+        EndBracket,
+        End2,
+        End0,
+        End1,
+    }
+
+    fn process_paste_bytes(
+        bytes: &[u8],
+        paste_mode: &mut PasteMode,
+        contains_detach_key: &mut bool,
+    ) {
+        *contains_detach_key = false;
+        for &byte in bytes {
+            match *paste_mode {
+                PasteMode::None => {
+                    if byte == 0x1b {
+                        *paste_mode = PasteMode::StartEsc;
+                    } else if byte == 0x1c {
+                        *contains_detach_key = true;
+                    }
+                }
+                PasteMode::StartEsc => {
+                    if byte == b'[' {
+                        *paste_mode = PasteMode::StartBracket;
+                    } else {
+                        *paste_mode = PasteMode::None;
+                    }
+                }
+                PasteMode::StartBracket => {
+                    if byte == b'2' {
+                        *paste_mode = PasteMode::Start2;
+                    } else {
+                        *paste_mode = PasteMode::None;
+                    }
+                }
+                PasteMode::Start2 => {
+                    if byte == b'0' {
+                        *paste_mode = PasteMode::Start0;
+                    } else {
+                        *paste_mode = PasteMode::None;
+                    }
+                }
+                PasteMode::Start0 => {
+                    if byte == b'0' {
+                        *paste_mode = PasteMode::InPaste;
+                    } else if byte == b'1' {
+                        *paste_mode = PasteMode::End1;
+                    } else {
+                        *paste_mode = PasteMode::None;
+                    }
+                }
+                PasteMode::InPaste => {
+                    if byte == 0x1b {
+                        *paste_mode = PasteMode::EndEsc;
+                    }
+                }
+                PasteMode::EndEsc => {
+                    if byte == b'[' {
+                        *paste_mode = PasteMode::EndBracket;
+                    } else {
+                        *paste_mode = PasteMode::InPaste;
+                    }
+                }
+                PasteMode::EndBracket => {
+                    if byte == b'2' {
+                        *paste_mode = PasteMode::End2;
+                    } else {
+                        *paste_mode = PasteMode::InPaste;
+                    }
+                }
+                PasteMode::End2 => {
+                    if byte == b'0' {
+                        *paste_mode = PasteMode::End0;
+                    } else {
+                        *paste_mode = PasteMode::InPaste;
+                    }
+                }
+                PasteMode::End0 => {
+                    if byte == b'1' {
+                        *paste_mode = PasteMode::End1;
+                    } else {
+                        *paste_mode = PasteMode::InPaste;
+                    }
+                }
+                PasteMode::End1 => {
+                    if byte == b'~' {
+                        *paste_mode = PasteMode::None;
+                    } else {
+                        *paste_mode = PasteMode::InPaste;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut paste_mode = PasteMode::None;
+
     loop {
         // Handle terminal resize
         if winch.load(std::sync::atomic::Ordering::Relaxed) {
@@ -69,7 +178,10 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 renderer.invalidate();
                 virtual_dirty = true;
                 // Tell server about new size
-                let msg = ClientMsg::Resize { cols: cur_cols, rows: cur_rows };
+                let msg = ClientMsg::Resize {
+                    cols: cur_cols,
+                    rows: cur_rows,
+                };
                 let _ = stream.set_nonblocking(false);
                 let _ = stream.write_all(&encode_message(&msg));
                 let _ = stream.set_nonblocking(true);
@@ -95,7 +207,9 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 match nix::unistd::read(stdin_fd, &mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if buf[..n].contains(&0x1c) {
+                        let mut contains_detach_key = false;
+                        process_paste_bytes(&buf[..n], &mut paste_mode, &mut contains_detach_key);
+                        if contains_detach_key {
                             let msg = ClientMsg::Detach;
                             let _ = stream.set_nonblocking(false);
                             let _ = stream.write_all(&encode_message(&msg));
@@ -278,14 +392,11 @@ impl Drop for RawMode {
         // Disable bracketed paste mode before restoring original settings
         let _ = std::io::stdout().write_all(b"\x1b[?2004l");
         let _ = std::io::stdout().flush();
-        
+
         if let Some(ref orig) = self.original {
             let stdin = std::io::stdin();
-            let _ = nix::sys::termios::tcsetattr(
-                &stdin,
-                nix::sys::termios::SetArg::TCSAFLUSH,
-                orig,
-            );
+            let _ =
+                nix::sys::termios::tcsetattr(&stdin, nix::sys::termios::SetArg::TCSAFLUSH, orig);
         }
     }
 }
