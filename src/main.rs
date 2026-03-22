@@ -26,9 +26,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run as an MCP server (for integration with AI agents)
+    /// Run as an MCP proxy server (for integration with AI agents)
+    /// Always connects to a running tttt instance via Unix socket.
     McpServer {
-        /// Working directory for sessions
+        /// Working directory for PTY sessions (when running standalone, not in proxy mode)
         #[arg(short, long)]
         workdir: Option<PathBuf>,
 

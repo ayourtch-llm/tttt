@@ -35,6 +35,9 @@ pub fn run_proxy<R: BufRead, W: Write>(
             continue;
         }
 
+        // Check if this is a notification (no response expected)
+        let is_notification = is_jsonrpc_notification(trimmed);
+
         // Forward request to TUI over socket
         // Protocol: length-prefixed line (4 bytes big-endian + line bytes + newline)
         let line_bytes = trimmed.as_bytes();
@@ -43,12 +46,25 @@ pub fn run_proxy<R: BufRead, W: Write>(
         socket.write_all(line_bytes)?;
         socket.flush()?;
 
+        if is_notification {
+            continue; // Don't wait for response for notifications
+        }
+
         // Read response from TUI
         let mut len_buf = [0u8; 4];
-        socket.read_exact(&mut len_buf)?;
+        match socket.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(Box::new(e)),
+        }
         let resp_len = u32::from_be_bytes(len_buf) as usize;
+        
         let mut resp_buf = vec![0u8; resp_len];
-        socket.read_exact(&mut resp_buf)?;
+        match socket.read_exact(&mut resp_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(Box::new(e)),
+        }
 
         // Write response to Claude
         writer.write_all(&resp_buf)?;
@@ -57,6 +73,12 @@ pub fn run_proxy<R: BufRead, W: Write>(
     }
 
     Ok(())
+}
+
+/// Check if a JSON-RPC request is a notification (id is null or missing)
+fn is_jsonrpc_notification(line: &str) -> bool {
+    // Quick check: look for "id":null or "id": null
+    line.contains("\"id\":null") || line.contains("\"id\": null")
 }
 
 /// Server-side handler: reads proxied requests from a Unix socket,

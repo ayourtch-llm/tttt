@@ -98,6 +98,18 @@ impl RealPty {
             .as_raw_fd()
             .ok_or_else(|| PtyError::Spawn("failed to get PTY raw fd".to_string()))?;
 
+        // Set the PTY master fd to non-blocking mode so reads return immediately
+        // when no data is available (returns EAGAIN/EWOULDBLOCK).
+        #[cfg(unix)]
+        {
+            use nix::fcntl::{fcntl, FcntlArg};
+            use nix::sys::stat::{Mode, SFlag};
+            let flags = fcntl(reader_raw_fd, FcntlArg::F_GETFL)
+                .map_err(|e| PtyError::Spawn(format!("fcntl F_GETFL failed: {}", e)))?;
+            fcntl(reader_raw_fd, FcntlArg::F_SETFL(nix::fcntl::OFlag::from_bits(flags).unwrap() | nix::fcntl::OFlag::O_NONBLOCK))
+                .map_err(|e| PtyError::Spawn(format!("fcntl F_SETFL failed: {}", e)))?;
+        }
+
         let writer = pair
             .master
             .take_writer()

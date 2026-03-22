@@ -7,6 +7,7 @@ members = [
     "crates/tttt-tui",
     "crates/tttt-scheduler",
     "crates/tttt-sandbox",
+    "crates/tttt-mcp-tester",
 ]
 resolver = "2"
 

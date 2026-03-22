@@ -677,6 +677,9 @@ impl App {
                             use tttt_mcp::{PtyToolHandler, SchedulerToolHandler, NotificationToolHandler, CompositeToolHandler};
                             use tttt_scheduler::Scheduler;
 
+                            // Set the stream to blocking mode for the handler
+                            let _ = stream.set_nonblocking(false);
+                            
                             let pty_handler = PtyToolHandler::new(sessions.clone(), work_dir);
                             let scheduler_handler = SchedulerToolHandler::new_owned(Scheduler::new());
                             let notif_handler = NotificationToolHandler::new(notifications, sessions);
