@@ -223,6 +223,74 @@ Current: text + SQLite logging exists but not wired into the event loop.
     - Enables: full replay, scrollback beyond vt100 buffer
     - Tests: run command with large output, verify full output in log
 
+### Phase E: Multi-client viewer (tttt attach)
+
+**Goal:** Additional terminals can connect to a running tttt instance, like `tmux attach`.
+
+The architecture already supports this because:
+- `SessionManager` is `Arc<Mutex<>>` — multiple viewers can read sessions
+- `PaneRenderer` is per-viewer — each client gets its own dirty-tracking
+- `InputParser` is per-viewer — each client has independent prefix-key state
+
+**Model:**
+```
+tttt server (one process, owns all sessions + PTYs)
+  ├── Client 0: main terminal (started tttt)
+  │   └── viewing: pty-1 (root agent)
+  ├── Client 1: tttt attach
+  │   └── viewing: pty-3 (executor B)
+  └── Client 2: tttt attach
+      └── viewing: pty-2 (executor A)
+```
+
+Each client independently:
+- Has its own screen size, PaneRenderer, sidebar
+- Switches sessions with prefix key
+- Types into the currently viewed session
+- Sees all sessions in sidebar
+
+**MVP (E1):** Simple viewer that shows the root agent session only.
+- `tttt attach` connects to running instance via Unix socket
+- Server sends screen updates (rendered cells or raw vt100 screen dump)
+- Client sends keystrokes (forwarded to root agent PTY)
+- Client inherits its own terminal size (may differ from server's terminal)
+- Tests: connect, receive screen, send keys, disconnect cleanly
+
+**Full (E2):** Independent session switching per client.
+- Each client has own `active_session`, InputParser, PaneRenderer
+- Prefix-key switching is per-client
+- Sidebar shows all sessions, highlights client's active one
+- Tests: two clients viewing different sessions, keys go to correct PTY
+
+15. **E1: Viewer protocol**
+    - Server-side: `ClientConnection` struct per connected viewer
+    - Each has: socket fd, screen size, active_session, PaneRenderer
+    - Server renders to each client independently
+    - Protocol: length-prefixed JSON messages
+      - Server → Client: `ScreenUpdate { cells, cursor, sidebar }`
+      - Server → Client: `SessionListUpdate { sessions }`
+      - Client → Server: `KeyInput { bytes }`
+      - Client → Server: `SwitchSession { session_id }` (full version)
+      - Client → Server: `Resize { cols, rows }`
+    - Tests: protocol serialization roundtrip, connect/disconnect
+
+16. **E2: `tttt attach` subcommand**
+    - Discovers running instance (socket path from PID file or known location)
+    - Enters raw terminal mode (same as main client)
+    - Polls: socket (screen updates) + stdin (keystrokes)
+    - Renders screen updates to its own terminal
+    - Forwards keystrokes to server
+    - Clean disconnect on Ctrl+\ d (detach) or socket close
+    - Tests: launch server, attach client, verify screen content, send keys
+
+17. **E3: Server-side client management**
+    - Main event loop polls: stdin + all PTY fds + all client sockets
+    - New client connection → create ClientConnection, send initial screen
+    - Client disconnect → remove ClientConnection
+    - PTY output → render to all clients viewing that session
+    - Client keystroke → forward to the session that client is viewing
+    - Tests: multiple clients, independent views, one client disconnects without affecting others
+
 ---
 
 ## Files to create/modify per phase
@@ -265,6 +333,16 @@ MOD:  src/app.rs                      — Full output stream logging for all ses
 NEW:  tests/capture.rs               — Capture and full logging tests
 ```
 
+### Phase E
+```
+NEW:  crates/tttt-tui/src/client.rs    — ClientConnection struct, viewer protocol
+NEW:  crates/tttt-tui/src/protocol.rs  — Wire protocol (ServerMsg, ClientMsg)
+MOD:  src/app.rs                       — Poll client sockets, render to clients, forward keys
+MOD:  src/main.rs                      — `tttt attach` subcommand
+NEW:  src/attach.rs                    — Attach client logic (connect, raw mode, poll loop)
+NEW:  tests/multi_client.rs           — Multi-client viewer tests
+```
+
 ---
 
 ## Test strategy per phase
@@ -275,5 +353,6 @@ Each phase adds integration tests that verify the end-to-end flow:
 - **Phase B tests:** "Register notification → executor output matches → root agent receives injection"
 - **Phase C tests:** "Root agent calls tui_switch → TUI active session changes"
 - **Phase D tests:** "Start capture → run command → stop capture → file has full output"
+- **Phase E tests:** "Start server → attach client → client receives screen → client sends keys → keys reach PTY → second client attaches → views different session"
 
-Total estimated new tests: ~60-80 across all phases.
+Total estimated new tests: ~80-100 across all phases.
