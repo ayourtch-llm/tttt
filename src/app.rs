@@ -6,7 +6,9 @@ use std::sync::Arc;
 use tttt_log::{Direction, LogEvent, LogSink, MultiLogger, SqliteLogger, TextLogger};
 use tttt_pty::{PtySession, RealPty, SessionManager, SessionStatus};
 use tttt_scheduler::{Scheduler, SchedulerEvent};
-use tttt_tui::{clear_screen, cursor_goto, InputEvent, InputParser, RawInput, SidebarRenderer};
+use tttt_tui::{
+    clear_screen, cursor_goto, InputEvent, InputParser, PaneRenderer, RawInput, SidebarRenderer,
+};
 
 /// Terminal state saved/restored around raw mode.
 struct TerminalState {
@@ -89,6 +91,7 @@ pub struct App {
     sessions: SessionManager<RealPty>,
     input_parser: InputParser,
     sidebar: SidebarRenderer,
+    pane_renderer: PaneRenderer,
     logger: MultiLogger,
     scheduler: Scheduler,
     active_session: Option<String>,
@@ -101,11 +104,14 @@ impl App {
     pub fn new(config: Config) -> Self {
         let display_config = config.display_config();
         let (cols, rows) = terminal_size();
+        let pty_cols = cols.saturating_sub(config.sidebar_width);
+        let pty_rows = rows.saturating_sub(1); // status line
 
         Self {
             sessions: SessionManager::with_max_sessions(config.max_sessions),
             input_parser: InputParser::new(display_config),
             sidebar: SidebarRenderer::new(config.sidebar_width),
+            pane_renderer: PaneRenderer::new(pty_cols, pty_rows, 1, 1),
             logger: MultiLogger::new(),
             scheduler: Scheduler::new(),
             active_session: None,
@@ -198,18 +204,20 @@ impl App {
                 self.handle_resize(stdout_fd)?;
             }
 
-            // Read PTY output (like prompter: read directly from fd, feed to parser)
+            // Read PTY output and render using cell-by-cell PaneRenderer
             if let Some(flags) = poll_result.0 {
                 if flags.contains(PollFlags::POLLIN) {
                     if let Some(id) = self.active_session.clone() {
-                        // Pump and collect rendering data, then release borrow
+                        // Pump session, get screen reference for rendering
                         let render_data = if let Ok(session) = self.sessions.get_mut(&id) {
                             match session.pump() {
                                 Ok(n) if n > 0 => {
-                                    let diff = session.screen_diff();
+                                    // Render cells from vt100 screen to terminal
+                                    let pane_output =
+                                        self.pane_renderer.render(session.screen().screen());
                                     let cursor = session.cursor_position();
-                                    if !diff.is_empty() {
-                                        Some((diff, cursor))
+                                    if !pane_output.is_empty() {
+                                        Some((pane_output, cursor))
                                     } else {
                                         None
                                     }
@@ -219,14 +227,15 @@ impl App {
                         } else {
                             None
                         };
-                        // Now render without holding session borrow
-                        if let Some((diff, (row, col))) = render_data {
-                            write_all(stdout_fd, cursor_goto(1, 1).as_bytes())?;
-                            write_all(stdout_fd, &diff)?;
+                        if let Some((pane_output, (row, col))) = render_data {
+                            write_all(stdout_fd, &pane_output)?;
                             self.render_sidebar(stdout_fd)?;
+                            // Restore cursor to PTY position (converted to terminal coords)
+                            let (term_row, term_col) =
+                                self.pane_renderer.cursor_terminal_position(row, col);
                             write_all(
                                 stdout_fd,
-                                cursor_goto(row + 1, col + 1).as_bytes(),
+                                cursor_goto(term_row, term_col).as_bytes(),
                             )?;
                         }
                     }
@@ -333,11 +342,16 @@ impl App {
         if self.sessions.exists(id) {
             self.active_session = Some(id.to_string());
             write_all(stdout_fd, clear_screen().as_bytes())?;
-            self.render_sidebar(stdout_fd)?;
+            self.pane_renderer.invalidate(); // force full redraw
             if let Ok(session) = self.sessions.get_mut(id) {
-                let formatted = session.get_screen_formatted();
-                write_all(stdout_fd, cursor_goto(1, 1).as_bytes())?;
-                write_all(stdout_fd, &formatted)?;
+                let pane_output = self.pane_renderer.render(session.screen().screen());
+                write_all(stdout_fd, &pane_output)?;
+                let (row, col) = session.cursor_position();
+                let (tr, tc) = self.pane_renderer.cursor_terminal_position(row, col);
+                self.render_sidebar(stdout_fd)?;
+                write_all(stdout_fd, cursor_goto(tr, tc).as_bytes())?;
+            } else {
+                self.render_sidebar(stdout_fd)?;
             }
         }
         Ok(())
@@ -435,6 +449,9 @@ impl App {
         let pty_cols = cols.saturating_sub(self.config.sidebar_width);
         let pty_rows = rows.saturating_sub(1);
 
+        // Resize pane renderer
+        self.pane_renderer.resize(pty_cols, pty_rows);
+
         // Resize all sessions
         let ids: Vec<String> = self.sessions.list().iter().map(|m| m.id.clone()).collect();
         for id in ids {
@@ -443,17 +460,15 @@ impl App {
             }
         }
 
-        // Redraw
+        // Full redraw
         write_all(stdout_fd, clear_screen().as_bytes())?;
-        self.render_sidebar(stdout_fd)?;
-
         if let Some(ref id) = self.active_session.clone() {
             if let Ok(session) = self.sessions.get_mut(id) {
-                let formatted = session.get_screen_formatted();
-                write_all(stdout_fd, cursor_goto(1, 1).as_bytes())?;
-                write_all(stdout_fd, &formatted)?;
+                let pane_output = self.pane_renderer.render(session.screen().screen());
+                write_all(stdout_fd, &pane_output)?;
             }
         }
+        self.render_sidebar(stdout_fd)?;
 
         Ok(())
     }
