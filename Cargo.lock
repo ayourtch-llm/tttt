@@ -904,6 +904,7 @@ dependencies = [
  "tttt-sandbox",
  "tttt-scheduler",
  "tttt-tui",
+ "vt100",
 ]
 
 [[package]]
