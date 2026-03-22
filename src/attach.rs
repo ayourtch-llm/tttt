@@ -371,6 +371,65 @@ mod tests {
         process_paste_bytes(&[0x1c], &mut paste_mode, &mut contains_detach_key);
         assert!(contains_detach_key);
     }
+
+    #[test]
+    fn test_invalid_end_sequence_during_paste() {
+        let mut paste_mode = PasteMode::None;
+        let mut contains_detach_key = false;
+
+        // Start paste: \x1b[200~
+        process_paste_bytes(
+            &[0x1b, b'[', b'2', b'0', b'0', b'~'],
+            &mut paste_mode,
+            &mut contains_detach_key,
+        );
+        assert_eq!(paste_mode, PasteMode::InPaste);
+
+        // Invalid end sequence: \x1b[201x (x != ~)
+        process_paste_bytes(
+            &[0x1b, b'[', b'2', b'0', b'1', b'x'],
+            &mut paste_mode,
+            &mut contains_detach_key,
+        );
+        assert_eq!(
+            paste_mode,
+            PasteMode::InPaste,
+            "Should still be in paste mode after invalid end sequence"
+        );
+
+        // Prefix key should NOT trigger detach
+        process_paste_bytes(&[0x1c], &mut paste_mode, &mut contains_detach_key);
+        assert!(
+            !contains_detach_key,
+            "Prefix key in paste should not trigger detach"
+        );
+    }
+
+    #[test]
+    fn test_end_sequence_split_across_reads() {
+        let mut paste_mode = PasteMode::None;
+        let mut contains_detach_key = false;
+
+        // Start paste
+        process_paste_bytes(
+            &[0x1b, b'[', b'2', b'0', b'0', b'~'],
+            &mut paste_mode,
+            &mut contains_detach_key,
+        );
+        assert_eq!(paste_mode, PasteMode::InPaste);
+
+        // End sequence split: \x1b[201 in one read
+        process_paste_bytes(
+            &[0x1b, b'[', b'2', b'0', b'1'],
+            &mut paste_mode,
+            &mut contains_detach_key,
+        );
+        assert_eq!(paste_mode, PasteMode::End1);
+
+        // ~ in next read
+        process_paste_bytes(&[b'~'], &mut paste_mode, &mut contains_detach_key);
+        assert_eq!(paste_mode, PasteMode::None);
+    }
 }
 
 /// Run the attach client.
