@@ -35,6 +35,9 @@ RUN npm install -g @anthropic-ai/claude-code
 # Install OpenAI Codex CLI via npm
 RUN npm install -g @openai/codex
 
+# Install Google Gemini CLI via npm
+RUN npm install -g @google/gemini-cli
+
 # Copy apchat from ghcr.io
 COPY --from=ghcr.io/ayourtch-llm/apchat:latest /usr/local/bin/apchat /usr/local/bin/apchat
 
