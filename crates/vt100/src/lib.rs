@@ -54,6 +54,9 @@ mod row;
 mod screen;
 mod term;
 
+#[cfg(test)]
+mod grid_test;
+
 pub use attrs::Color;
 pub use cell::Cell;
 pub use parser::Parser;

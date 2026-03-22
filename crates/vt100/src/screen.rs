@@ -1643,6 +1643,9 @@ impl vte::Perform for Screen {
                     params,
                     self.grid().size(),
                 )),
+                // CSI s = SCOSC (Save Cursor), CSI u = SCORC (Restore Cursor)
+                's' => self.save_cursor(),
+                'u' => self.restore_cursor(),
                 _ => {
                     if log::log_enabled!(log::Level::Debug) {
                         log::debug!(
