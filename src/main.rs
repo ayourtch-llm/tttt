@@ -1,4 +1,5 @@
 mod app;
+mod attach;
 mod config;
 
 use clap::{Parser, Subcommand};
@@ -31,6 +32,13 @@ enum Commands {
         #[arg(short, long)]
         workdir: Option<PathBuf>,
     },
+
+    /// Attach to a running tttt instance as a viewer
+    Attach {
+        /// Socket path (default: auto-detect from /tmp/tttt-*.sock)
+        #[arg(short, long)]
+        socket: Option<String>,
+    },
 }
 
 fn main() {
@@ -39,6 +47,9 @@ fn main() {
     match cli.subcommand {
         Some(Commands::McpServer { workdir }) => {
             run_standalone_mcp_server(workdir);
+        }
+        Some(Commands::Attach { socket }) => {
+            run_attach(socket);
         }
         None => {
             run_tui(cli);
@@ -64,23 +75,22 @@ fn run_tui(cli: Cli) {
         config.work_dir = dir;
     }
 
-    let work_dir = config.work_dir.clone();
     let mut app = app::App::new(config);
 
     if let Err(e) = app.init_loggers() {
         eprintln!("Warning: failed to initialize loggers: {}", e);
     }
 
-    // Start the MCP server thread with the shared session manager.
-    // The MCP server listens on a Unix socket that the root agent can connect to.
-    // For now, we also support the `tttt mcp-server` standalone mode for stdio.
-    let shared_sessions = app.shared_sessions();
-    let _mcp_thread = std::thread::spawn(move || {
-        // The MCP server thread will be activated when we implement
-        // the pipe-based connection from the root agent.
-        // For now, just hold the shared reference.
-        let _sessions = shared_sessions;
-    });
+    // Start viewer socket listener
+    match app.start_viewer_listener() {
+        Ok(path) => {
+            eprintln!("Viewer socket: {}", path);
+            eprintln!("Connect with: tttt attach -s {}", path);
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to start viewer listener: {}", e);
+        }
+    }
 
     match app.launch_root() {
         Ok(id) => {
@@ -96,6 +106,47 @@ fn run_tui(cli: Cli) {
         eprintln!("\nError: {}", e);
         std::process::exit(1);
     }
+
+    // Clean up socket
+    if let Some(ref path) = app.socket_path {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn run_attach(socket: Option<String>) {
+    let socket_path = match socket {
+        Some(s) => s,
+        None => {
+            // Auto-detect: find /tmp/tttt-*.sock
+            match find_tttt_socket() {
+                Some(path) => path,
+                None => {
+                    eprintln!("No running tttt instance found. Specify socket with -s.");
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+
+    if let Err(e) = attach::run_attach(&socket_path) {
+        eprintln!("Attach error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn find_tttt_socket() -> Option<String> {
+    let read_dir = std::fs::read_dir("/tmp").ok()?;
+    for entry in read_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("tttt-") && name.ends_with(".sock") {
+            let path = entry.path().to_string_lossy().to_string();
+            // Check if socket is alive by trying to connect
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 /// Standalone MCP server mode — runs on stdin/stdout with its own session manager.

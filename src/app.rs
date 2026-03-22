@@ -6,8 +6,10 @@ use std::sync::{Arc, Mutex};
 use tttt_log::{Direction, LogEvent, LogSink, MultiLogger, SqliteLogger, TextLogger};
 use tttt_pty::{PtySession, RealPty, SessionManager, SessionStatus};
 use tttt_scheduler::{Scheduler, SchedulerEvent};
+use std::os::unix::net::UnixListener;
 use tttt_tui::{
-    clear_screen, cursor_goto, InputEvent, InputParser, PaneRenderer, RawInput, SidebarRenderer,
+    clear_screen, cursor_goto, protocol, InputEvent, InputParser, PaneRenderer, RawInput,
+    SessionInfo, SidebarRenderer, ViewerClient,
 };
 
 /// Terminal state saved/restored around raw mode.
@@ -92,6 +94,12 @@ pub struct App {
     session_order: Vec<String>,
     screen_cols: u16,
     screen_rows: u16,
+    /// Unix socket listener for viewer connections.
+    viewer_listener: Option<UnixListener>,
+    /// Connected viewer clients.
+    viewer_clients: Vec<ViewerClient>,
+    /// Path to the viewer socket.
+    pub socket_path: Option<String>,
 }
 
 impl App {
@@ -111,6 +119,9 @@ impl App {
             session_order: Vec::new(),
             screen_cols: cols,
             screen_rows: rows,
+            viewer_listener: None,
+            viewer_clients: Vec::new(),
+            socket_path: None,
             config,
         }
     }
@@ -118,6 +129,18 @@ impl App {
     /// Get a shared reference to the session manager (for the MCP server thread).
     pub fn shared_sessions(&self) -> Arc<Mutex<SessionManager<RealPty>>> {
         self.sessions.clone()
+    }
+
+    /// Start listening for viewer connections on a Unix socket.
+    pub fn start_viewer_listener(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+        let path = format!("/tmp/tttt-{}.sock", std::process::id());
+        // Clean up stale socket
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
+        self.socket_path = Some(path.clone());
+        self.viewer_listener = Some(listener);
+        Ok(path)
     }
 
     pub fn init_loggers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -251,6 +274,15 @@ impl App {
                     }
                 }
             }
+
+            // Accept new viewer connections
+            self.accept_viewer_connections();
+
+            // Process viewer client input
+            self.process_viewer_input(stdout_fd)?;
+
+            // Send screen updates to all viewers
+            self.update_viewers();
 
             // Pump all non-active sessions to keep screens updated and log output
             {
@@ -480,6 +512,100 @@ impl App {
                     if let Ok(session) = mgr.get_mut(session_id) {
                         let _ = session.send_keys(&job.command);
                     }
+                }
+            }
+        }
+    }
+
+    // === Viewer client management ===
+
+    fn accept_viewer_connections(&mut self) {
+        if let Some(ref listener) = self.viewer_listener {
+            // Accept all pending connections
+            loop {
+                match listener.accept() {
+                    Ok((stream, _addr)) => {
+                        let mut client = ViewerClient::new(
+                            stream,
+                            80, // default, client will send resize
+                            24,
+                            self.config.sidebar_width,
+                        );
+                        // Set the viewer to watch the root session
+                        client.active_session = self.active_session.clone();
+                        client.invalidate(); // force full screen on first render
+                        self.viewer_clients.push(client);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    fn process_viewer_input(&mut self, _stdout_fd: i32) -> Result<(), Box<dyn std::error::Error>> {
+        for i in 0..self.viewer_clients.len() {
+            if !self.viewer_clients[i].connected {
+                continue;
+            }
+            self.viewer_clients[i].read_available();
+
+            // Process all complete messages in the buffer
+            loop {
+                let buf = &self.viewer_clients[i].read_buf;
+                if let Some((msg, consumed)) = protocol::decode_message::<protocol::ClientMsg>(buf)
+                {
+                    self.viewer_clients[i].read_buf.drain(..consumed);
+                    match msg {
+                        protocol::ClientMsg::KeyInput { bytes } => {
+                            // Forward keystrokes to the viewer's active session
+                            if let Some(ref sid) = self.viewer_clients[i].active_session.clone() {
+                                let mut mgr = self.sessions.lock().unwrap();
+                                if let Ok(session) = mgr.get_mut(sid) {
+                                    let _ = session.send_raw(&bytes);
+                                }
+                            }
+                        }
+                        protocol::ClientMsg::SwitchSession { session_id } => {
+                            if self.sessions.lock().unwrap().exists(&session_id) {
+                                self.viewer_clients[i].active_session =
+                                    Some(session_id);
+                                self.viewer_clients[i].invalidate();
+                            }
+                        }
+                        protocol::ClientMsg::Resize { cols, rows } => {
+                            self.viewer_clients[i].cols = cols;
+                            self.viewer_clients[i].rows = rows;
+                            let pty_cols = cols.saturating_sub(self.config.sidebar_width);
+                            let pty_rows = rows.saturating_sub(1);
+                            self.viewer_clients[i].renderer.resize(pty_cols, pty_rows);
+                        }
+                        protocol::ClientMsg::Detach => {
+                            self.viewer_clients[i].send_goodbye();
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Remove disconnected clients
+        self.viewer_clients.retain(|c| c.connected);
+
+        Ok(())
+    }
+
+    fn update_viewers(&mut self) {
+        let mgr = self.sessions.lock().unwrap();
+        for client in &mut self.viewer_clients {
+            if !client.connected {
+                continue;
+            }
+            if let Some(ref sid) = client.active_session.clone() {
+                if let Ok(session) = mgr.get(sid) {
+                    let (row, col) = session.cursor_position();
+                    client.send_screen_update(session.screen().screen(), row, col);
                 }
             }
         }

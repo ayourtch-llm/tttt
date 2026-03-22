@@ -966,7 +966,10 @@ name = "tttt-tui"
 version = "0.1.0"
 dependencies = [
  "nix 0.29.0",
+ "serde",
+ "serde_json",
  "signal-hook",
+ "tempfile",
  "thiserror 2.0.18",
  "tttt-pty",
  "vt100",
