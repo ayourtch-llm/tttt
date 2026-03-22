@@ -668,6 +668,28 @@ impl App {
                 }
             }
         }
+        // Fill gap between PTY area and sidebar with gray dots
+        let max_pty_cols = self.screen_cols.saturating_sub(self.config.sidebar_width);
+        if min_cols < max_pty_cols {
+            let dot_attr = "\x1b[2;90m"; // dim + gray
+            let reset = "\x1b[0m";
+            let dots: String = ".".repeat((max_pty_cols - min_cols) as usize);
+            for row in 0..min_rows {
+                let _ = write_all(
+                    stdout_fd,
+                    format!(
+                        "\x1b[{};{}H{}{}{}",
+                        row + 1,
+                        min_cols + 1,
+                        dot_attr,
+                        dots,
+                        reset
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+
         let _ = self.render_sidebar(stdout_fd);
 
         // Resize all viewer renderers and invalidate
