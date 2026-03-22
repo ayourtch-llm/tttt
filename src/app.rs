@@ -3,6 +3,7 @@ use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tttt_log::{Direction, LogEvent, LogSink, MultiLogger, SqliteLogger, TextLogger};
 use tttt_pty::{PtySession, RealPty, SessionManager, SessionStatus};
 use tttt_scheduler::{Scheduler, SchedulerEvent};
@@ -11,6 +12,11 @@ use tttt_tui::{
     clear_screen, cursor_goto, protocol, InputEvent, InputParser, PaneRenderer, RawInput,
     SessionInfo, SidebarRenderer, ViewerClient,
 };
+
+/// Minimum time between renders to the server terminal (ms).
+/// During rapid updates (e.g., Claude Code redrawing history),
+/// we accumulate changes and only render once the burst settles.
+const RENDER_DEBOUNCE_MS: u64 = 50;
 
 /// Terminal state saved/restored around raw mode.
 struct TerminalState {
@@ -100,6 +106,12 @@ pub struct App {
     viewer_clients: Vec<ViewerClient>,
     /// Path to the viewer socket.
     pub socket_path: Option<String>,
+    /// Whether the server terminal needs a render.
+    server_render_dirty: bool,
+    /// When the current dirty burst started (for max latency cap).
+    first_dirty_time: Option<Instant>,
+    /// When the last PTY data was received (for burst-end detection).
+    last_pty_data_time: Option<Instant>,
 }
 
 impl App {
@@ -122,6 +134,9 @@ impl App {
             viewer_listener: None,
             viewer_clients: Vec::new(),
             socket_path: None,
+            server_render_dirty: false,
+            first_dirty_time: None,
+            last_pty_data_time: None,
             config,
         }
     }
@@ -193,16 +208,19 @@ impl App {
             let stdin_pfd = PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(stdin_fd) }, PollFlags::POLLIN,
             );
+            // Shorter poll timeout when we have a pending render (for debounce responsiveness)
+            let poll_timeout_ms = if self.server_render_dirty { 10u16 } else { 100u16 };
+
             let poll_result = if let Some(pty_raw_fd) = pty_fd {
                 let pty_pfd = PollFd::new(
                     unsafe { BorrowedFd::borrow_raw(pty_raw_fd) }, PollFlags::POLLIN,
                 );
                 let mut fds = [pty_pfd, stdin_pfd];
-                let _ = poll(&mut fds, PollTimeout::from(100u16));
+                let _ = poll(&mut fds, PollTimeout::from(poll_timeout_ms));
                 (fds[0].revents(), fds[1].revents())
             } else {
                 let mut fds = [stdin_pfd];
-                let _ = poll(&mut fds, PollTimeout::from(100u16));
+                let _ = poll(&mut fds, PollTimeout::from(poll_timeout_ms));
                 (None, fds[0].revents())
             };
 
@@ -211,27 +229,53 @@ impl App {
                 self.handle_resize(stdout_fd)?;
             }
 
-            // Read PTY output and render
+            // Read PTY output — pump into screen buffer but defer rendering
             if let Some(flags) = poll_result.0 {
                 if flags.contains(PollFlags::POLLIN) {
                     if let Some(id) = self.active_session.clone() {
-                        let render_data = {
-                            let mut mgr = self.sessions.lock().unwrap();
-                            if let Ok(session) = mgr.get_mut(&id) {
-                                match session.pump_raw() {
-                                    Ok((n, raw_bytes)) if n > 0 => {
-                                        // Log the raw output
-                                        let _ = self.logger.log_event(&LogEvent::new(
-                                            id.clone(), Direction::Output, raw_bytes,
-                                        ));
-                                        let pane_output = self.pane_renderer.render(session.screen().screen());
-                                        let cursor = session.cursor_position();
-                                        // Always return cursor position — even if no cells changed
-                                        // (e.g., arrow keys move cursor without changing content)
-                                        Some((pane_output, cursor))
+                        let mut mgr = self.sessions.lock().unwrap();
+                        if let Ok(session) = mgr.get_mut(&id) {
+                            match session.pump_raw() {
+                                Ok((n, raw_bytes)) if n > 0 => {
+                                    let _ = self.logger.log_event(&LogEvent::new(
+                                        id.clone(), Direction::Output, raw_bytes,
+                                    ));
+                                    let now = Instant::now();
+                                    if !self.server_render_dirty {
+                                        self.first_dirty_time = Some(now);
                                     }
-                                    _ => None,
+                                    self.server_render_dirty = true;
+                                    self.last_pty_data_time = Some(now);
                                 }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Debounced render: only render to server terminal when
+            // dirty AND enough time has passed since last PTY data.
+            // This absorbs rapid redraws (e.g., Claude Code history)
+            // into a single clean update.
+            if self.server_render_dirty {
+                let now = Instant::now();
+                let burst_ended = self.last_pty_data_time
+                    .map(|t| now.duration_since(t).as_millis() >= RENDER_DEBOUNCE_MS as u128)
+                    .unwrap_or(true);
+                let max_latency_exceeded = self.first_dirty_time
+                    .map(|t| now.duration_since(t).as_millis() >= (RENDER_DEBOUNCE_MS * 4) as u128)
+                    .unwrap_or(false);
+                let should_render = burst_ended || max_latency_exceeded;
+
+                if should_render {
+                    if let Some(id) = self.active_session.clone() {
+                        let render_data = {
+                            let mgr = self.sessions.lock().unwrap();
+                            if let Ok(session) = mgr.get(&id) {
+                                let pane_output = self.pane_renderer.render(session.screen().screen());
+                                let cursor = session.cursor_position();
+                                Some((pane_output, cursor))
                             } else { None }
                         };
                         if let Some((pane_output, (row, col))) = render_data {
@@ -239,11 +283,12 @@ impl App {
                                 write_all(stdout_fd, &pane_output)?;
                                 self.render_sidebar(stdout_fd)?;
                             }
-                            // Always restore cursor to correct position
                             let (tr, tc) = self.pane_renderer.cursor_terminal_position(row, col);
                             write_all(stdout_fd, cursor_goto(tr, tc).as_bytes())?;
                         }
                     }
+                    self.server_render_dirty = false;
+                    self.first_dirty_time = None;
                 }
             }
 
