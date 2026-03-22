@@ -19,6 +19,9 @@ pub enum McpError {
 
     #[error("protocol error: {0}")]
     Protocol(String),
+
+    #[error("scheduler error: {0}")]
+    Scheduler(#[from] tttt_scheduler::SchedulerError),
 }
 
 pub type Result<T> = std::result::Result<T, McpError>;

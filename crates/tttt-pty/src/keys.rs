@@ -88,6 +88,7 @@ fn bracket_sequence(tag: &str) -> Option<&'static [u8]> {
         "DELETE" => Some(b"\x1b[3~"),
         "BACKSPACE" => Some(b"\x7f"),
         "TAB" => Some(b"\t"),
+        "SHIFT+TAB" => Some(b"\x1b[Z"),
         "ENTER" => Some(b"\r"),
         "ESCAPE" => Some(b"\x1b"),
         "F1" => Some(b"\x1bOP"),
@@ -102,6 +103,36 @@ fn bracket_sequence(tag: &str) -> Option<&'static [u8]> {
         "F10" => Some(b"\x1b[21~"),
         "F11" => Some(b"\x1b[23~"),
         "F12" => Some(b"\x1b[24~"),
+        // CTRL+A through CTRL+Z
+        "CTRL+A" => Some(b"\x01"),
+        "CTRL+B" => Some(b"\x02"),
+        "CTRL+C" => Some(b"\x03"),
+        "CTRL+D" => Some(b"\x04"),
+        "CTRL+E" => Some(b"\x05"),
+        "CTRL+F" => Some(b"\x06"),
+        "CTRL+G" => Some(b"\x07"),
+        "CTRL+H" => Some(b"\x08"),
+        "CTRL+I" => Some(b"\x09"),
+        "CTRL+J" => Some(b"\x0a"),
+        "CTRL+K" => Some(b"\x0b"),
+        "CTRL+L" => Some(b"\x0c"),
+        "CTRL+M" => Some(b"\x0d"),
+        "CTRL+N" => Some(b"\x0e"),
+        "CTRL+O" => Some(b"\x0f"),
+        "CTRL+P" => Some(b"\x10"),
+        "CTRL+Q" => Some(b"\x11"),
+        "CTRL+R" => Some(b"\x12"),
+        "CTRL+S" => Some(b"\x13"),
+        "CTRL+T" => Some(b"\x14"),
+        "CTRL+U" => Some(b"\x15"),
+        "CTRL+V" => Some(b"\x16"),
+        "CTRL+W" => Some(b"\x17"),
+        "CTRL+X" => Some(b"\x18"),
+        "CTRL+Y" => Some(b"\x19"),
+        "CTRL+Z" => Some(b"\x1a"),
+        // Bracketed paste
+        "PASTE_START" => Some(b"\x1b[200~"),
+        "PASTE_END" => Some(b"\x1b[201~"),
         _ => None,
     }
 }
@@ -209,5 +240,39 @@ mod tests {
     fn test_caret_not_followed_by_letter() {
         assert_eq!(process_special_keys("^1"), b"^1");
         assert_eq!(process_special_keys("^"), b"^");
+    }
+
+    #[test]
+    fn test_shift_tab() {
+        assert_eq!(process_special_keys("[SHIFT+TAB]"), b"\x1b[Z");
+    }
+
+    #[test]
+    fn test_ctrl_named_keys() {
+        assert_eq!(process_special_keys("[CTRL+C]"), vec![0x03]);
+        assert_eq!(process_special_keys("[CTRL+D]"), vec![0x04]);
+        assert_eq!(process_special_keys("[CTRL+L]"), vec![0x0c]);
+        assert_eq!(process_special_keys("[CTRL+O]"), vec![0x0f]);
+        assert_eq!(process_special_keys("[CTRL+U]"), vec![0x15]);
+        assert_eq!(process_special_keys("[CTRL+A]"), vec![0x01]);
+        assert_eq!(process_special_keys("[CTRL+Z]"), vec![0x1a]);
+    }
+
+    #[test]
+    fn test_paste_brackets() {
+        let result = process_special_keys("[PASTE_START]hello[PASTE_END]");
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"\x1b[200~");
+        expected.extend_from_slice(b"hello");
+        expected.extend_from_slice(b"\x1b[201~");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_ctrl_bracket_vs_caret() {
+        // Both [CTRL+C] and ^C should produce 0x03
+        assert_eq!(process_special_keys("[CTRL+C]"), process_special_keys("^C"));
+        assert_eq!(process_special_keys("[CTRL+A]"), process_special_keys("^A"));
+        assert_eq!(process_special_keys("[CTRL+Z]"), process_special_keys("^Z"));
     }
 }

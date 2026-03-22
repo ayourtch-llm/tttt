@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 tttt-pty = { path = "../tttt-pty" }
+tttt-scheduler = { path = "../tttt-scheduler" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

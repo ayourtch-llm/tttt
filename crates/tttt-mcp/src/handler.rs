@@ -1,7 +1,9 @@
 use crate::error::{McpError, Result};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tttt_pty::{MockPty, PtyBackend, PtySession, SessionManager};
+use tttt_scheduler::Scheduler;
 
 /// Trait for handling MCP tool calls.
 pub trait ToolHandler: Send {
@@ -72,16 +74,9 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         let keys = args["keys"]
             .as_str()
             .ok_or_else(|| McpError::InvalidParams("keys required".to_string()))?;
-        let raw = args["raw"].as_bool().unwrap_or(false);
-
         let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
         let session = mgr.get_mut(session_id)?;
-        if raw {
-            session.send_keys(keys)?;
-        } else {
-            let with_newline = format!("{}\n", keys);
-            session.send_keys(&with_newline)?;
-        }
+        session.send_keys(keys)?;
         Ok(json!({"status": "ok"}))
     }
 
@@ -265,6 +260,118 @@ impl ToolHandler for CompositeToolHandler {
     }
 }
 
+/// Shared scheduler type for use across handlers and the TUI.
+pub type SharedScheduler = Arc<Mutex<Scheduler>>;
+
+/// Handles scheduler-related tool calls (reminders and cron jobs).
+pub struct SchedulerToolHandler {
+    scheduler: SharedScheduler,
+}
+
+impl SchedulerToolHandler {
+    /// Create a new handler with a shared scheduler.
+    pub fn new(scheduler: SharedScheduler) -> Self {
+        Self { scheduler }
+    }
+
+    /// Create a handler that owns its own scheduler (convenience for standalone use).
+    pub fn new_owned(scheduler: Scheduler) -> Self {
+        Self::new(Arc::new(Mutex::new(scheduler)))
+    }
+
+    /// Access the shared scheduler.
+    pub fn scheduler(&self) -> &SharedScheduler {
+        &self.scheduler
+    }
+
+    fn handle_reminder_set(&self, args: &Value) -> Result<Value> {
+        let message = args["message"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("message required".to_string()))?
+            .to_string();
+        let delay_seconds = args["delay_seconds"]
+            .as_u64()
+            .ok_or_else(|| McpError::InvalidParams("delay_seconds required".to_string()))?;
+
+        let fire_at = Instant::now() + Duration::from_secs(delay_seconds);
+        let mut sched = self
+            .scheduler
+            .lock()
+            .map_err(|e| McpError::Protocol(e.to_string()))?;
+        let id = sched.add_reminder(message, fire_at);
+        Ok(json!({"reminder_id": id}))
+    }
+
+    fn handle_cron_create(&self, args: &Value) -> Result<Value> {
+        let expression = args["expression"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("expression required".to_string()))?
+            .to_string();
+        let command = args["command"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("command required".to_string()))?
+            .to_string();
+        let session_id = args["session_id"].as_str().map(|s| s.to_string());
+
+        let now = Instant::now();
+        let mut sched = self
+            .scheduler
+            .lock()
+            .map_err(|e| McpError::Protocol(e.to_string()))?;
+        let id = sched.add_cron(expression, command, session_id, now)?;
+        Ok(json!({"job_id": id}))
+    }
+
+    fn handle_cron_list(&self) -> Result<Value> {
+        let sched = self
+            .scheduler
+            .lock()
+            .map_err(|e| McpError::Protocol(e.to_string()))?;
+        let jobs: Vec<Value> = sched
+            .list_cron()
+            .iter()
+            .map(|j| {
+                json!({
+                    "id": j.id,
+                    "expression": j.expression,
+                    "command": j.command,
+                    "session_id": j.session_id,
+                })
+            })
+            .collect();
+        Ok(json!(jobs))
+    }
+
+    fn handle_cron_delete(&self, args: &Value) -> Result<Value> {
+        let job_id = args["job_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("job_id required".to_string()))?;
+
+        let mut sched = self
+            .scheduler
+            .lock()
+            .map_err(|e| McpError::Protocol(e.to_string()))?;
+        sched.remove_cron(job_id)?;
+        Ok(json!({"status": "ok"}))
+    }
+}
+
+impl ToolHandler for SchedulerToolHandler {
+    fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
+        match name {
+            "reminder_set" => self.handle_reminder_set(args),
+            "cron_create" => self.handle_cron_create(args),
+            "cron_list" => self.handle_cron_list(),
+            "cron_delete" => self.handle_cron_delete(args),
+            _ => Err(McpError::ToolNotFound(name.to_string())),
+        }
+    }
+
+    fn tool_definitions(&self) -> Vec<Value> {
+        crate::tools::scheduler_tool_definitions()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,13 +436,15 @@ mod tests {
     }
 
     #[test]
-    fn test_pty_send_keys_raw() {
+    fn test_pty_send_keys_no_auto_enter() {
+        // Verify that send_keys does NOT auto-append a newline;
+        // callers must use explicit [ENTER] or \n.
         let handler = make_handler_with_session();
         let id = handler.manager().lock().unwrap().list()[0].id.clone();
         let mut handler = handler;
         let result = handler.handle_tool_call(
             "pty_send_keys",
-            &json!({"session_id": id, "keys": "hello", "raw": true}),
+            &json!({"session_id": id, "keys": "hello"}),
         );
         assert!(result.is_ok());
     }
@@ -420,7 +529,7 @@ mod tests {
         let handler = make_handler();
         composite.add_handler(Box::new(handler));
         let defs = composite.tool_definitions();
-        assert_eq!(defs.len(), 8);
+        assert_eq!(defs.len(), 9);
     }
 
     #[test]
@@ -441,6 +550,54 @@ mod tests {
         assert!(matches!(result.unwrap_err(), McpError::ToolNotFound(_)));
     }
 
+    #[test]
+    fn test_pty_get_scrollback() {
+        let handler = make_handler();
+        handler.handle_pty_launch_mock(&json!({"cols": 80, "rows": 5})).unwrap();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+
+        // Queue output that overflows the 5-row screen
+        {
+            let mut mgr = handler.manager().lock().unwrap();
+            let session = mgr.get_mut(&id).unwrap();
+            let mut output = String::new();
+            for i in 0..15 {
+                output.push_str(&format!("line {}\r\n", i));
+            }
+            session.send_raw(output.as_bytes()).unwrap();
+        }
+
+        let mut handler = handler;
+        let result = handler
+            .handle_tool_call("pty_get_scrollback", &json!({"session_id": id}))
+            .unwrap();
+        assert!(result["lines"].is_array(), "response should contain lines array");
+    }
+
+    #[test]
+    fn test_pty_get_scrollback_with_lines_param() {
+        let handler = make_handler();
+        handler.handle_pty_launch_mock(&json!({"cols": 80, "rows": 5})).unwrap();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+
+        {
+            let mut mgr = handler.manager().lock().unwrap();
+            let session = mgr.get_mut(&id).unwrap();
+            let mut output = String::new();
+            for i in 0..15 {
+                output.push_str(&format!("line {}\r\n", i));
+            }
+            session.send_raw(output.as_bytes()).unwrap();
+        }
+
+        let mut handler = handler;
+        let result = handler
+            .handle_tool_call("pty_get_scrollback", &json!({"session_id": id, "lines": 3}))
+            .unwrap();
+        let lines = result["lines"].as_array().unwrap();
+        assert!(lines.len() <= 3, "should return at most 3 lines");
+    }
+
     /// Test that two references to the same handler share state.
     #[test]
     fn test_shared_manager() {
@@ -457,5 +614,121 @@ mod tests {
 
         // And through the handler's own reference
         assert_eq!(handler.manager().lock().unwrap().session_count(), 1);
+    }
+
+    // --- Scheduler tool handler tests ---
+
+    fn make_scheduler_handler() -> SchedulerToolHandler {
+        SchedulerToolHandler::new_owned(Scheduler::new())
+    }
+
+    #[test]
+    fn test_scheduler_reminder_set() {
+        let mut handler = make_scheduler_handler();
+        let result = handler
+            .handle_tool_call(
+                "reminder_set",
+                &json!({"message": "test reminder", "delay_seconds": 60}),
+            )
+            .unwrap();
+        assert!(result["reminder_id"].is_string());
+        assert_eq!(
+            handler.scheduler().lock().unwrap().reminder_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_scheduler_cron_create() {
+        let mut handler = make_scheduler_handler();
+        let result = handler
+            .handle_tool_call(
+                "cron_create",
+                &json!({"expression": "10s", "command": "echo hello"}),
+            )
+            .unwrap();
+        assert!(result["job_id"].is_string());
+        assert_eq!(handler.scheduler().lock().unwrap().cron_count(), 1);
+    }
+
+    #[test]
+    fn test_scheduler_cron_create_invalid() {
+        let mut handler = make_scheduler_handler();
+        let result = handler.handle_tool_call(
+            "cron_create",
+            &json!({"expression": "invalid!!!", "command": "x"}),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_scheduler_cron_list() {
+        let mut handler = make_scheduler_handler();
+        handler
+            .handle_tool_call(
+                "cron_create",
+                &json!({"expression": "10s", "command": "a"}),
+            )
+            .unwrap();
+        handler
+            .handle_tool_call(
+                "cron_create",
+                &json!({"expression": "20s", "command": "b"}),
+            )
+            .unwrap();
+
+        let result = handler.handle_tool_call("cron_list", &json!({})).unwrap();
+        let jobs = result.as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+    }
+
+    #[test]
+    fn test_scheduler_cron_delete() {
+        let mut handler = make_scheduler_handler();
+        let create_result = handler
+            .handle_tool_call(
+                "cron_create",
+                &json!({"expression": "10s", "command": "x"}),
+            )
+            .unwrap();
+        let job_id = create_result["job_id"].as_str().unwrap();
+
+        handler
+            .handle_tool_call("cron_delete", &json!({"job_id": job_id}))
+            .unwrap();
+        assert_eq!(handler.scheduler().lock().unwrap().cron_count(), 0);
+    }
+
+    #[test]
+    fn test_scheduler_cron_delete_nonexistent() {
+        let mut handler = make_scheduler_handler();
+        let result = handler.handle_tool_call("cron_delete", &json!({"job_id": "nope"}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_composite_pty_and_scheduler() {
+        let mut composite = CompositeToolHandler::new();
+        composite.add_handler(Box::new(make_handler()));
+        composite.add_handler(Box::new(make_scheduler_handler()));
+
+        // Should have 8 PTY + 4 scheduler = 12 tool definitions
+        let defs = composite.tool_definitions();
+        assert_eq!(defs.len(), 12);
+
+        // PTY tool should work
+        let result = composite.handle_tool_call("pty_list", &json!({}));
+        assert!(result.is_ok());
+
+        // Scheduler tool should work
+        let result = composite.handle_tool_call(
+            "cron_create",
+            &json!({"expression": "10s", "command": "test"}),
+        );
+        assert!(result.is_ok());
+
+        // Unknown tool should error
+        let result = composite.handle_tool_call("nonexistent", &json!({}));
+        assert!(matches!(result.unwrap_err(), McpError::ToolNotFound(_)));
     }
 }

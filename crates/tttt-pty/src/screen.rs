@@ -201,4 +201,42 @@ mod tests {
         let screen = buf.screen();
         assert_eq!(screen.size(), (24, 80));
     }
+
+    #[test]
+    fn test_scrollback_empty() {
+        let mut buf = ScreenBuffer::new(80, 24);
+        let scrollback = buf.get_scrollback(100);
+        assert!(scrollback.is_empty(), "no scrollback initially");
+    }
+
+    #[test]
+    fn test_scrollback_after_overflow() {
+        let mut buf = ScreenBuffer::with_scrollback(80, 5, 100);
+        // Write 10 lines into a 5-row screen; first 5 should scroll off
+        for i in 0..10 {
+            buf.process(format!("line {}\r\n", i).as_bytes());
+        }
+        let scrollback = buf.get_scrollback(100);
+        // Should have scrollback lines (the ones that scrolled off the visible area)
+        assert!(!scrollback.is_empty(), "should have scrollback after overflow");
+        // The earliest scrollback lines should contain "line 0", "line 1", etc.
+        let joined = scrollback.join("\n");
+        assert!(joined.contains("line 0"), "scrollback should contain earliest line, got: {}", joined);
+    }
+
+    #[test]
+    fn test_scrollback_max_lines() {
+        let mut buf = ScreenBuffer::with_scrollback(80, 5, 100);
+        // Write 20 lines into a 5-row screen
+        for i in 0..20 {
+            buf.process(format!("line {:02}\r\n", i).as_bytes());
+        }
+        let all = buf.get_scrollback(100);
+        let limited = buf.get_scrollback(3);
+        assert!(all.len() > 3, "should have more than 3 scrollback lines, got {}", all.len());
+        assert_eq!(limited.len(), 3, "should return at most 3 lines");
+        // The limited lines should be the most recent scrollback lines
+        // (most recent first means the last scrollback lines before visible screen)
+        assert_eq!(limited[..], all[all.len()-3..]);
+    }
 }

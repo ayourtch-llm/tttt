@@ -314,4 +314,21 @@ mod tests {
         session.pump().unwrap();
         assert_eq!(*session.status(), SessionStatus::Exited(42));
     }
+
+    #[test]
+    fn test_session_get_scrollback() {
+        let mut mock = MockPty::new(80, 5);
+        // Queue output that overflows the 5-row screen
+        let mut output = String::new();
+        for i in 0..15 {
+            output.push_str(&format!("line {}\r\n", i));
+        }
+        mock.queue_output(output.as_bytes());
+        let mut session = PtySession::new("t1".to_string(), mock, "bash".to_string(), 80, 5);
+        session.pump().unwrap();
+        let scrollback = session.get_scrollback(100);
+        assert!(!scrollback.is_empty(), "should have scrollback after overflow");
+        let joined = scrollback.join("\n");
+        assert!(joined.contains("line 0"), "scrollback should contain earliest line");
+    }
 }

@@ -24,13 +24,12 @@ pub fn pty_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "pty_send_keys",
-            "description": "Send keystrokes to a terminal session",
+            "description": "Send keystrokes to a terminal session. Keys are sent as-is. Use [ENTER] to submit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string", "description": "Target session ID" },
-                    "keys": { "type": "string", "description": "Keys to send (supports [UP], ^C, etc.)" },
-                    "raw": { "type": "boolean", "description": "If true, don't append newline (default: false)" }
+                    "keys": { "type": "string", "description": "Keys to send (supports [UP], [ENTER], [CTRL+C], ^C, etc.)" }
                 },
                 "required": ["session_id", "keys"]
             }
@@ -160,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_pty_tool_count() {
-        assert_eq!(pty_tool_definitions().len(), 8);
+        assert_eq!(pty_tool_definitions().len(), 9);
     }
 
     #[test]

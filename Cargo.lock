@@ -927,6 +927,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tttt-pty",
+ "tttt-scheduler",
 ]
 
 [[package]]
