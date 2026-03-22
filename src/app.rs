@@ -611,11 +611,22 @@ impl App {
         }
         write_all(stdout_fd, clear_screen().as_bytes())?;
         if let Some(ref id) = self.active_session.clone() {
-            let mut mgr = self.sessions.lock().unwrap();
-            if let Ok(session) = mgr.get_mut(id) {
-                let pane_output = self.pane_renderer.render(session.screen().screen());
-                drop(mgr);
+            let render_data = {
+                let mut mgr = self.sessions.lock().unwrap();
+                if let Ok(session) = mgr.get_mut(id) {
+                    let pane_output = self.pane_renderer.render(session.screen().screen());
+                    let cursor = session.cursor_position();
+                    Some((pane_output, cursor))
+                } else {
+                    None
+                }
+            };
+            if let Some((pane_output, (row, col))) = render_data {
                 write_all(stdout_fd, &pane_output)?;
+                self.render_sidebar(stdout_fd)?;
+                let (tr, tc) = self.pane_renderer.cursor_terminal_position(row, col);
+                write_all(stdout_fd, cursor_goto(tr, tc).as_bytes())?;
+                return Ok(());
             }
         }
         self.render_sidebar(stdout_fd)?;
