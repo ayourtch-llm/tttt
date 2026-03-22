@@ -35,6 +35,16 @@ RUN npm install -g @anthropic-ai/claude-code
 # Copy apchat from ghcr.io
 COPY --from=ghcr.io/ayourtch/apchat:latest /usr/local/bin/apchat /usr/local/bin/apchat
 
+# Install OpenCode CLI (detect architecture and download appropriate binary)
+RUN ARCH=$(dpkg --print-architecture) && \
+    case "$ARCH" in \
+        amd64) OPENCODE_ARCH="x64" ;; \
+        arm64) OPENCODE_ARCH="arm64" ;; \
+        *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
+    esac && \
+    curl -fsSL "https://github.com/anomalyco/opencode/releases/latest/download/opencode-linux-${OPENCODE_ARCH}.tar.gz" | tar xz -C /usr/local/bin && \
+    chmod +x /usr/local/bin/opencode
+
 # Copy tttt binary from builder
 COPY --from=builder /app/target/release/tttt /usr/local/bin/tttt
 
