@@ -88,6 +88,11 @@ pub fn handle_proxy_client<H: crate::handler::ToolHandler>(
         // Parse and process the JSON-RPC request
         let response = process_jsonrpc_request(&req_str, handler, server_name);
 
+        // Skip sending for notifications (empty response)
+        if response.is_empty() {
+            continue;
+        }
+
         // Send length-prefixed response
         let resp_bytes = response.as_bytes();
         let resp_len = resp_bytes.len() as u32;
