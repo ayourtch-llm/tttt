@@ -590,11 +590,12 @@ impl App {
                             }
                         }
                         protocol::ClientMsg::Resize { cols, rows } => {
+                            // cols = usable PTY width reported by client
+                            // (client subtracts its own sidebar if it has one)
                             self.viewer_clients[i].cols = cols;
                             self.viewer_clients[i].rows = rows;
-                            let pty_cols = cols.saturating_sub(self.config.sidebar_width);
                             let pty_rows = rows.saturating_sub(1);
-                            self.viewer_clients[i].renderer.resize(pty_cols, pty_rows);
+                            self.viewer_clients[i].renderer.resize(cols, pty_rows);
                             self.viewer_clients[i].invalidate();
                             // Resize PTY to minimum across all clients (tmux behavior)
                             self.resize_pty_to_min_and_redraw(_stdout_fd);
@@ -628,12 +629,14 @@ impl App {
         let mut min_cols = self.screen_cols.saturating_sub(sidebar);
         let mut min_rows = self.screen_rows.saturating_sub(1);
 
-        // Find minimum across all connected viewers
+        // Find minimum across all connected viewers.
+        // Attach clients don't have a sidebar, so use their cols directly
+        // as usable PTY width (no sidebar subtraction).
         for client in &self.viewer_clients {
             if !client.connected {
                 continue;
             }
-            let c = client.cols.saturating_sub(sidebar);
+            let c = client.cols; // no sidebar on attach clients
             let r = client.rows.saturating_sub(1);
             min_cols = min_cols.min(c);
             min_rows = min_rows.min(r);

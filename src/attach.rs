@@ -173,29 +173,10 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         // updating the virtual screen and skip the real terminal render.
         // Only when the socket goes quiet do we render the final state.
         if virtual_dirty && !got_server_data {
-            // The server's PTY might be smaller than our terminal.
-            // Get the actual screen size from the virtual screen.
-            let (screen_rows, screen_cols) = virtual_screen.screen().size();
-
-            // If the PTY size changed (e.g., after resize), recreate renderer
-            // to match the PTY dimensions, and clear the terminal.
-            let (_, cur_renderer_cols) = (0u16, renderer.cursor_terminal_position(0, 0).1);
-            // Simple approach: always use screen size for the renderer
-            // and clear right margin + bottom with erase sequences
+            // Render PTY cells via PaneRenderer (minimal diff).
             let output = renderer.render(virtual_screen.screen());
             if !output.is_empty() {
                 write_fd(stdout_fd, &output);
-            }
-
-            // Clear right margin: for each row, position cursor after PTY area
-            // and clear to end of line. This removes stale content.
-            for row in 0..screen_rows.min(cur_rows) {
-                let clear_cmd = format!(
-                    "\x1b[{};{}H\x1b[K",
-                    row + 1,
-                    screen_cols + 1
-                );
-                write_fd(stdout_fd, clear_cmd.as_bytes());
             }
 
             let new_cursor = (last_cursor.0 + 1, last_cursor.1 + 1);
