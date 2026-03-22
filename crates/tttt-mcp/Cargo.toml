@@ -9,3 +9,4 @@ tttt-scheduler = { path = "../tttt-scheduler" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+regex = "1"

@@ -1,5 +1,6 @@
 mod error;
 mod handler;
+pub mod notification;
 mod protocol;
 mod server;
 mod tools;

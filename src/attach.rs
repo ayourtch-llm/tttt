@@ -73,7 +73,6 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 match stream.read(&mut tmp) {
                     Ok(0) => {
                         break; // server disconnected
-                        break;
                     }
                     Ok(n) => {
                         read_buf.extend_from_slice(&tmp[..n]);
@@ -85,7 +84,6 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(flags) = fds[1].revents() {
                 if flags.contains(PollFlags::POLLHUP) {
                     break; // server disconnected
-                    break;
                 }
             }
         }
