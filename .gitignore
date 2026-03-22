@@ -1,2 +1,5 @@
 /target
 /tmp
+.apchat-large-outputs/
+*.swp
+/m
