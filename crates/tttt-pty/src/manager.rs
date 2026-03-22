@@ -74,12 +74,23 @@ impl<B: PtyBackend> SessionManager<B> {
         Ok(())
     }
 
-    /// List metadata for all sessions.
+    /// List metadata for all sessions, sorted by session ID (natural sort).
     pub fn list(&self) -> Vec<SessionMetadata> {
-        self.sessions
+        let mut sessions: Vec<SessionMetadata> = self.sessions
             .values()
             .map(|s| s.metadata())
-            .collect()
+            .collect();
+        // Natural sort: extract numeric part of "pty-N" for proper ordering
+        sessions.sort_by(|a, b| {
+            let num_a = a.id.strip_prefix("pty-")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let num_b = b.id.strip_prefix("pty-")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            num_a.cmp(&num_b)
+        });
+        sessions
     }
 
     /// Get the number of active sessions.
@@ -212,6 +223,21 @@ mod tests {
         let ids: Vec<&str> = list.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"s1"));
         assert!(ids.contains(&"s2"));
+    }
+
+    #[test]
+    fn test_manager_list_sorted() {
+        let mut mgr: SessionManager<MockPty> = SessionManager::new();
+        // Add sessions in non-sequential order
+        mgr.add_session(make_session("pty-2")).unwrap();
+        mgr.add_session(make_session("pty-1")).unwrap();
+        mgr.add_session(make_session("pty-10")).unwrap();
+        mgr.add_session(make_session("pty-3")).unwrap();
+        let list = mgr.list();
+        assert_eq!(list.len(), 4);
+        // Should be naturally sorted: pty-1, pty-2, pty-3, pty-10
+        let ids: Vec<&str> = list.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["pty-1", "pty-2", "pty-3", "pty-10"]);
     }
 
     #[test]
