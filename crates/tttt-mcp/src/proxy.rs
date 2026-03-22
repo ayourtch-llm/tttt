@@ -256,7 +256,7 @@ mod tests {
         let mut client = client_stream;
 
         // Launch
-        let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pty_launch","arguments":{}}}"#;
+        let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tttt_pty_launch","arguments":{}}}"#;
         let len = req.len() as u32;
         client.write_all(&len.to_be_bytes()).unwrap();
         client.write_all(req.as_bytes()).unwrap();
@@ -274,7 +274,7 @@ mod tests {
         assert_eq!(result["session_id"], "pty-1");
 
         // List
-        let req = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"pty_list","arguments":{}}}"#;
+        let req = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tttt_pty_list","arguments":{}}}"#;
         let len = req.len() as u32;
         client.write_all(&len.to_be_bytes()).unwrap();
         client.write_all(req.as_bytes()).unwrap();

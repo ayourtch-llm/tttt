@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 pub fn pty_tool_definitions() -> Vec<Value> {
     vec![
         json!({
-            "name": "pty_launch",
+            "name": "tttt_pty_launch",
             "description": "Launch a new terminal session",
             "inputSchema": {
                 "type": "object",
@@ -23,7 +23,7 @@ pub fn pty_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "pty_send_keys",
+            "name": "tttt_pty_send_keys",
             "description": "Send keystrokes to a terminal session. Keys are sent as-is. Use [ENTER] to submit.",
             "inputSchema": {
                 "type": "object",
@@ -35,7 +35,7 @@ pub fn pty_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "pty_get_screen",
+            "name": "tttt_pty_get_screen",
             "description": "Get the current screen contents of a terminal session",
             "inputSchema": {
                 "type": "object",
@@ -46,7 +46,7 @@ pub fn pty_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "pty_list",
+            "name": "tttt_pty_list",
             "description": "List all terminal sessions",
             "inputSchema": {
                 "type": "object",
@@ -54,7 +54,7 @@ pub fn pty_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "pty_kill",
+            "name": "tttt_pty_kill",
             "description": "Kill a terminal session",
             "inputSchema": {
                 "type": "object",
@@ -65,7 +65,7 @@ pub fn pty_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "pty_get_cursor",
+            "name": "tttt_pty_get_cursor",
             "description": "Get the cursor position in a terminal session",
             "inputSchema": {
                 "type": "object",
@@ -76,7 +76,7 @@ pub fn pty_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "pty_resize",
+            "name": "tttt_pty_resize",
             "description": "Resize a terminal session",
             "inputSchema": {
                 "type": "object",
@@ -89,7 +89,7 @@ pub fn pty_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "pty_set_scrollback",
+            "name": "tttt_pty_set_scrollback",
             "description": "Set the scrollback buffer size for a terminal session",
             "inputSchema": {
                 "type": "object",
@@ -101,7 +101,7 @@ pub fn pty_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "pty_get_scrollback",
+            "name": "tttt_pty_get_scrollback",
             "description": "Get scrollback buffer contents (text that has scrolled off the visible screen)",
             "inputSchema": {
                 "type": "object",
@@ -119,7 +119,7 @@ pub fn pty_tool_definitions() -> Vec<Value> {
 pub fn scheduler_tool_definitions() -> Vec<Value> {
     vec![
         json!({
-            "name": "reminder_set",
+            "name": "tttt_reminder_set",
             "description": "Set a one-shot reminder that will be injected at a future time",
             "inputSchema": {
                 "type": "object",
@@ -131,7 +131,7 @@ pub fn scheduler_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "cron_create",
+            "name": "tttt_cron_create",
             "description": "Create a recurring cron job",
             "inputSchema": {
                 "type": "object",
@@ -144,7 +144,7 @@ pub fn scheduler_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "cron_list",
+            "name": "tttt_cron_list",
             "description": "List all cron jobs",
             "inputSchema": {
                 "type": "object",
@@ -152,7 +152,7 @@ pub fn scheduler_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "cron_delete",
+            "name": "tttt_cron_delete",
             "description": "Delete a cron job",
             "inputSchema": {
                 "type": "object",
@@ -169,7 +169,7 @@ pub fn scheduler_tool_definitions() -> Vec<Value> {
 pub fn notification_tool_definitions() -> Vec<Value> {
     vec![
         json!({
-            "name": "notify_on_prompt",
+            "name": "tttt_notify_on_prompt",
             "description": "Register a one-shot notification: when the target session's screen matches the pattern, inject text into the specified session. Eliminates polling.",
             "inputSchema": {
                 "type": "object",
@@ -183,7 +183,7 @@ pub fn notification_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "notify_on_pattern",
+            "name": "tttt_notify_on_pattern",
             "description": "Register a recurring notification: fires every time the pattern matches (not removed after firing).",
             "inputSchema": {
                 "type": "object",
@@ -197,7 +197,7 @@ pub fn notification_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "notify_cancel",
+            "name": "tttt_notify_cancel",
             "description": "Cancel a registered notification watcher.",
             "inputSchema": {
                 "type": "object",
@@ -208,7 +208,7 @@ pub fn notification_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "notify_list",
+            "name": "tttt_notify_list",
             "description": "List all active notification watchers.",
             "inputSchema": {
                 "type": "object",
@@ -216,7 +216,7 @@ pub fn notification_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
-            "name": "self_inject",
+            "name": "tttt_self_inject",
             "description": "Inject text into a session's PTY stdin, as if typed by the user. Can be used to inject commands, /compact, reminders, etc.",
             "inputSchema": {
                 "type": "object",
@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn test_required_params_present() {
         let tools = pty_tool_definitions();
-        let send_keys = tools.iter().find(|t| t["name"] == "pty_send_keys").unwrap();
+        let send_keys = tools.iter().find(|t| t["name"] == "tttt_pty_send_keys").unwrap();
         let required = send_keys["inputSchema"]["required"].as_array().unwrap();
         assert!(required.contains(&Value::from("session_id")));
         assert!(required.contains(&Value::from("keys")));
@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn test_pty_launch_no_required_params() {
         let tools = pty_tool_definitions();
-        let launch = tools.iter().find(|t| t["name"] == "pty_launch").unwrap();
+        let launch = tools.iter().find(|t| t["name"] == "tttt_pty_launch").unwrap();
         assert!(launch["inputSchema"]["required"].is_null());
     }
 

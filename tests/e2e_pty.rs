@@ -92,7 +92,7 @@ fn test_e2e_mcp_server() {
     session.send_raw(b"\n").unwrap();
 
     assert!(
-        wait_for_screen(&mut session, "pty_launch", 5000),
+        wait_for_screen(&mut session, "tttt_pty_launch", 5000),
         "should list tools: {:?}",
         session.get_screen()
     );

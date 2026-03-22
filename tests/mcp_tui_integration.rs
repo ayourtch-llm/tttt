@@ -18,7 +18,7 @@ fn test_mcp_creates_session_in_shared_manager() {
     // Launch a session via MCP tool call
     let result = handler
         .handle_tool_call(
-            "pty_launch",
+            "tttt_pty_launch",
             &serde_json::json!({"cols": 80, "rows": 24}),
         )
         .unwrap();
@@ -38,17 +38,17 @@ fn test_mcp_multiple_sessions() {
     let mut handler = PtyToolHandler::new_owned(manager, std::path::PathBuf::from("/tmp"));
 
     handler
-        .handle_tool_call("pty_launch", &serde_json::json!({}))
+        .handle_tool_call("tttt_pty_launch", &serde_json::json!({}))
         .unwrap();
     handler
-        .handle_tool_call("pty_launch", &serde_json::json!({}))
+        .handle_tool_call("tttt_pty_launch", &serde_json::json!({}))
         .unwrap();
     handler
-        .handle_tool_call("pty_launch", &serde_json::json!({}))
+        .handle_tool_call("tttt_pty_launch", &serde_json::json!({}))
         .unwrap();
 
     let list = handler
-        .handle_tool_call("pty_list", &serde_json::json!({}))
+        .handle_tool_call("tttt_pty_list", &serde_json::json!({}))
         .unwrap();
     let sessions = list.as_array().unwrap();
     assert_eq!(sessions.len(), 3);
@@ -61,13 +61,13 @@ fn test_mcp_kill_removes_session() {
     let mut handler = PtyToolHandler::new_owned(manager, std::path::PathBuf::from("/tmp"));
 
     handler
-        .handle_tool_call("pty_launch", &serde_json::json!({}))
+        .handle_tool_call("tttt_pty_launch", &serde_json::json!({}))
         .unwrap();
     assert_eq!(handler.manager().lock().unwrap().session_count(), 1);
 
     handler
         .handle_tool_call(
-            "pty_kill",
+            "tttt_pty_kill",
             &serde_json::json!({"session_id": "pty-1"}),
         )
         .unwrap();
@@ -90,7 +90,7 @@ fn test_mcp_workflow_launch_type_read() {
     // Pump and get screen
     let screen_result = handler
         .handle_tool_call(
-            "pty_get_screen",
+            "tttt_pty_get_screen",
             &serde_json::json!({"session_id": "pty-1"}),
         )
         .unwrap();
@@ -107,11 +107,11 @@ fn test_mcp_server_full_session_with_mock() {
     let input = concat!(
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#, "\n",
         r#"{"jsonrpc":"2.0","method":"initialized"}"#, "\n",
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"pty_launch","arguments":{}}}"#, "\n",
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"pty_launch","arguments":{}}}"#, "\n",
-        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"pty_list","arguments":{}}}"#, "\n",
-        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"pty_kill","arguments":{"session_id":"pty-1"}}}"#, "\n",
-        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"pty_list","arguments":{}}}"#, "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tttt_pty_launch","arguments":{}}}"#, "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tttt_pty_launch","arguments":{}}}"#, "\n",
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tttt_pty_list","arguments":{}}}"#, "\n",
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"tttt_pty_kill","arguments":{"session_id":"pty-1"}}}"#, "\n",
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"tttt_pty_list","arguments":{}}}"#, "\n",
     );
 
     let reader = BufReader::new(Cursor::new(input.as_bytes().to_vec()));
@@ -171,7 +171,7 @@ fn test_mcp_launch_with_sandbox_profile() {
     // Launch with sandbox profile (currently just a parameter, not enforced)
     let result = handler
         .handle_tool_call(
-            "pty_launch",
+            "tttt_pty_launch",
             &serde_json::json!({
                 "sandbox_profile": "read_only_worktree"
             }),
@@ -190,12 +190,12 @@ fn test_mcp_scheduler_tools_listed() {
     let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
     // PTY tools
-    assert!(tool_names.contains(&"pty_launch"));
-    assert!(tool_names.contains(&"pty_send_keys"));
-    assert!(tool_names.contains(&"pty_get_screen"));
-    assert!(tool_names.contains(&"pty_list"));
-    assert!(tool_names.contains(&"pty_kill"));
-    assert!(tool_names.contains(&"pty_get_cursor"));
-    assert!(tool_names.contains(&"pty_resize"));
-    assert!(tool_names.contains(&"pty_set_scrollback"));
+    assert!(tool_names.contains(&"tttt_pty_launch"));
+    assert!(tool_names.contains(&"tttt_pty_send_keys"));
+    assert!(tool_names.contains(&"tttt_pty_get_screen"));
+    assert!(tool_names.contains(&"tttt_pty_list"));
+    assert!(tool_names.contains(&"tttt_pty_kill"));
+    assert!(tool_names.contains(&"tttt_pty_get_cursor"));
+    assert!(tool_names.contains(&"tttt_pty_resize"));
+    assert!(tool_names.contains(&"tttt_pty_set_scrollback"));
 }

@@ -200,7 +200,7 @@ mod tests {
         let mut server = make_server("");
         let resp = server
             .process_line(
-                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"pty_list","arguments":{}}}"#,
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tttt_pty_list","arguments":{}}}"#,
             )
             .unwrap();
         let result = resp.result.unwrap();

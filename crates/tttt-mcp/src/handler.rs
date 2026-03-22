@@ -193,15 +193,15 @@ impl PtyToolHandler<tttt_pty::RealPty> {
 impl ToolHandler for PtyToolHandler<tttt_pty::RealPty> {
     fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
         match name {
-            "pty_launch" => self.handle_pty_launch_real(args),
-            "pty_list" => self.handle_pty_list(),
-            "pty_get_screen" => self.handle_pty_get_screen(args),
-            "pty_send_keys" => self.handle_pty_send_keys(args),
-            "pty_kill" => self.handle_pty_kill(args),
-            "pty_get_cursor" => self.handle_pty_get_cursor(args),
-            "pty_resize" => self.handle_pty_resize(args),
-            "pty_get_scrollback" => self.handle_pty_get_scrollback(args),
-            "pty_set_scrollback" => self.handle_pty_set_scrollback(args),
+            "tttt_pty_launch" => self.handle_pty_launch_real(args),
+            "tttt_pty_list" => self.handle_pty_list(),
+            "tttt_pty_get_screen" => self.handle_pty_get_screen(args),
+            "tttt_pty_send_keys" => self.handle_pty_send_keys(args),
+            "tttt_pty_kill" => self.handle_pty_kill(args),
+            "tttt_pty_get_cursor" => self.handle_pty_get_cursor(args),
+            "tttt_pty_resize" => self.handle_pty_resize(args),
+            "tttt_pty_get_scrollback" => self.handle_pty_get_scrollback(args),
+            "tttt_pty_set_scrollback" => self.handle_pty_set_scrollback(args),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
     }
@@ -214,15 +214,15 @@ impl ToolHandler for PtyToolHandler<tttt_pty::RealPty> {
 impl ToolHandler for PtyToolHandler<MockPty> {
     fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
         match name {
-            "pty_launch" => self.handle_pty_launch_mock(args),
-            "pty_list" => self.handle_pty_list(),
-            "pty_get_screen" => self.handle_pty_get_screen(args),
-            "pty_send_keys" => self.handle_pty_send_keys(args),
-            "pty_kill" => self.handle_pty_kill(args),
-            "pty_get_cursor" => self.handle_pty_get_cursor(args),
-            "pty_resize" => self.handle_pty_resize(args),
-            "pty_get_scrollback" => self.handle_pty_get_scrollback(args),
-            "pty_set_scrollback" => self.handle_pty_set_scrollback(args),
+            "tttt_pty_launch" => self.handle_pty_launch_mock(args),
+            "tttt_pty_list" => self.handle_pty_list(),
+            "tttt_pty_get_screen" => self.handle_pty_get_screen(args),
+            "tttt_pty_send_keys" => self.handle_pty_send_keys(args),
+            "tttt_pty_kill" => self.handle_pty_kill(args),
+            "tttt_pty_get_cursor" => self.handle_pty_get_cursor(args),
+            "tttt_pty_resize" => self.handle_pty_resize(args),
+            "tttt_pty_get_scrollback" => self.handle_pty_get_scrollback(args),
+            "tttt_pty_set_scrollback" => self.handle_pty_set_scrollback(args),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
     }
@@ -373,10 +373,10 @@ impl SchedulerToolHandler {
 impl ToolHandler for SchedulerToolHandler {
     fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
         match name {
-            "reminder_set" => self.handle_reminder_set(args),
-            "cron_create" => self.handle_cron_create(args),
-            "cron_list" => self.handle_cron_list(),
-            "cron_delete" => self.handle_cron_delete(args),
+            "tttt_reminder_set" => self.handle_reminder_set(args),
+            "tttt_cron_create" => self.handle_cron_create(args),
+            "tttt_cron_list" => self.handle_cron_list(),
+            "tttt_cron_delete" => self.handle_cron_delete(args),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
     }
@@ -509,11 +509,11 @@ impl NotificationToolHandler {
 impl ToolHandler for NotificationToolHandler {
     fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
         match name {
-            "notify_on_prompt" => self.handle_notify_on_prompt(args),
-            "notify_on_pattern" => self.handle_notify_on_pattern(args),
-            "notify_cancel" => self.handle_notify_cancel(args),
-            "notify_list" => self.handle_notify_list(),
-            "self_inject" => self.handle_self_inject(args),
+            "tttt_notify_on_prompt" => self.handle_notify_on_prompt(args),
+            "tttt_notify_on_pattern" => self.handle_notify_on_pattern(args),
+            "tttt_notify_cancel" => self.handle_notify_cancel(args),
+            "tttt_notify_list" => self.handle_notify_list(),
+            "tttt_self_inject" => self.handle_self_inject(args),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
     }
@@ -580,7 +580,7 @@ mod tests {
         let id = handler.manager().lock().unwrap().list()[0].id.clone();
         let mut handler = handler;
         let result = handler.handle_tool_call(
-            "pty_send_keys",
+            "tttt_pty_send_keys",
             &json!({"session_id": id, "keys": "hello"}),
         );
         assert!(result.is_ok());
@@ -594,7 +594,7 @@ mod tests {
         let id = handler.manager().lock().unwrap().list()[0].id.clone();
         let mut handler = handler;
         let result = handler.handle_tool_call(
-            "pty_send_keys",
+            "tttt_pty_send_keys",
             &json!({"session_id": id, "keys": "hello"}),
         );
         assert!(result.is_ok());
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn test_pty_send_keys_missing_session_id() {
         let mut handler = make_handler();
-        let result = handler.handle_tool_call("pty_send_keys", &json!({"keys": "hello"}));
+        let result = handler.handle_tool_call("tttt_pty_send_keys", &json!({"keys": "hello"}));
         assert!(result.is_err());
     }
 
@@ -613,7 +613,7 @@ mod tests {
         let id = handler.manager().lock().unwrap().list()[0].id.clone();
         let mut handler = handler;
         let result = handler
-            .handle_tool_call("pty_get_screen", &json!({"session_id": id}))
+            .handle_tool_call("tttt_pty_get_screen", &json!({"session_id": id}))
             .unwrap();
         assert!(result["screen"].is_string());
         assert!(result["cursor"].is_array());
@@ -625,7 +625,7 @@ mod tests {
         let id = handler.manager().lock().unwrap().list()[0].id.clone();
         let mut handler = handler;
         handler
-            .handle_tool_call("pty_kill", &json!({"session_id": id}))
+            .handle_tool_call("tttt_pty_kill", &json!({"session_id": id}))
             .unwrap();
         assert_eq!(handler.manager().lock().unwrap().session_count(), 0);
     }
@@ -636,7 +636,7 @@ mod tests {
         let id = handler.manager().lock().unwrap().list()[0].id.clone();
         let mut handler = handler;
         let result = handler
-            .handle_tool_call("pty_get_cursor", &json!({"session_id": id}))
+            .handle_tool_call("tttt_pty_get_cursor", &json!({"session_id": id}))
             .unwrap();
         assert_eq!(result["row"], 0);
         assert_eq!(result["col"], 0);
@@ -648,7 +648,7 @@ mod tests {
         let id = handler.manager().lock().unwrap().list()[0].id.clone();
         let mut handler = handler;
         handler
-            .handle_tool_call("pty_resize", &json!({"session_id": id, "cols": 100, "rows": 50}))
+            .handle_tool_call("tttt_pty_resize", &json!({"session_id": id, "cols": 100, "rows": 50}))
             .unwrap();
         let mgr = handler.manager().lock().unwrap();
         let session = mgr.get(&id).unwrap();
@@ -663,7 +663,7 @@ mod tests {
         let id = handler.manager().lock().unwrap().list()[0].id.clone();
         let mut handler = handler;
         handler
-            .handle_tool_call("pty_set_scrollback", &json!({"session_id": id, "lines": 5000}))
+            .handle_tool_call("tttt_pty_set_scrollback", &json!({"session_id": id, "lines": 5000}))
             .unwrap();
     }
 
@@ -688,7 +688,7 @@ mod tests {
         let mut composite = CompositeToolHandler::new();
         let handler = make_handler();
         composite.add_handler(Box::new(handler));
-        let result = composite.handle_tool_call("pty_list", &json!({}));
+        let result = composite.handle_tool_call("tttt_pty_list", &json!({}));
         assert!(result.is_ok());
     }
 
@@ -720,7 +720,7 @@ mod tests {
 
         let mut handler = handler;
         let result = handler
-            .handle_tool_call("pty_get_scrollback", &json!({"session_id": id}))
+            .handle_tool_call("tttt_pty_get_scrollback", &json!({"session_id": id}))
             .unwrap();
         assert!(result["lines"].is_array(), "response should contain lines array");
     }
@@ -743,7 +743,7 @@ mod tests {
 
         let mut handler = handler;
         let result = handler
-            .handle_tool_call("pty_get_scrollback", &json!({"session_id": id, "lines": 3}))
+            .handle_tool_call("tttt_pty_get_scrollback", &json!({"session_id": id, "lines": 3}))
             .unwrap();
         let lines = result["lines"].as_array().unwrap();
         assert!(lines.len() <= 3, "should return at most 3 lines");
@@ -778,7 +778,7 @@ mod tests {
         let mut handler = make_scheduler_handler();
         let result = handler
             .handle_tool_call(
-                "reminder_set",
+                "tttt_reminder_set",
                 &json!({"message": "test reminder", "delay_seconds": 60}),
             )
             .unwrap();
@@ -794,7 +794,7 @@ mod tests {
         let mut handler = make_scheduler_handler();
         let result = handler
             .handle_tool_call(
-                "cron_create",
+                "tttt_cron_create",
                 &json!({"expression": "10s", "command": "echo hello"}),
             )
             .unwrap();
@@ -806,7 +806,7 @@ mod tests {
     fn test_scheduler_cron_create_invalid() {
         let mut handler = make_scheduler_handler();
         let result = handler.handle_tool_call(
-            "cron_create",
+            "tttt_cron_create",
             &json!({"expression": "invalid!!!", "command": "x"}),
         );
         assert!(result.is_err());
@@ -817,18 +817,18 @@ mod tests {
         let mut handler = make_scheduler_handler();
         handler
             .handle_tool_call(
-                "cron_create",
+                "tttt_cron_create",
                 &json!({"expression": "10s", "command": "a"}),
             )
             .unwrap();
         handler
             .handle_tool_call(
-                "cron_create",
+                "tttt_cron_create",
                 &json!({"expression": "20s", "command": "b"}),
             )
             .unwrap();
 
-        let result = handler.handle_tool_call("cron_list", &json!({})).unwrap();
+        let result = handler.handle_tool_call("tttt_cron_list", &json!({})).unwrap();
         let jobs = result.as_array().unwrap();
         assert_eq!(jobs.len(), 2);
     }
@@ -838,14 +838,14 @@ mod tests {
         let mut handler = make_scheduler_handler();
         let create_result = handler
             .handle_tool_call(
-                "cron_create",
+                "tttt_cron_create",
                 &json!({"expression": "10s", "command": "x"}),
             )
             .unwrap();
         let job_id = create_result["job_id"].as_str().unwrap();
 
         handler
-            .handle_tool_call("cron_delete", &json!({"job_id": job_id}))
+            .handle_tool_call("tttt_cron_delete", &json!({"job_id": job_id}))
             .unwrap();
         assert_eq!(handler.scheduler().lock().unwrap().cron_count(), 0);
     }
@@ -853,7 +853,7 @@ mod tests {
     #[test]
     fn test_scheduler_cron_delete_nonexistent() {
         let mut handler = make_scheduler_handler();
-        let result = handler.handle_tool_call("cron_delete", &json!({"job_id": "nope"}));
+        let result = handler.handle_tool_call("tttt_cron_delete", &json!({"job_id": "nope"}));
         assert!(result.is_err());
     }
 
@@ -868,12 +868,12 @@ mod tests {
         assert_eq!(defs.len(), 13);
 
         // PTY tool should work
-        let result = composite.handle_tool_call("pty_list", &json!({}));
+        let result = composite.handle_tool_call("tttt_pty_list", &json!({}));
         assert!(result.is_ok());
 
         // Scheduler tool should work
         let result = composite.handle_tool_call(
-            "cron_create",
+            "tttt_cron_create",
             &json!({"expression": "10s", "command": "test"}),
         );
         assert!(result.is_ok());
@@ -896,7 +896,7 @@ mod tests {
         let mut handler = make_notification_handler();
         let result = handler
             .handle_tool_call(
-                "notify_on_prompt",
+                "tttt_notify_on_prompt",
                 &json!({
                     "watch_session_id": "pty-1",
                     "pattern": "❯\\s*$",
@@ -913,7 +913,7 @@ mod tests {
         let mut handler = make_notification_handler();
         let result = handler
             .handle_tool_call(
-                "notify_on_pattern",
+                "tttt_notify_on_pattern",
                 &json!({
                     "watch_session_id": "pty-1",
                     "pattern": "error",
@@ -929,7 +929,7 @@ mod tests {
     fn test_notify_invalid_regex() {
         let mut handler = make_notification_handler();
         let result = handler.handle_tool_call(
-            "notify_on_prompt",
+            "tttt_notify_on_prompt",
             &json!({
                 "watch_session_id": "pty-1",
                 "pattern": "[invalid",
@@ -945,7 +945,7 @@ mod tests {
         let mut handler = make_notification_handler();
         handler
             .handle_tool_call(
-                "notify_on_prompt",
+                "tttt_notify_on_prompt",
                 &json!({
                     "watch_session_id": "pty-1",
                     "pattern": "a",
@@ -956,7 +956,7 @@ mod tests {
             .unwrap();
         handler
             .handle_tool_call(
-                "notify_on_pattern",
+                "tttt_notify_on_pattern",
                 &json!({
                     "watch_session_id": "pty-2",
                     "pattern": "b",
@@ -966,7 +966,7 @@ mod tests {
             )
             .unwrap();
 
-        let result = handler.handle_tool_call("notify_list", &json!({})).unwrap();
+        let result = handler.handle_tool_call("tttt_notify_list", &json!({})).unwrap();
         let watchers = result.as_array().unwrap();
         assert_eq!(watchers.len(), 2);
     }
@@ -976,7 +976,7 @@ mod tests {
         let mut handler = make_notification_handler();
         let result = handler
             .handle_tool_call(
-                "notify_on_prompt",
+                "tttt_notify_on_prompt",
                 &json!({
                     "watch_session_id": "pty-1",
                     "pattern": "a",
@@ -988,17 +988,17 @@ mod tests {
         let watcher_id = result["watcher_id"].as_str().unwrap();
 
         handler
-            .handle_tool_call("notify_cancel", &json!({"watcher_id": watcher_id}))
+            .handle_tool_call("tttt_notify_cancel", &json!({"watcher_id": watcher_id}))
             .unwrap();
 
-        let list = handler.handle_tool_call("notify_list", &json!({})).unwrap();
+        let list = handler.handle_tool_call("tttt_notify_list", &json!({})).unwrap();
         assert_eq!(list.as_array().unwrap().len(), 0);
     }
 
     #[test]
     fn test_notify_cancel_nonexistent() {
         let mut handler = make_notification_handler();
-        let result = handler.handle_tool_call("notify_cancel", &json!({"watcher_id": "nope"}));
+        let result = handler.handle_tool_call("tttt_notify_cancel", &json!({"watcher_id": "nope"}));
         assert!(result.is_err());
     }
 
@@ -1006,7 +1006,7 @@ mod tests {
     fn test_self_inject_missing_session() {
         let mut handler = make_notification_handler();
         let result = handler.handle_tool_call(
-            "self_inject",
+            "tttt_self_inject",
             &json!({"session_id": "nonexistent", "text": "hello"}),
         );
         assert!(result.is_err());

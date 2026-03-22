@@ -80,9 +80,9 @@ fn test_mcp_pty_launch_with_working_dir() {
     use tttt_pty::SessionManager;
 
     let input = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pty_launch","arguments":{"command":"/bin/pwd","working_dir":"/tmp","cols":80,"rows":10}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tttt_pty_launch","arguments":{"command":"/bin/pwd","working_dir":"/tmp","cols":80,"rows":10}}}"#,
         "\n",
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"pty_get_screen","arguments":{"session_id":"pty-1"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tttt_pty_get_screen","arguments":{"session_id":"pty-1"}}}"#,
         "\n",
     );
 

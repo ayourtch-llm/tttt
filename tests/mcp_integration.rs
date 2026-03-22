@@ -45,7 +45,7 @@ fn test_mcp_launch_real_pty() {
     let mut server = make_real_server("");
     let resp = server
         .process_line(
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pty_launch","arguments":{"command":"/bin/echo","args":["hello"],"cols":40,"rows":10}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tttt_pty_launch","arguments":{"command":"/bin/echo","args":["hello"],"cols":40,"rows":10}}}"#,
         )
         .unwrap();
 
@@ -57,10 +57,10 @@ fn test_mcp_launch_real_pty() {
 #[test]
 fn test_mcp_launch_and_get_screen() {
     let input = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pty_launch","arguments":{"command":"/bin/echo","args":["hello world"],"cols":40,"rows":10}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tttt_pty_launch","arguments":{"command":"/bin/echo","args":["hello world"],"cols":40,"rows":10}}}"#,
         "\n",
         // Small delay via a second request to let the echo complete
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"pty_get_screen","arguments":{"session_id":"pty-1"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tttt_pty_get_screen","arguments":{"session_id":"pty-1"}}}"#,
         "\n",
     );
     let mut server = make_real_server(input);
@@ -86,9 +86,9 @@ fn test_mcp_launch_and_get_screen() {
 #[test]
 fn test_mcp_launch_and_list() {
     let input = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pty_launch","arguments":{"command":"/bin/echo","args":["test"]}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tttt_pty_launch","arguments":{"command":"/bin/echo","args":["test"]}}}"#,
         "\n",
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"pty_list","arguments":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tttt_pty_list","arguments":{}}}"#,
         "\n",
     );
     let mut server = make_real_server(input);
@@ -106,11 +106,11 @@ fn test_mcp_launch_and_list() {
 #[test]
 fn test_mcp_launch_and_kill() {
     let input = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pty_launch","arguments":{"command":"/bin/sleep","args":["60"]}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tttt_pty_launch","arguments":{"command":"/bin/sleep","args":["60"]}}}"#,
         "\n",
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"pty_kill","arguments":{"session_id":"pty-1"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tttt_pty_kill","arguments":{"session_id":"pty-1"}}}"#,
         "\n",
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"pty_list","arguments":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tttt_pty_list","arguments":{}}}"#,
         "\n",
     );
     let mut server = make_real_server(input);
@@ -128,11 +128,11 @@ fn test_mcp_launch_and_kill() {
 #[test]
 fn test_mcp_launch_and_resize() {
     let input = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pty_launch","arguments":{"command":"/bin/sleep","args":["60"],"cols":40,"rows":10}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tttt_pty_launch","arguments":{"command":"/bin/sleep","args":["60"],"cols":40,"rows":10}}}"#,
         "\n",
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"pty_resize","arguments":{"session_id":"pty-1","cols":100,"rows":50}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tttt_pty_resize","arguments":{"session_id":"pty-1","cols":100,"rows":50}}}"#,
         "\n",
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"pty_list","arguments":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tttt_pty_list","arguments":{}}}"#,
         "\n",
     );
     let mut server = make_real_server(input);
@@ -148,9 +148,9 @@ fn test_mcp_launch_and_resize() {
 #[test]
 fn test_mcp_launch_and_get_cursor() {
     let input = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pty_launch","arguments":{"command":"/bin/echo","args":["hi"],"cols":40,"rows":10}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tttt_pty_launch","arguments":{"command":"/bin/echo","args":["hi"],"cols":40,"rows":10}}}"#,
         "\n",
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"pty_get_cursor","arguments":{"session_id":"pty-1"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tttt_pty_get_cursor","arguments":{"session_id":"pty-1"}}}"#,
         "\n",
     );
     let mut server = make_real_server(input);
@@ -195,7 +195,7 @@ fn test_mcp_nonexistent_session() {
     let mut server = make_real_server("");
     let resp = server
         .process_line(
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pty_get_screen","arguments":{"session_id":"nonexistent"}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tttt_pty_get_screen","arguments":{"session_id":"nonexistent"}}}"#,
         )
         .unwrap();
 
