@@ -34,8 +34,14 @@ pub struct RealPty {
 }
 
 impl RealPty {
-    /// Spawn a new PTY process with the given command and dimensions.
-    pub fn spawn(command: &str, args: &[&str], cols: u16, rows: u16) -> Result<Self> {
+    /// Spawn a new PTY process with the given command, dimensions, and working directory.
+    pub fn spawn_with_cwd(
+        command: &str,
+        args: &[&str],
+        cwd: Option<&std::path::Path>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -49,6 +55,11 @@ impl RealPty {
         let mut cmd = CommandBuilder::new(command);
         for arg in args {
             cmd.arg(*arg);
+        }
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
+        } else if let Ok(current) = std::env::current_dir() {
+            cmd.cwd(current);
         }
 
         let child = pair
@@ -84,9 +95,13 @@ impl RealPty {
             reader_raw_fd,
         })
     }
-}
 
-impl RealPty {
+    /// Spawn a new PTY process in the current working directory.
+    pub fn spawn(command: &str, args: &[&str], cols: u16, rows: u16) -> Result<Self> {
+        let cwd = std::env::current_dir().ok();
+        Self::spawn_with_cwd(command, args, cwd.as_deref(), cols, rows)
+    }
+
     /// Get the raw file descriptor of the PTY reader for use with poll().
     #[cfg(unix)]
     pub fn reader_raw_fd(&self) -> i32 {

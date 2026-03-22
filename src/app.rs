@@ -144,7 +144,13 @@ impl App {
         let pty_rows = self.screen_rows.saturating_sub(1);
 
         let args: Vec<&str> = self.config.root_args.iter().map(|s| s.as_str()).collect();
-        let backend = RealPty::spawn(&self.config.root_command, &args, pty_cols, pty_rows)?;
+        let backend = RealPty::spawn_with_cwd(
+            &self.config.root_command,
+            &args,
+            Some(&self.config.work_dir),
+            pty_cols,
+            pty_rows,
+        )?;
         let id = self.sessions.generate_id();
         let session = PtySession::new(
             id.clone(),

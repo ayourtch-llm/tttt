@@ -13,7 +13,12 @@ pub fn pty_tool_definitions() -> Vec<Value> {
                     "args": { "type": "array", "items": { "type": "string" }, "description": "Command arguments" },
                     "working_dir": { "type": "string", "description": "Working directory" },
                     "cols": { "type": "integer", "description": "Terminal width (default: 80)" },
-                    "rows": { "type": "integer", "description": "Terminal height (default: 24)" }
+                    "rows": { "type": "integer", "description": "Terminal height (default: 24)" },
+                    "sandbox_profile": {
+                        "type": "string",
+                        "description": "Sandbox profile: 'none', 'read_only_worktree', 'read_write_worktree', 'own_worktree'",
+                        "enum": ["none", "read_only_worktree", "read_write_worktree", "own_worktree"]
+                    }
                 }
             }
         }),

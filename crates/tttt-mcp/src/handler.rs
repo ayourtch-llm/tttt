@@ -151,7 +151,17 @@ impl PtyToolHandler<tttt_pty::RealPty> {
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
 
-        let backend = tttt_pty::RealPty::spawn(command, &cmd_args, cols, rows)?;
+        let cwd = args["working_dir"]
+            .as_str()
+            .map(std::path::PathBuf::from)
+            .or_else(|| Some(self.work_dir.clone()));
+        let backend = tttt_pty::RealPty::spawn_with_cwd(
+            command,
+            &cmd_args,
+            cwd.as_deref(),
+            cols,
+            rows,
+        )?;
         let id = self.manager.generate_id();
         let session = PtySession::new(id.clone(), backend, command.to_string(), cols, rows);
         self.manager.add_session(session)?;
