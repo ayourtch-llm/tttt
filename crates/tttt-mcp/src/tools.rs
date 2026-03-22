@@ -100,6 +100,18 @@ pub fn pty_tool_definitions() -> Vec<Value> {
                 "required": ["session_id", "lines"]
             }
         }),
+        json!({
+            "name": "pty_get_scrollback",
+            "description": "Get scrollback buffer contents (text that has scrolled off the visible screen)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Target session ID" },
+                    "lines": { "type": "integer", "description": "Max lines to return (default: 100)" }
+                },
+                "required": ["session_id"]
+            }
+        }),
     ]
 }
 

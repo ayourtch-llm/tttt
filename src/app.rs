@@ -195,8 +195,12 @@ impl App {
                         let render_data = {
                             let mut mgr = self.sessions.lock().unwrap();
                             if let Ok(session) = mgr.get_mut(&id) {
-                                match session.pump() {
-                                    Ok(n) if n > 0 => {
+                                match session.pump_raw() {
+                                    Ok((n, raw_bytes)) if n > 0 => {
+                                        // Log the raw output
+                                        let _ = self.logger.log_event(&LogEvent::new(
+                                            id.clone(), Direction::Output, raw_bytes,
+                                        ));
                                         let pane_output = self.pane_renderer.render(session.screen().screen());
                                         let cursor = session.cursor_position();
                                         if !pane_output.is_empty() { Some((pane_output, cursor)) } else { None }
@@ -243,7 +247,28 @@ impl App {
                 }
             }
 
-            // Also pump any new sessions the MCP server may have created
+            // Pump all non-active sessions to keep screens updated and log output
+            {
+                let active_id = self.active_session.clone();
+                let mut mgr = self.sessions.lock().unwrap();
+                let ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
+                for sid in ids {
+                    if active_id.as_deref() == Some(&sid) {
+                        continue; // already pumped above
+                    }
+                    if let Ok(session) = mgr.get_mut(&sid) {
+                        if let Ok((n, raw_bytes)) = session.pump_raw() {
+                            if n > 0 {
+                                let _ = self.logger.log_event(&LogEvent::new(
+                                    sid.clone(), Direction::Output, raw_bytes,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Sync session order (MCP may have added new ones)
             self.sync_session_order();
 
             if self.check_session_exit() { break; }

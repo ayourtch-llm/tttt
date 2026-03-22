@@ -115,6 +115,18 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         Ok(json!({"status": "ok"}))
     }
 
+    fn handle_pty_get_scrollback(&self, args: &Value) -> Result<Value> {
+        let session_id = args["session_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
+        let max_lines = args["lines"].as_u64().unwrap_or(100) as usize;
+        let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let session = mgr.get_mut(session_id)?;
+        session.pump()?;
+        let lines = session.get_scrollback(max_lines);
+        Ok(json!({"lines": lines}))
+    }
+
     fn handle_pty_set_scrollback(&self, args: &Value) -> Result<Value> {
         let session_id = args["session_id"]
             .as_str()
@@ -188,6 +200,7 @@ impl ToolHandler for PtyToolHandler<tttt_pty::RealPty> {
             "pty_kill" => self.handle_pty_kill(args),
             "pty_get_cursor" => self.handle_pty_get_cursor(args),
             "pty_resize" => self.handle_pty_resize(args),
+            "pty_get_scrollback" => self.handle_pty_get_scrollback(args),
             "pty_set_scrollback" => self.handle_pty_set_scrollback(args),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
@@ -208,6 +221,7 @@ impl ToolHandler for PtyToolHandler<MockPty> {
             "pty_kill" => self.handle_pty_kill(args),
             "pty_get_cursor" => self.handle_pty_get_cursor(args),
             "pty_resize" => self.handle_pty_resize(args),
+            "pty_get_scrollback" => self.handle_pty_get_scrollback(args),
             "pty_set_scrollback" => self.handle_pty_set_scrollback(args),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
@@ -712,9 +726,9 @@ mod tests {
         composite.add_handler(Box::new(make_handler()));
         composite.add_handler(Box::new(make_scheduler_handler()));
 
-        // Should have 8 PTY + 4 scheduler = 12 tool definitions
+        // Should have 9 PTY + 4 scheduler = 13 tool definitions
         let defs = composite.tool_definitions();
-        assert_eq!(defs.len(), 12);
+        assert_eq!(defs.len(), 13);
 
         // PTY tool should work
         let result = composite.handle_tool_call("pty_list", &json!({}));

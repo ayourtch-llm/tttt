@@ -1,0 +1,12 @@
+[package]
+name = "vt100"
+version = "0.15.2"
+edition = "2021"
+license = "MIT"
+description = "Library for parsing terminal data (vendored for tttt)"
+
+[dependencies]
+itoa = "1.0"
+log = "0.4"
+unicode-width = "0.1"
+vte = "0.11"

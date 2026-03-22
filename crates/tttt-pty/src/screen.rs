@@ -87,6 +87,12 @@ impl ScreenBuffer {
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
     }
+
+    /// Get lines from the scrollback buffer (text that scrolled off the visible screen).
+    /// Returns up to `max_lines` lines in chronological order (oldest first).
+    pub fn get_scrollback(&self, max_lines: usize) -> Vec<String> {
+        self.parser.screen().scrollback_contents(max_lines)
+    }
 }
 
 #[cfg(test)]

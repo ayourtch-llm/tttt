@@ -56,8 +56,15 @@ impl<B: PtyBackend> PtySession<B> {
     /// Read available output from the PTY and feed it to the screen buffer.
     /// Returns the number of bytes read.
     pub fn pump(&mut self) -> Result<usize> {
+        let (n, _) = self.pump_raw()?;
+        Ok(n)
+    }
+
+    /// Read available output from the PTY, feed to screen buffer, and return raw bytes.
+    /// Returns (bytes_read, raw_data). The raw data can be used for logging.
+    pub fn pump_raw(&mut self) -> Result<(usize, Vec<u8>)> {
         if self.status != SessionStatus::Running {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
         let mut buf = [0u8; 32768];
         let n = self.backend.read(&mut buf)?;
@@ -65,7 +72,7 @@ impl<B: PtyBackend> PtySession<B> {
             self.screen.process(&buf[..n]);
         }
         self.update_status()?;
-        Ok(n)
+        Ok((n, buf[..n].to_vec()))
     }
 
     /// Send keys to the PTY, processing special key sequences.
@@ -144,6 +151,11 @@ impl<B: PtyBackend> PtySession<B> {
     /// Access the PTY backend (for getting raw fd, etc.).
     pub fn backend(&self) -> &B {
         &self.backend
+    }
+
+    /// Get scrollback buffer contents (text that scrolled off the visible screen).
+    pub fn get_scrollback(&self, max_lines: usize) -> Vec<String> {
+        self.screen.get_scrollback(max_lines)
     }
 
     /// Set scrollback buffer depth.
@@ -286,6 +298,26 @@ mod tests {
         session.kill().unwrap();
         let n = session.pump().unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_session_pump_raw_returns_bytes() {
+        let mut mock = MockPty::new(80, 24);
+        mock.queue_output(b"raw output data");
+        let mut session = PtySession::new("t1".to_string(), mock, "bash".to_string(), 80, 24);
+        let (n, raw) = session.pump_raw().unwrap();
+        assert_eq!(n, 15);
+        assert_eq!(raw, b"raw output data");
+        // Screen should also have the content
+        assert!(session.get_screen().contains("raw output data"));
+    }
+
+    #[test]
+    fn test_session_pump_raw_empty() {
+        let mut session = make_session();
+        let (n, raw) = session.pump_raw().unwrap();
+        assert_eq!(n, 0);
+        assert!(raw.is_empty());
     }
 
     #[test]
