@@ -1,9 +1,10 @@
 //! Client for `tttt attach` — connects to a running tttt instance.
 //!
-//! Uses client-side double-buffering: server ANSI data is applied to a local
-//! vt100 screen, then PaneRenderer computes the minimal diff to the real
-//! terminal. This prevents scroll floods when the inner program (e.g., Claude
-//! Code) redraws its entire history.
+//! Uses a virtual screen approach to prevent scroll floods:
+//! - All server updates are applied to a virtual vt100 screen immediately
+//! - The real terminal is only updated when the socket has no more pending data
+//! - This means rapid redraws (e.g., Claude Code redrawing history) are absorbed
+//!   into the virtual screen, and only the final state is rendered
 
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::io::{Read, Write};
@@ -30,19 +31,14 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Clear screen
     write_fd(stdout_fd, clear_screen().as_bytes());
 
-    // Client-side double buffer:
-    // 1. server_screen: vt100 parser that receives server's ANSI data
-    // 2. client_renderer: PaneRenderer that computes minimal diff to real terminal
-    //
-    // This prevents scroll floods: even if the server sends a full screen redraw
-    // (e.g., Claude Code redrawing history), we only update the cells that
-    // actually changed from the client's perspective.
-    let mut server_screen = vt100::Parser::new(term_rows, term_cols, 0);
-    let mut client_renderer = PaneRenderer::new(term_cols, term_rows, 1, 1);
+    // Virtual screen: absorbs all server updates instantly.
+    // Only flushed to real terminal when socket is idle.
+    let mut virtual_screen = vt100::Parser::new(term_rows, term_cols, 0);
+    let mut renderer = PaneRenderer::new(term_cols, term_rows, 1, 1);
+    let mut last_cursor = (0u16, 0u16);
+    let mut virtual_dirty = false;
 
     let mut read_buf = Vec::new();
-    let mut last_cursor = (1u16, 1u16);
-    let mut last_server_cursor = (0u16, 0u16);
 
     loop {
         let stdin_pfd = PollFd::new(
@@ -83,29 +79,35 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Read from server
+        // Read ALL available data from server into buffer
+        let mut got_server_data = false;
         if let Some(flags) = fds[1].revents() {
             if flags.contains(PollFlags::POLLIN) {
-                let mut tmp = [0u8; 65536];
-                match stream.read(&mut tmp) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        read_buf.extend_from_slice(&tmp[..n]);
+                // Drain the socket completely
+                loop {
+                    let mut tmp = [0u8; 65536];
+                    match stream.read(&mut tmp) {
+                        Ok(0) => {
+                            // EOF — server disconnected
+                            return Ok(());
+                        }
+                        Ok(n) => {
+                            read_buf.extend_from_slice(&tmp[..n]);
+                            got_server_data = true;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => return Ok(()),
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => break,
                 }
             }
             if let Some(flags) = fds[1].revents() {
                 if flags.contains(PollFlags::POLLHUP) {
-                    break;
+                    return Ok(());
                 }
             }
         }
 
-        // Process received messages — batch all pending before rendering
-        let mut needs_render = false;
-
+        // Process ALL pending messages into virtual screen
         while let Some((msg, consumed)) = decode_message::<ServerMsg>(&read_buf) {
             read_buf.drain(..consumed);
             match msg {
@@ -115,41 +117,37 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     cursor_col,
                 } => {
                     if !screen_data.is_empty() {
-                        // Reset and replay: contents_formatted() is a full
-                        // screen snapshot, so we create a fresh parser each
-                        // time to avoid state accumulation.
-                        server_screen = vt100::Parser::new(term_rows, term_cols, 0);
-                        server_screen.process(&screen_data);
-                        needs_render = true;
+                        // Apply to virtual screen (fresh parser for clean state)
+                        virtual_screen = vt100::Parser::new(term_rows, term_cols, 0);
+                        virtual_screen.process(&screen_data);
+                        virtual_dirty = true;
                     }
-                    // Use server's cursor coords (0-indexed PTY coords)
-                    last_server_cursor = (cursor_row, cursor_col);
+                    last_cursor = (cursor_row, cursor_col);
                 }
-                ServerMsg::SessionList { .. } => {
-                    // TODO: render sidebar
-                }
-                ServerMsg::Goodbye => {
-                    break;
-                }
+                ServerMsg::SessionList { .. } => {}
+                ServerMsg::Goodbye => return Ok(()),
             }
         }
 
-        // Render: use PaneRenderer to compute minimal diff from server_screen
-        // to real terminal. This is the key anti-flood mechanism.
-        if needs_render {
-            let output = client_renderer.render(server_screen.screen());
+        // Only flush virtual screen to real terminal when:
+        // 1. Virtual screen has changes AND
+        // 2. No more data waiting on the socket (we've drained it)
+        //
+        // This is the key insight: if data is still arriving, we keep
+        // updating the virtual screen and skip the real terminal render.
+        // Only when the socket goes quiet do we render the final state.
+        if virtual_dirty && !got_server_data {
+            // Nothing more coming right now — safe to render
+            let output = renderer.render(virtual_screen.screen());
             if !output.is_empty() {
                 write_fd(stdout_fd, &output);
             }
-            // Position cursor: 0-indexed server coords → 1-indexed terminal
-            let new_cursor = (last_server_cursor.0 + 1, last_server_cursor.1 + 1);
-            if new_cursor != last_cursor {
-                write_fd(
-                    stdout_fd,
-                    cursor_goto(new_cursor.0, new_cursor.1).as_bytes(),
-                );
-                last_cursor = new_cursor;
-            }
+            let new_cursor = (last_cursor.0 + 1, last_cursor.1 + 1);
+            write_fd(
+                stdout_fd,
+                cursor_goto(new_cursor.0, new_cursor.1).as_bytes(),
+            );
+            virtual_dirty = false;
         }
     }
 
