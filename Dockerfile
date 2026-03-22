@@ -72,6 +72,3 @@ WORKDIR /workspace
 
 # The entrypoint is the wrapper script
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-
-# Default to showing help
-CMD ["--help"]
