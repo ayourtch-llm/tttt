@@ -100,21 +100,31 @@ fn run_tui(cli: Cli) {
 
 /// Standalone MCP server mode — runs on stdin/stdout with its own session manager.
 fn run_standalone_mcp_server(workdir: Option<PathBuf>) {
-    use tttt_mcp::{McpServer, PtyToolHandler};
+    use tttt_mcp::{
+        CompositeToolHandler, McpServer, PtyToolHandler, SchedulerToolHandler,
+    };
     use tttt_pty::{RealPty, SessionManager};
+    use tttt_scheduler::Scheduler;
 
     let work_dir = workdir.unwrap_or_else(|| {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     });
 
     let manager: SessionManager<RealPty> = SessionManager::new();
-    let handler = PtyToolHandler::new_owned(manager, work_dir);
+    let pty_handler = PtyToolHandler::new_owned(manager, work_dir);
+
+    let scheduler = Scheduler::new();
+    let scheduler_handler = SchedulerToolHandler::new_owned(scheduler);
+
+    let mut composite = CompositeToolHandler::new();
+    composite.add_handler(Box::new(pty_handler));
+    composite.add_handler(Box::new(scheduler_handler));
 
     let stdin = std::io::stdin().lock();
     let stdout = std::io::stdout().lock();
     let reader = std::io::BufReader::new(stdin);
 
-    let mut server = McpServer::new(reader, stdout, handler);
+    let mut server = McpServer::new(reader, stdout, composite);
 
     if let Err(e) = server.run() {
         eprintln!("MCP server error: {}", e);
