@@ -237,8 +237,10 @@ impl App {
         }
 
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let backend = RealPty::spawn_with_cwd(
+        let tttt_pid = std::process::id();
+        let backend = RealPty::spawn_with_cwd_and_env(
             &self.config.root_command, &args_refs, Some(&self.config.work_dir), pty_cols, pty_rows,
+            [("TTTT_PID".to_string(), tttt_pid.to_string())],
         )?;
         let mut mgr = self.sessions.lock().unwrap();
         let id = mgr.generate_id();

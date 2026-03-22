@@ -42,6 +42,18 @@ impl RealPty {
         cols: u16,
         rows: u16,
     ) -> Result<Self> {
+        Self::spawn_with_cwd_and_env(command, args, cwd, cols, rows, [])
+    }
+
+    /// Spawn a new PTY process with the given command, dimensions, working directory, and environment variables.
+    pub fn spawn_with_cwd_and_env(
+        command: &str,
+        args: &[&str],
+        cwd: Option<&std::path::Path>,
+        cols: u16,
+        rows: u16,
+        env: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -60,6 +72,11 @@ impl RealPty {
             cmd.cwd(dir);
         } else if let Ok(current) = std::env::current_dir() {
             cmd.cwd(current);
+        }
+
+        // Set environment variables
+        for (key, value) in env {
+            cmd.env(key, value);
         }
 
         let child = pair
