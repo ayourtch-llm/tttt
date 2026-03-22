@@ -203,15 +203,20 @@ impl App {
                                         ));
                                         let pane_output = self.pane_renderer.render(session.screen().screen());
                                         let cursor = session.cursor_position();
-                                        if !pane_output.is_empty() { Some((pane_output, cursor)) } else { None }
+                                        // Always return cursor position — even if no cells changed
+                                        // (e.g., arrow keys move cursor without changing content)
+                                        Some((pane_output, cursor))
                                     }
                                     _ => None,
                                 }
                             } else { None }
                         };
                         if let Some((pane_output, (row, col))) = render_data {
-                            write_all(stdout_fd, &pane_output)?;
-                            self.render_sidebar(stdout_fd)?;
+                            if !pane_output.is_empty() {
+                                write_all(stdout_fd, &pane_output)?;
+                                self.render_sidebar(stdout_fd)?;
+                            }
+                            // Always restore cursor to correct position
                             let (tr, tc) = self.pane_renderer.cursor_terminal_position(row, col);
                             write_all(stdout_fd, cursor_goto(tr, tc).as_bytes())?;
                         }
