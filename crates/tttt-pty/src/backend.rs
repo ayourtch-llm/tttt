@@ -106,7 +106,7 @@ impl RealPty {
             use nix::sys::stat::{Mode, SFlag};
             let flags = fcntl(reader_raw_fd, FcntlArg::F_GETFL)
                 .map_err(|e| PtyError::Spawn(format!("fcntl F_GETFL failed: {}", e)))?;
-            fcntl(reader_raw_fd, FcntlArg::F_SETFL(nix::fcntl::OFlag::from_bits(flags).unwrap() | nix::fcntl::OFlag::O_NONBLOCK))
+            fcntl(reader_raw_fd, FcntlArg::F_SETFL(nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK))
                 .map_err(|e| PtyError::Spawn(format!("fcntl F_SETFL failed: {}", e)))?;
         }
 
