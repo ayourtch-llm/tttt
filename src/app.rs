@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tttt_log::{Direction, LogEvent, LogSink, MultiLogger, SqliteLogger, TextLogger};
 use tttt_mcp::notification::NotificationRegistry;
+use tttt_mcp::SharedNotificationRegistry;
 use tttt_pty::{PtySession, RealPty, SessionManager, SessionStatus};
 use tttt_scheduler::{Scheduler, SchedulerEvent};
 use std::os::unix::net::UnixListener;
@@ -97,7 +98,7 @@ pub struct App {
     pane_renderer: PaneRenderer,
     logger: MultiLogger,
     scheduler: Scheduler,
-    notifications: NotificationRegistry,
+    notifications: SharedNotificationRegistry,
     active_session: Option<String>,
     session_order: Vec<String>,
     screen_cols: u16,
@@ -133,7 +134,7 @@ impl App {
             pane_renderer: PaneRenderer::new(pty_cols, pty_rows, 1, 1),
             logger: MultiLogger::new(),
             scheduler: Scheduler::new(),
-            notifications: NotificationRegistry::new(),
+            notifications: Arc::new(Mutex::new(NotificationRegistry::new())),
             active_session: None,
             session_order: Vec::new(),
             screen_cols: cols,
@@ -420,10 +421,11 @@ impl App {
                 let mgr = self.sessions.lock().unwrap();
                 let ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
                 let mut injections = Vec::new();
+                let mut notif = self.notifications.lock().unwrap();
                 for sid in &ids {
                     if let Ok(session) = mgr.get(sid) {
                         let screen_text = session.get_screen();
-                        for inj in self.notifications.check_session(sid, &screen_text) {
+                        for inj in notif.check_session(sid, &screen_text) {
                             injections.push((inj.target_session_id, inj.text));
                         }
                     }
@@ -666,17 +668,20 @@ impl App {
                         // Each MCP proxy client gets its own thread with a
                         // CompositeToolHandler backed by the shared session manager.
                         let sessions = self.sessions.clone();
+                        let notifications = self.notifications.clone();
                         let work_dir = self.config.work_dir.clone();
                         std::thread::spawn(move || {
                             use tttt_mcp::proxy::handle_proxy_client;
-                            use tttt_mcp::{PtyToolHandler, SchedulerToolHandler, CompositeToolHandler};
+                            use tttt_mcp::{PtyToolHandler, SchedulerToolHandler, NotificationToolHandler, CompositeToolHandler};
                             use tttt_scheduler::Scheduler;
 
-                            let pty_handler = PtyToolHandler::new(sessions, work_dir);
+                            let pty_handler = PtyToolHandler::new(sessions.clone(), work_dir);
                             let scheduler_handler = SchedulerToolHandler::new_owned(Scheduler::new());
+                            let notif_handler = NotificationToolHandler::new(notifications, sessions);
                             let mut composite = CompositeToolHandler::new();
                             composite.add_handler(Box::new(pty_handler));
                             composite.add_handler(Box::new(scheduler_handler));
+                            composite.add_handler(Box::new(notif_handler));
 
                             if let Err(e) = handle_proxy_client(stream, &mut composite, "tttt") {
                                 // Client disconnected or error — normal

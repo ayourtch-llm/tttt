@@ -165,6 +165,71 @@ pub fn scheduler_tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// Returns tool definitions for notification and self-management tools.
+pub fn notification_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "notify_on_prompt",
+            "description": "Register a one-shot notification: when the target session's screen matches the pattern, inject text into the specified session. Eliminates polling.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "watch_session_id": { "type": "string", "description": "Session to watch" },
+                    "pattern": { "type": "string", "description": "Regex pattern to match against screen content" },
+                    "inject_text": { "type": "string", "description": "Text to inject when pattern matches" },
+                    "inject_session_id": { "type": "string", "description": "Session to inject into" }
+                },
+                "required": ["watch_session_id", "pattern", "inject_text", "inject_session_id"]
+            }
+        }),
+        json!({
+            "name": "notify_on_pattern",
+            "description": "Register a recurring notification: fires every time the pattern matches (not removed after firing).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "watch_session_id": { "type": "string", "description": "Session to watch" },
+                    "pattern": { "type": "string", "description": "Regex pattern to match" },
+                    "inject_text": { "type": "string", "description": "Text to inject on match" },
+                    "inject_session_id": { "type": "string", "description": "Session to inject into" }
+                },
+                "required": ["watch_session_id", "pattern", "inject_text", "inject_session_id"]
+            }
+        }),
+        json!({
+            "name": "notify_cancel",
+            "description": "Cancel a registered notification watcher.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "watcher_id": { "type": "string", "description": "ID of the watcher to cancel" }
+                },
+                "required": ["watcher_id"]
+            }
+        }),
+        json!({
+            "name": "notify_list",
+            "description": "List all active notification watchers.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "self_inject",
+            "description": "Inject text into a session's PTY stdin, as if typed by the user. Can be used to inject commands, /compact, reminders, etc.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session to inject into" },
+                    "text": { "type": "string", "description": "Text to inject" }
+                },
+                "required": ["session_id", "text"]
+            }
+        }),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,10 +274,16 @@ mod tests {
     }
 
     #[test]
+    fn test_notification_tool_count() {
+        assert_eq!(notification_tool_definitions().len(), 5);
+    }
+
+    #[test]
     fn test_tool_names_unique() {
         let all: Vec<Value> = pty_tool_definitions()
             .into_iter()
             .chain(scheduler_tool_definitions())
+            .chain(notification_tool_definitions())
             .collect();
         let names: Vec<&str> = all.iter().map(|t| t["name"].as_str().unwrap()).collect();
         let mut unique = names.clone();

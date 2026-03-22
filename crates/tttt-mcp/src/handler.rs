@@ -386,6 +386,143 @@ impl ToolHandler for SchedulerToolHandler {
     }
 }
 
+// === Notification tool handler ===
+
+use crate::notification::NotificationRegistry;
+
+pub type SharedNotificationRegistry = Arc<Mutex<NotificationRegistry>>;
+
+/// Handles notification and self-injection tool calls.
+pub struct NotificationToolHandler {
+    registry: SharedNotificationRegistry,
+    sessions: SharedSessionManager<tttt_pty::RealPty>,
+}
+
+impl NotificationToolHandler {
+    pub fn new(
+        registry: SharedNotificationRegistry,
+        sessions: SharedSessionManager<tttt_pty::RealPty>,
+    ) -> Self {
+        Self { registry, sessions }
+    }
+
+    fn handle_notify_on_prompt(&self, args: &Value) -> Result<Value> {
+        let watch_session_id = args["watch_session_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("watch_session_id required".into()))?;
+        let pattern = args["pattern"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("pattern required".into()))?;
+        let inject_text = args["inject_text"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("inject_text required".into()))?;
+        let inject_session_id = args["inject_session_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("inject_session_id required".into()))?;
+
+        let mut reg = self.registry.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let id = reg
+            .add_watcher(
+                watch_session_id.into(),
+                pattern,
+                inject_text.into(),
+                inject_session_id.into(),
+                true, // one-shot
+            )
+            .map_err(|e| McpError::InvalidParams(e))?;
+        Ok(json!({"watcher_id": id}))
+    }
+
+    fn handle_notify_on_pattern(&self, args: &Value) -> Result<Value> {
+        let watch_session_id = args["watch_session_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("watch_session_id required".into()))?;
+        let pattern = args["pattern"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("pattern required".into()))?;
+        let inject_text = args["inject_text"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("inject_text required".into()))?;
+        let inject_session_id = args["inject_session_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("inject_session_id required".into()))?;
+
+        let mut reg = self.registry.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let id = reg
+            .add_watcher(
+                watch_session_id.into(),
+                pattern,
+                inject_text.into(),
+                inject_session_id.into(),
+                false, // recurring
+            )
+            .map_err(|e| McpError::InvalidParams(e))?;
+        Ok(json!({"watcher_id": id}))
+    }
+
+    fn handle_notify_cancel(&self, args: &Value) -> Result<Value> {
+        let watcher_id = args["watcher_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("watcher_id required".into()))?;
+        let mut reg = self.registry.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        if reg.remove_watcher(watcher_id) {
+            Ok(json!({"status": "ok"}))
+        } else {
+            Err(McpError::InvalidParams(format!("watcher not found: {}", watcher_id)))
+        }
+    }
+
+    fn handle_notify_list(&self) -> Result<Value> {
+        let reg = self.registry.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let watchers: Vec<Value> = reg
+            .list_watchers()
+            .iter()
+            .map(|w| {
+                json!({
+                    "id": w.id,
+                    "watch_session_id": w.watch_session_id,
+                    "pattern": w.pattern,
+                    "inject_text": w.inject_text,
+                    "inject_session_id": w.inject_session_id,
+                    "one_shot": w.one_shot,
+                })
+            })
+            .collect();
+        Ok(json!(watchers))
+    }
+
+    fn handle_self_inject(&self, args: &Value) -> Result<Value> {
+        let session_id = args["session_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("session_id required".into()))?;
+        let text = args["text"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("text required".into()))?;
+
+        let mut mgr = self.sessions.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let session = mgr.get_mut(session_id)?;
+        session.send_raw(text.as_bytes())?;
+        Ok(json!({"status": "ok"}))
+    }
+}
+
+impl ToolHandler for NotificationToolHandler {
+    fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
+        match name {
+            "notify_on_prompt" => self.handle_notify_on_prompt(args),
+            "notify_on_pattern" => self.handle_notify_on_pattern(args),
+            "notify_cancel" => self.handle_notify_cancel(args),
+            "notify_list" => self.handle_notify_list(),
+            "self_inject" => self.handle_self_inject(args),
+            _ => Err(McpError::ToolNotFound(name.to_string())),
+        }
+    }
+
+    fn tool_definitions(&self) -> Vec<Value> {
+        crate::tools::notification_tool_definitions()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,5 +881,134 @@ mod tests {
         // Unknown tool should error
         let result = composite.handle_tool_call("nonexistent", &json!({}));
         assert!(matches!(result.unwrap_err(), McpError::ToolNotFound(_)));
+    }
+
+    // --- Notification tool handler tests ---
+
+    fn make_notification_handler() -> NotificationToolHandler {
+        let sessions = Arc::new(Mutex::new(SessionManager::<tttt_pty::RealPty>::new()));
+        let registry = Arc::new(Mutex::new(NotificationRegistry::new()));
+        NotificationToolHandler::new(registry, sessions)
+    }
+
+    #[test]
+    fn test_notify_on_prompt() {
+        let mut handler = make_notification_handler();
+        let result = handler
+            .handle_tool_call(
+                "notify_on_prompt",
+                &json!({
+                    "watch_session_id": "pty-1",
+                    "pattern": "❯\\s*$",
+                    "inject_text": "[DONE] Executor finished",
+                    "inject_session_id": "root"
+                }),
+            )
+            .unwrap();
+        assert!(result["watcher_id"].is_string());
+    }
+
+    #[test]
+    fn test_notify_on_pattern() {
+        let mut handler = make_notification_handler();
+        let result = handler
+            .handle_tool_call(
+                "notify_on_pattern",
+                &json!({
+                    "watch_session_id": "pty-1",
+                    "pattern": "error",
+                    "inject_text": "[ALERT] Error detected",
+                    "inject_session_id": "root"
+                }),
+            )
+            .unwrap();
+        assert!(result["watcher_id"].is_string());
+    }
+
+    #[test]
+    fn test_notify_invalid_regex() {
+        let mut handler = make_notification_handler();
+        let result = handler.handle_tool_call(
+            "notify_on_prompt",
+            &json!({
+                "watch_session_id": "pty-1",
+                "pattern": "[invalid",
+                "inject_text": "x",
+                "inject_session_id": "root"
+            }),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_notify_list() {
+        let mut handler = make_notification_handler();
+        handler
+            .handle_tool_call(
+                "notify_on_prompt",
+                &json!({
+                    "watch_session_id": "pty-1",
+                    "pattern": "a",
+                    "inject_text": "x",
+                    "inject_session_id": "root"
+                }),
+            )
+            .unwrap();
+        handler
+            .handle_tool_call(
+                "notify_on_pattern",
+                &json!({
+                    "watch_session_id": "pty-2",
+                    "pattern": "b",
+                    "inject_text": "y",
+                    "inject_session_id": "root"
+                }),
+            )
+            .unwrap();
+
+        let result = handler.handle_tool_call("notify_list", &json!({})).unwrap();
+        let watchers = result.as_array().unwrap();
+        assert_eq!(watchers.len(), 2);
+    }
+
+    #[test]
+    fn test_notify_cancel() {
+        let mut handler = make_notification_handler();
+        let result = handler
+            .handle_tool_call(
+                "notify_on_prompt",
+                &json!({
+                    "watch_session_id": "pty-1",
+                    "pattern": "a",
+                    "inject_text": "x",
+                    "inject_session_id": "root"
+                }),
+            )
+            .unwrap();
+        let watcher_id = result["watcher_id"].as_str().unwrap();
+
+        handler
+            .handle_tool_call("notify_cancel", &json!({"watcher_id": watcher_id}))
+            .unwrap();
+
+        let list = handler.handle_tool_call("notify_list", &json!({})).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_notify_cancel_nonexistent() {
+        let mut handler = make_notification_handler();
+        let result = handler.handle_tool_call("notify_cancel", &json!({"watcher_id": "nope"}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_self_inject_missing_session() {
+        let mut handler = make_notification_handler();
+        let result = handler.handle_tool_call(
+            "self_inject",
+            &json!({"session_id": "nonexistent", "text": "hello"}),
+        );
+        assert!(result.is_err());
     }
 }
