@@ -1,0 +1,126 @@
+name: Build and Publish Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Additional tag for the image (optional, e.g., v1.0.0)'
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=build-${{ matrix.arch }}
+            type=raw,value=${{ inputs.tag }}-${{ matrix.arch }},enable=${{ inputs.tag != '' }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: ${{ matrix.platform }}
+
+      - name: Generate summary
+        run: |
+          echo "### Docker Image Published Successfully for ${{ matrix.arch }}! :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** \`${{ env.REGISTRY }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Architecture:** \`${{ matrix.arch }}\` (built on native hardware)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+          echo "```" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo "```" >> $GITHUB_STEP_SUMMARY
+
+  create-manifest:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest for latest
+        run: |
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          
+          # Get digests for each architecture
+          AMD64_DIGEST=$(docker manifest inspect $IMAGE:build-amd64 | jq -r '.manifests[0].digest')
+          ARM64_DIGEST=$(docker manifest inspect $IMAGE:build-arm64 | jq -r '.manifests[0].digest')
+          
+          # Create manifest for 'latest' tag from build-* images using digests
+          docker manifest create $IMAGE:latest \
+            $IMAGE@sha256:${AMD64_DIGEST#sha256:} \
+            $IMAGE@sha256:${ARM64_DIGEST#sha256:}
+          
+          docker manifest push $IMAGE:latest
+          echo "Created manifest: $IMAGE:latest"
+
+      - name: Create and push manifest for SHA tag
+        run: |
+          IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          SHA=${{ github.sha }}
+          BRANCH=${{ github.ref_name }}
+          MANIFEST_TAG="${BRANCH}-${SHA}"
+          
+          # Get digests for each architecture
+          AMD64_DIGEST=$(docker manifest inspect $IMAGE:build-amd64 | jq -r '.manifests[0].digest')
+          ARM64_DIGEST=$(docker manifest inspect $IMAGE:build-arm64 | jq -r '.manifests[0].digest')
+          
+          # Create manifest for branch-SHA tag using digests
+          docker manifest create $IMAGE:${MANIFEST_TAG} \
+            $IMAGE@sha256:${AMD64_DIGEST#sha256:} \
+            $IMAGE@sha256:${ARM64_DIGEST#sha256:}
+          
+          docker manifest push $IMAGE:${MANIFEST_TAG}
+          echo "Created manifest: $IMAGE:${MANIFEST_TAG}"
