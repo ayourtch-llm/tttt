@@ -1,0 +1,16 @@
+[package]
+name = "tttt-pty"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+portable-pty = { workspace = true }
+vt100 = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = "0.2"
+nix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

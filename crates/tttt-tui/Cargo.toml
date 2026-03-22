@@ -1,0 +1,11 @@
+[package]
+name = "tttt-tui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tttt-pty = { path = "../tttt-pty" }
+vt100 = { workspace = true }
+nix = { workspace = true }
+signal-hook = { workspace = true }
+thiserror = { workspace = true }
