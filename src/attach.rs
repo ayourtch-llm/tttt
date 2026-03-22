@@ -264,12 +264,21 @@ impl RawMode {
             raw.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
             let _ = tcsetattr(&stdin, SetArg::TCSAFLUSH, &raw);
         }
+        // Enable bracketed paste mode (xterm DEC private mode 2004)
+        // This causes the terminal to wrap pasted content in \x1b[200~ markers
+        // so we can distinguish paste events from regular keystrokes
+        let _ = std::io::stdout().write_all(b"\x1b[?2004h");
+        let _ = std::io::stdout().flush();
         Self { original }
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
+        // Disable bracketed paste mode before restoring original settings
+        let _ = std::io::stdout().write_all(b"\x1b[?2004l");
+        let _ = std::io::stdout().flush();
+        
         if let Some(ref orig) = self.original {
             let stdin = std::io::stdin();
             let _ = nix::sys::termios::tcsetattr(
