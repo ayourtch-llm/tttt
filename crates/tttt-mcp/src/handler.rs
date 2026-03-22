@@ -2,7 +2,7 @@ use crate::error::{McpError, Result};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tttt_pty::{MockPty, PtyBackend, PtySession, SessionManager};
+use tttt_pty::{MockPty, PtyBackend, PtySession, SessionManager, SessionStatus};
 use tttt_scheduler::Scheduler;
 
 /// Trait for handling MCP tool calls.
@@ -58,7 +58,20 @@ impl<B: PtyBackend> PtyToolHandler<B> {
             .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
         let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
         let session = mgr.get_mut(session_id)?;
-        session.pump()?;
+        // Poll until process exits and output is fully drained, or until timeout.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            session.pump()?;
+            if *session.status() != SessionStatus::Running {
+                // Drain any remaining buffered output after exit.
+                while session.pump()? > 0 {}
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let contents = session.get_screen();
         let cursor = session.cursor_position();
         Ok(json!({
