@@ -91,35 +91,18 @@ fn run_tui(cli: Cli) {
     }
 
     // Start MCP proxy socket listener
-    match app.start_mcp_listener() {
-        Ok(path) => {
-            eprintln!("MCP socket: {}", path);
-            eprintln!("Use with: tttt mcp-server --connect {}", path);
-        }
-        Err(e) => {
-            eprintln!("Warning: failed to start MCP listener: {}", e);
-        }
+    if let Err(e) = app.start_mcp_listener() {
+        eprintln!("Warning: failed to start MCP listener: {}", e);
     }
 
     // Start viewer socket listener
-    match app.start_viewer_listener() {
-        Ok(path) => {
-            eprintln!("Viewer socket: {}", path);
-            eprintln!("Connect with: tttt attach -s {}", path);
-        }
-        Err(e) => {
-            eprintln!("Warning: failed to start viewer listener: {}", e);
-        }
+    if let Err(e) = app.start_viewer_listener() {
+        eprintln!("Warning: failed to start viewer listener: {}", e);
     }
 
-    match app.launch_root() {
-        Ok(id) => {
-            eprintln!("Launched root session: {}", id);
-        }
-        Err(e) => {
-            eprintln!("Failed to launch root session: {}", e);
-            std::process::exit(1);
-        }
+    if let Err(e) = app.launch_root() {
+        eprintln!("Failed to launch root session: {}", e);
+        std::process::exit(1);
     }
 
     if let Err(e) = app.run() {
