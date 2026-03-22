@@ -1,11 +1,16 @@
 //! Client for `tttt attach` — connects to a running tttt instance.
+//!
+//! Uses client-side double-buffering: server ANSI data is applied to a local
+//! vt100 screen, then PaneRenderer computes the minimal diff to the real
+//! terminal. This prevents scroll floods when the inner program (e.g., Claude
+//! Code) redraws its entire history.
 
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use tttt_tui::protocol::{decode_message, encode_message, ClientMsg, ServerMsg};
-use tttt_tui::{clear_screen, cursor_goto};
+use tttt_tui::{clear_screen, cursor_goto, PaneRenderer};
 
 /// Run the attach client.
 pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -19,10 +24,24 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let stdin_fd = std::io::stdin().as_raw_fd();
     let stream_fd = stream.as_raw_fd();
 
-    // Clear screen (must be after raw mode entry)
+    // Get our terminal size
+    let (term_cols, term_rows) = terminal_size();
+
+    // Clear screen
     write_fd(stdout_fd, clear_screen().as_bytes());
 
+    // Client-side double buffer:
+    // 1. server_screen: vt100 parser that receives server's ANSI data
+    // 2. client_renderer: PaneRenderer that computes minimal diff to real terminal
+    //
+    // This prevents scroll floods: even if the server sends a full screen redraw
+    // (e.g., Claude Code redrawing history), we only update the cells that
+    // actually changed from the client's perspective.
+    let mut server_screen = vt100::Parser::new(term_rows, term_cols, 0);
+    let mut client_renderer = PaneRenderer::new(term_cols, term_rows, 1, 1);
+
     let mut read_buf = Vec::new();
+    let mut last_cursor = (1u16, 1u16);
 
     loop {
         let stdin_pfd = PollFd::new(
@@ -43,10 +62,7 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 match nix::unistd::read(stdin_fd, &mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        // Check for detach sequence (Ctrl+\ d)
                         if buf[..n].contains(&0x1c) {
-                            // Simplified: any Ctrl+\ in the stream means detach for now
-                            // A proper implementation would use InputParser
                             let msg = ClientMsg::Detach;
                             let _ = stream.set_nonblocking(false);
                             let _ = stream.write_all(&encode_message(&msg));
@@ -66,14 +82,12 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Read from server → display
+        // Read from server
         if let Some(flags) = fds[1].revents() {
             if flags.contains(PollFlags::POLLIN) {
                 let mut tmp = [0u8; 65536];
                 match stream.read(&mut tmp) {
-                    Ok(0) => {
-                        break; // server disconnected
-                    }
+                    Ok(0) => break,
                     Ok(n) => {
                         read_buf.extend_from_slice(&tmp[..n]);
                     }
@@ -83,12 +97,15 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
             if let Some(flags) = fds[1].revents() {
                 if flags.contains(PollFlags::POLLHUP) {
-                    break; // server disconnected
+                    break;
                 }
             }
         }
 
-        // Process received messages
+        // Process received messages — batch all pending before rendering
+        let mut needs_render = false;
+        let mut new_cursor = last_cursor;
+
         while let Some((msg, consumed)) = decode_message::<ServerMsg>(&read_buf) {
             read_buf.drain(..consumed);
             match msg {
@@ -97,25 +114,53 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     cursor_row,
                     cursor_col,
                 } => {
+                    // Apply server's ANSI to our local vt100 screen
                     if !ansi_data.is_empty() {
-                        write_fd(stdout_fd, &ansi_data);
+                        server_screen.process(&ansi_data);
+                        needs_render = true;
                     }
-                    write_fd(
-                        stdout_fd,
-                        cursor_goto(cursor_row, cursor_col).as_bytes(),
-                    );
+                    new_cursor = (cursor_row, cursor_col);
                 }
                 ServerMsg::SessionList { .. } => {
                     // TODO: render sidebar
                 }
                 ServerMsg::Goodbye => {
-                    break; // server shutting down
+                    break;
                 }
             }
+        }
+
+        // Render: use PaneRenderer to compute minimal diff from server_screen
+        // to real terminal. This is the key anti-flood mechanism.
+        if needs_render {
+            let output = client_renderer.render(server_screen.screen());
+            if !output.is_empty() {
+                write_fd(stdout_fd, &output);
+            }
+        }
+
+        // Always update cursor if it changed
+        if new_cursor != last_cursor {
+            write_fd(
+                stdout_fd,
+                cursor_goto(new_cursor.0, new_cursor.1).as_bytes(),
+            );
+            last_cursor = new_cursor;
         }
     }
 
     Ok(())
+}
+
+fn terminal_size() -> (u16, u16) {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
+            (ws.ws_col, ws.ws_row)
+        } else {
+            (80, 24)
+        }
+    }
 }
 
 fn write_fd(fd: i32, data: &[u8]) {

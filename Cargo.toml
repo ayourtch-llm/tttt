@@ -43,6 +43,7 @@ serde = { workspace = true }
 nix = { workspace = true }
 signal-hook = { workspace = true }
 libc = "0.2"
+vt100 = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
