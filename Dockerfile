@@ -33,7 +33,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 RUN npm install -g @anthropic-ai/claude-code
 
 # Copy apchat from ghcr.io
-COPY --from=ghcr.io/ayourtch/apchat:latest /usr/local/bin/apchat /usr/local/bin/apchat
+COPY --from=ghcr.io/ayourtch-llm/apchat:latest /usr/local/bin/apchat /usr/local/bin/apchat
 
 # Install OpenCode CLI (detect architecture and download appropriate binary)
 RUN ARCH=$(dpkg --print-architecture) && \
