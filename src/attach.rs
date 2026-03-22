@@ -42,6 +42,7 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut read_buf = Vec::new();
     let mut last_cursor = (1u16, 1u16);
+    let mut last_server_cursor = (0u16, 0u16);
 
     loop {
         let stdin_pfd = PollFd::new(
@@ -109,17 +110,20 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             read_buf.drain(..consumed);
             match msg {
                 ServerMsg::ScreenUpdate {
-                    ansi_data,
-                    cursor_row: _,
-                    cursor_col: _,
+                    screen_data,
+                    cursor_row,
+                    cursor_col,
                 } => {
-                    // Apply server's ANSI to our local vt100 screen.
-                    // We ignore the server's cursor coords — our local
-                    // vt100 screen tracks cursor position from the ANSI data.
-                    if !ansi_data.is_empty() {
-                        server_screen.process(&ansi_data);
+                    if !screen_data.is_empty() {
+                        // Reset and replay: contents_formatted() is a full
+                        // screen snapshot, so we create a fresh parser each
+                        // time to avoid state accumulation.
+                        server_screen = vt100::Parser::new(term_rows, term_cols, 0);
+                        server_screen.process(&screen_data);
                         needs_render = true;
                     }
+                    // Use server's cursor coords (0-indexed PTY coords)
+                    last_server_cursor = (cursor_row, cursor_col);
                 }
                 ServerMsg::SessionList { .. } => {
                     // TODO: render sidebar
@@ -137,10 +141,8 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             if !output.is_empty() {
                 write_fd(stdout_fd, &output);
             }
-            // Position cursor from the local vt100 screen state.
-            // Use screen cursor + PaneRenderer offset (1,1).
-            let (cr, cc) = server_screen.screen().cursor_position();
-            let new_cursor = (cr + 1, cc + 1); // 0-indexed → 1-indexed
+            // Position cursor: 0-indexed server coords → 1-indexed terminal
+            let new_cursor = (last_server_cursor.0 + 1, last_server_cursor.1 + 1);
             if new_cursor != last_cursor {
                 write_fd(
                     stdout_fd,

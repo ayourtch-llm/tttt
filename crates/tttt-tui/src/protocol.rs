@@ -7,12 +7,13 @@ use serde::{Deserialize, Serialize};
 /// Message from server to client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMsg {
-    /// Full screen content for the client to render.
-    /// Contains rendered ANSI bytes (ready to write to terminal).
+    /// Screen content as vt100 contents_formatted() — a replayable
+    /// representation that a vt100 parser can consume to reproduce
+    /// the exact screen state including attributes and cursor.
     ScreenUpdate {
-        /// ANSI-encoded screen content (cursor positions + cell content).
-        ansi_data: Vec<u8>,
-        /// Cursor position to restore after rendering (1-indexed terminal coords).
+        /// vt100 contents_formatted() output.
+        screen_data: Vec<u8>,
+        /// Cursor position (0-indexed PTY coords).
         cursor_row: u16,
         cursor_col: u16,
     },
@@ -82,7 +83,7 @@ mod tests {
     #[test]
     fn test_encode_decode_server_msg() {
         let msg = ServerMsg::ScreenUpdate {
-            ansi_data: b"hello".to_vec(),
+            screen_data: b"hello".to_vec(),
             cursor_row: 1,
             cursor_col: 5,
         };
@@ -90,8 +91,8 @@ mod tests {
         let (decoded, consumed): (ServerMsg, usize) = decode_message(&encoded).unwrap();
         assert_eq!(consumed, encoded.len());
         match decoded {
-            ServerMsg::ScreenUpdate { ansi_data, cursor_row, cursor_col } => {
-                assert_eq!(ansi_data, b"hello");
+            ServerMsg::ScreenUpdate { screen_data, cursor_row, cursor_col } => {
+                assert_eq!(screen_data, b"hello");
                 assert_eq!(cursor_row, 1);
                 assert_eq!(cursor_col, 5);
             }

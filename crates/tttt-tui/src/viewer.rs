@@ -48,26 +48,39 @@ impl ViewerClient {
 
     /// Send a screen update to the client.
     /// Returns true if data was sent, false if no changes or error.
+    ///
+    /// Uses the PaneRenderer to detect if anything changed. If so,
+    /// sends the vt100 contents_formatted() which the client can
+    /// feed into its own vt100 parser for clean state reproduction.
     pub fn send_screen_update(
         &mut self,
         screen: &vt100::Screen,
         cursor_row: u16,
         cursor_col: u16,
     ) -> bool {
-        let ansi_data = self.renderer.render(screen);
-        let (tr, tc) = self.renderer.cursor_terminal_position(cursor_row, cursor_col);
+        // Use PaneRenderer just for dirty detection
+        let pane_diff = self.renderer.render(screen);
 
-        // Skip sending if nothing changed (empty ansi_data AND same cursor)
-        if ansi_data.is_empty() && tr == self.last_cursor_row && tc == self.last_cursor_col {
+        // Skip if nothing changed
+        if pane_diff.is_empty()
+            && cursor_row == self.last_cursor_row
+            && cursor_col == self.last_cursor_col
+        {
             return true;
         }
-        self.last_cursor_row = tr;
-        self.last_cursor_col = tc;
+        self.last_cursor_row = cursor_row;
+        self.last_cursor_col = cursor_col;
+
+        // Send the full screen as contents_formatted() — this is a
+        // replayable ANSI sequence that reproduces the exact screen state
+        // when fed to a vt100 parser. The client will then use its own
+        // PaneRenderer for minimal rendering to the real terminal.
+        let screen_data = screen.contents_formatted();
 
         let msg = ServerMsg::ScreenUpdate {
-            ansi_data,
-            cursor_row: tr,
-            cursor_col: tc,
+            screen_data,
+            cursor_row,
+            cursor_col,
         };
         self.send_msg(&msg)
     }
