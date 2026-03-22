@@ -104,22 +104,22 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
         // Process received messages — batch all pending before rendering
         let mut needs_render = false;
-        let mut new_cursor = last_cursor;
 
         while let Some((msg, consumed)) = decode_message::<ServerMsg>(&read_buf) {
             read_buf.drain(..consumed);
             match msg {
                 ServerMsg::ScreenUpdate {
                     ansi_data,
-                    cursor_row,
-                    cursor_col,
+                    cursor_row: _,
+                    cursor_col: _,
                 } => {
-                    // Apply server's ANSI to our local vt100 screen
+                    // Apply server's ANSI to our local vt100 screen.
+                    // We ignore the server's cursor coords — our local
+                    // vt100 screen tracks cursor position from the ANSI data.
                     if !ansi_data.is_empty() {
                         server_screen.process(&ansi_data);
                         needs_render = true;
                     }
-                    new_cursor = (cursor_row, cursor_col);
                 }
                 ServerMsg::SessionList { .. } => {
                     // TODO: render sidebar
@@ -137,15 +137,17 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             if !output.is_empty() {
                 write_fd(stdout_fd, &output);
             }
-        }
-
-        // Always update cursor if it changed
-        if new_cursor != last_cursor {
-            write_fd(
-                stdout_fd,
-                cursor_goto(new_cursor.0, new_cursor.1).as_bytes(),
-            );
-            last_cursor = new_cursor;
+            // Position cursor from the local vt100 screen state.
+            // Use screen cursor + PaneRenderer offset (1,1).
+            let (cr, cc) = server_screen.screen().cursor_position();
+            let new_cursor = (cr + 1, cc + 1); // 0-indexed → 1-indexed
+            if new_cursor != last_cursor {
+                write_fd(
+                    stdout_fd,
+                    cursor_goto(new_cursor.0, new_cursor.1).as_bytes(),
+                );
+                last_cursor = new_cursor;
+            }
         }
     }
 
