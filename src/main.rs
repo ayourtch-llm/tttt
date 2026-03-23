@@ -129,6 +129,31 @@ fn run_tui(cli: Cli) {
         std::process::exit(1);
     }
 
+    // Show diagnostic info if root session exited (especially useful for quick failures)
+    if let Some((screen, status)) = &app.last_root_screen {
+        let screen_trimmed = screen.trim();
+        if !screen_trimmed.is_empty() {
+            match status {
+                tttt_pty::SessionStatus::Exited(code) if *code != 0 => {
+                    eprintln!("\n--- Root session exited with code {} ---", code);
+                    eprintln!("{}", screen_trimmed);
+                    eprintln!("---");
+                }
+                tttt_pty::SessionStatus::Exited(0) => {
+                    // Normal exit — show screen if it was very short-lived
+                    // (less than a few lines, likely an error message)
+                    let line_count = screen_trimmed.lines().count();
+                    if line_count <= 10 {
+                        eprintln!("\n--- Root session output ---");
+                        eprintln!("{}", screen_trimmed);
+                        eprintln!("---");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Clean up sockets
     if let Some(ref path) = app.socket_path {
         let _ = std::fs::remove_file(path);

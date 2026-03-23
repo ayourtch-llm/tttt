@@ -115,6 +115,8 @@ pub struct App {
     pub mcp_socket_path: Option<String>,
     /// Whether the server terminal needs a render.
     server_render_dirty: bool,
+    /// Last root session screen + status, captured on exit for diagnostics.
+    pub last_root_screen: Option<(String, SessionStatus)>,
     /// When the current dirty burst started (for max latency cap).
     first_dirty_time: Option<Instant>,
     /// When the last PTY data was received (for burst-end detection).
@@ -145,6 +147,7 @@ impl App {
             mcp_listener: None,
             mcp_socket_path: None,
             server_render_dirty: false,
+            last_root_screen: None,
             first_dirty_time: None,
             last_pty_data_time: None,
             config,
@@ -478,6 +481,19 @@ impl App {
             let events = self.scheduler.lock().unwrap().tick(std::time::Instant::now());
             for event in events { self.handle_scheduler_event(event); }
         }
+
+        // Capture last screen content from root session for diagnostics
+        if let Some(ref id) = self.active_session {
+            let mut mgr = self.sessions.lock().unwrap();
+            if let Ok(session) = mgr.get_mut(id) {
+                // Final pump to get any remaining output
+                let _ = session.pump();
+                let screen = session.get_screen();
+                let status = session.status().clone();
+                self.last_root_screen = Some((screen, status));
+            }
+        }
+
         Ok(())
     }
 
