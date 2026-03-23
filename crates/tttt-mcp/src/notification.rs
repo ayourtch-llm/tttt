@@ -24,6 +24,9 @@ pub struct NotificationWatcher {
     pub one_shot: bool,
     /// Whether this watcher has fired.
     pub fired: bool,
+    /// Snapshot of screen content at last check; None means first check (snapshot only).
+    #[serde(skip)]
+    pub last_screen: Option<String>,
 }
 
 /// Registry of notification watchers.
@@ -73,6 +76,7 @@ impl NotificationRegistry {
             inject_session_id,
             one_shot,
             fired: false,
+            last_screen: None,
         });
         Ok(id)
     }
@@ -101,10 +105,36 @@ impl NotificationRegistry {
             if watcher.fired && watcher.one_shot {
                 continue;
             }
+
+            // On first check, take a snapshot and skip matching.
+            let prev = match watcher.last_screen.take() {
+                None => {
+                    watcher.last_screen = Some(screen_content.to_string());
+                    continue;
+                }
+                Some(p) => p,
+            };
+
+            // Find the new content since last check.
+            let common_bytes = prev.as_bytes().iter()
+                .zip(screen_content.as_bytes().iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let cut = (0..=common_bytes).rev()
+                .find(|&i| screen_content.is_char_boundary(i))
+                .unwrap_or(0);
+            let diff = &screen_content[cut..];
+
+            watcher.last_screen = Some(screen_content.to_string());
+
+            if diff.is_empty() {
+                continue;
+            }
+
             let matches = watcher
                 .compiled
                 .as_ref()
-                .map_or(false, |re| re.is_match(screen_content));
+                .map_or(false, |re| re.is_match(diff));
 
             if matches {
                 injections.push(Injection {
@@ -179,11 +209,23 @@ mod tests {
     }
 
     #[test]
+    fn test_check_session_first_call_snapshots() {
+        let mut reg = NotificationRegistry::new();
+        reg.add_watcher("pty-1".into(), "❯", "notify".into(), "root".into(), true)
+            .unwrap();
+        // First call: snapshot only, no match even if pattern is present
+        let injections = reg.check_session("pty-1", "❯ ");
+        assert!(injections.is_empty());
+        assert_eq!(reg.watcher_count(), 1);
+    }
+
+    #[test]
     fn test_check_session_no_match() {
         let mut reg = NotificationRegistry::new();
         reg.add_watcher("pty-1".into(), "❯", "notify".into(), "root".into(), true)
             .unwrap();
-        let injections = reg.check_session("pty-1", "Thinking...");
+        let _ = reg.check_session("pty-1", "Thinking..."); // snapshot
+        let injections = reg.check_session("pty-1", "Thinking... still");
         assert!(injections.is_empty());
         assert_eq!(reg.watcher_count(), 1); // still active
     }
@@ -193,6 +235,7 @@ mod tests {
         let mut reg = NotificationRegistry::new();
         reg.add_watcher("pty-1".into(), "❯", "[DONE]".into(), "root".into(), true)
             .unwrap();
+        let _ = reg.check_session("pty-1", "output here\n"); // snapshot
         let injections = reg.check_session("pty-1", "output here\n❯ ");
         assert_eq!(injections.len(), 1);
         assert_eq!(injections[0].text, "[DONE]");
@@ -204,7 +247,8 @@ mod tests {
         let mut reg = NotificationRegistry::new();
         reg.add_watcher("pty-1".into(), "❯", "notify".into(), "root".into(), true)
             .unwrap();
-        let _ = reg.check_session("pty-1", "❯ ");
+        let _ = reg.check_session("pty-1", ""); // snapshot
+        let _ = reg.check_session("pty-1", "❯ "); // fires
         assert_eq!(reg.watcher_count(), 0); // removed after firing
     }
 
@@ -213,26 +257,41 @@ mod tests {
         let mut reg = NotificationRegistry::new();
         reg.add_watcher("pty-1".into(), "❯", "notify".into(), "root".into(), false)
             .unwrap();
+        let _ = reg.check_session("pty-1", ""); // snapshot
         let injections = reg.check_session("pty-1", "❯ ");
         assert_eq!(injections.len(), 1);
         assert_eq!(reg.watcher_count(), 1); // still active (recurring)
     }
 
     #[test]
-    fn test_recurring_fires_again_after_reset() {
+    fn test_recurring_fires_again_on_new_content() {
         let mut reg = NotificationRegistry::new();
         reg.add_watcher("pty-1".into(), "❯", "ping".into(), "root".into(), false)
             .unwrap();
 
-        // First fire
+        let _ = reg.check_session("pty-1", ""); // snapshot
+        // New content with pattern — fires
         let inj1 = reg.check_session("pty-1", "❯ ");
         assert_eq!(inj1.len(), 1);
 
-        // Already fired — should not fire again with same content
-        // (but our current impl fires every check; this is intentional
-        // for recurring watchers — they fire every time the pattern matches)
+        // Same screen — no new content, should not fire again
         let inj2 = reg.check_session("pty-1", "❯ ");
-        assert_eq!(inj2.len(), 1); // fires again
+        assert_eq!(inj2.len(), 0);
+
+        // New content with pattern again — fires
+        let inj3 = reg.check_session("pty-1", "❯ \nnew output\n❯ ");
+        assert_eq!(inj3.len(), 1);
+    }
+
+    #[test]
+    fn test_pattern_present_at_registration_does_not_fire_immediately() {
+        let mut reg = NotificationRegistry::new();
+        reg.add_watcher("pty-1".into(), "next slide", "advance".into(), "root".into(), true)
+            .unwrap();
+        // Pattern already on screen when registered — should not fire
+        let inj = reg.check_session("pty-1", "All right\nNext slide\nOkay");
+        assert!(inj.is_empty());
+        assert_eq!(reg.watcher_count(), 1); // still waiting
     }
 
     #[test]
@@ -255,6 +314,7 @@ mod tests {
         reg.add_watcher("pty-1".into(), "error", "err".into(), "root".into(), true)
             .unwrap();
 
+        let _ = reg.check_session("pty-1", "some output\n"); // snapshot
         let injections = reg.check_session("pty-1", "some output\n❯ ");
         assert_eq!(injections.len(), 1);
         assert_eq!(injections[0].text, "done1");
@@ -287,6 +347,7 @@ mod tests {
         )
         .unwrap();
 
+        let _ = reg.check_session("pty-1", ""); // snapshot
         let inj = reg.check_session("pty-1", "⏺ Thinking...");
         assert_eq!(inj.len(), 1);
 

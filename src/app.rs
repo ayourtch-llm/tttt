@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tttt_log::{Direction, LogEvent, LogSink, MultiLogger, SqliteLogger, TextLogger};
 use tttt_mcp::notification::NotificationRegistry;
-use tttt_mcp::SharedNotificationRegistry;
+use tttt_mcp::{SharedNotificationRegistry, SharedScheduler};
 use tttt_pty::{PtySession, RealPty, SessionManager, SessionStatus};
 use tttt_scheduler::{Scheduler, SchedulerEvent};
 use std::os::unix::net::UnixListener;
@@ -97,7 +97,7 @@ pub struct App {
     sidebar: SidebarRenderer,
     pane_renderer: PaneRenderer,
     logger: MultiLogger,
-    scheduler: Scheduler,
+    scheduler: SharedScheduler,
     notifications: SharedNotificationRegistry,
     active_session: Option<String>,
     session_order: Vec<String>,
@@ -133,7 +133,7 @@ impl App {
             sidebar: SidebarRenderer::new(config.sidebar_width),
             pane_renderer: PaneRenderer::new(pty_cols, pty_rows, 1, 1),
             logger: MultiLogger::new(),
-            scheduler: Scheduler::new(),
+            scheduler: Arc::new(Mutex::new(Scheduler::new())),
             notifications: Arc::new(Mutex::new(NotificationRegistry::new())),
             active_session: None,
             session_order: Vec::new(),
@@ -460,7 +460,8 @@ impl App {
                 let mut mgr = self.sessions.lock().unwrap();
                 for (target_id, text) in &pending_injections {
                     if let Ok(session) = mgr.get_mut(target_id) {
-                        let _ = session.send_raw(text.as_bytes());
+                        let bytes = text.replace("[ENTER]", "\r").into_bytes();
+                        let _ = session.send_raw(&bytes);
                     }
                     let _ = self.logger.log_event(&LogEvent::new(
                         target_id.clone(), Direction::Meta,
@@ -474,7 +475,7 @@ impl App {
 
             if self.check_session_exit() { break; }
 
-            let events = self.scheduler.tick(std::time::Instant::now());
+            let events = self.scheduler.lock().unwrap().tick(std::time::Instant::now());
             for event in events { self.handle_scheduler_event(event); }
         }
         Ok(())
@@ -683,6 +684,17 @@ impl App {
                     "scheduler".to_string(), Direction::Meta,
                     format!("REMINDER: {}", reminder.message).into_bytes(),
                 ));
+                // Inject the reminder message into the active session (or first session).
+                let target = self.active_session.clone().or_else(|| {
+                    self.session_order.first().cloned()
+                });
+                if let Some(sid) = target {
+                    let mut mgr = self.sessions.lock().unwrap();
+                    if let Ok(session) = mgr.get_mut(&sid) {
+                        let text = format!("\n[REMINDER: {}]\r", reminder.message);
+                        let _ = session.send_raw(text.as_bytes());
+                    }
+                }
             }
             SchedulerEvent::CronFired(job) => {
                 if let Some(ref session_id) = job.session_id {
@@ -706,17 +718,17 @@ impl App {
                         // CompositeToolHandler backed by the shared session manager.
                         let sessions = self.sessions.clone();
                         let notifications = self.notifications.clone();
+                        let scheduler = self.scheduler.clone();
                         let work_dir = self.config.work_dir.clone();
                         std::thread::spawn(move || {
                             use tttt_mcp::proxy::handle_proxy_client;
                             use tttt_mcp::{PtyToolHandler, SchedulerToolHandler, NotificationToolHandler, CompositeToolHandler};
-                            use tttt_scheduler::Scheduler;
 
                             // Set the stream to blocking mode for the handler
                             let _ = stream.set_nonblocking(false);
-                            
+
                             let pty_handler = PtyToolHandler::new(sessions.clone(), work_dir);
-                            let scheduler_handler = SchedulerToolHandler::new_owned(Scheduler::new());
+                            let scheduler_handler = SchedulerToolHandler::new(scheduler);
                             let notif_handler = NotificationToolHandler::new(notifications, sessions);
                             let mut composite = CompositeToolHandler::new();
                             composite.add_handler(Box::new(pty_handler));
