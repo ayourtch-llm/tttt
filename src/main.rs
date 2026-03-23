@@ -20,6 +20,10 @@ struct Cli {
     #[arg(short, long)]
     workdir: Option<PathBuf>,
 
+    /// Arguments to pass to the root command (after --)
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    root_args: Vec<String>,
+
     #[command(subcommand)]
     subcommand: Option<Commands>,
 }
@@ -79,7 +83,21 @@ fn run_tui(cli: Cli) {
     config.apply_env_overrides();
 
     if let Some(cmd) = cli.command {
-        config.root_command = cmd;
+        // Shell-style parsing: supports quotes and escapes
+        // e.g., -e 'claude --prompt "hello world"' → ["claude", "--prompt", "hello world"]
+        match shell_words::split(&cmd) {
+            Ok(parts) if !parts.is_empty() => {
+                config.root_command = parts[0].clone();
+                config.root_args = parts[1..].to_vec();
+            }
+            _ => {
+                config.root_command = cmd;
+            }
+        }
+    }
+    // Append any trailing arguments (after --)
+    if !cli.root_args.is_empty() {
+        config.root_args.extend(cli.root_args);
     }
     if let Some(dir) = cli.workdir {
         config.work_dir = dir;
