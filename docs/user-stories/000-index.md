@@ -23,8 +23,6 @@
 | [013](013-key-reference.md) | Complete Key Input Reference | **Critical** | **HIGH** |
 | [014](014-self-injection.md) | Self-Injected Commands & Notifications | High | **HIGH** |
 | [015](015-rate-limiting.md) | Injection Pacing & Throttling | **Critical** | Medium |
-| [016](016-bootstrap-prompt.md) | Root Agent Bootstrap Prompt | **Critical** | **HIGH** |
-| [999](999-lessons-from-the-field.md) | Lessons From the Field | Reference | — |
 | [011](011-heterogeneous-ai-army.md) | Heterogeneous AI Team | Vision | N/A (future) |
 
 ## Top 5 Pain Points (implement these first)

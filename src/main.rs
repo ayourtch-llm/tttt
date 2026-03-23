@@ -20,6 +20,10 @@ struct Cli {
     #[arg(short, long)]
     workdir: Option<PathBuf>,
 
+    /// Show full initial screen dump on exit (default: first 10 lines)
+    #[arg(long)]
+    full_dump: bool,
+
     /// Arguments to pass to the root command (after --)
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     root_args: Vec<String>,
@@ -129,28 +133,25 @@ fn run_tui(cli: Cli) {
         std::process::exit(1);
     }
 
-    // Show diagnostic info if root session exited (especially useful for quick failures)
+    // Show root session's last screen on exit for diagnostics
     if let Some((screen, status)) = &app.last_root_screen {
         let screen_trimmed = screen.trim();
         if !screen_trimmed.is_empty() {
-            match status {
-                tttt_pty::SessionStatus::Exited(code) if *code != 0 => {
-                    eprintln!("\n--- Root session exited with code {} ---", code);
-                    eprintln!("{}", screen_trimmed);
-                    eprintln!("---");
+            let exit_info = match status {
+                tttt_pty::SessionStatus::Exited(code) => format!("exited with code {}", code),
+                tttt_pty::SessionStatus::Running => "still running".to_string(),
+            };
+            eprintln!("\n--- Root session {} ---", exit_info);
+            let lines: Vec<&str> = screen_trimmed.lines().collect();
+            if cli.full_dump || lines.len() <= 10 {
+                eprintln!("{}", screen_trimmed);
+            } else {
+                for line in &lines[..10] {
+                    eprintln!("{}", line);
                 }
-                tttt_pty::SessionStatus::Exited(0) => {
-                    // Normal exit — show screen if it was very short-lived
-                    // (less than a few lines, likely an error message)
-                    let line_count = screen_trimmed.lines().count();
-                    if line_count <= 10 {
-                        eprintln!("\n--- Root session output ---");
-                        eprintln!("{}", screen_trimmed);
-                        eprintln!("---");
-                    }
-                }
-                _ => {}
+                eprintln!("... ({} more lines, use --full-dump to show all)", lines.len() - 10);
             }
+            eprintln!("---");
         }
     }
 
