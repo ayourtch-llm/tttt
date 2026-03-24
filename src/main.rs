@@ -168,11 +168,19 @@ fn run_attach(socket: Option<String>) {
     let socket_path = match socket {
         Some(s) => s,
         None => {
-            // Auto-detect: find /tmp/tttt-*.sock
+            // Auto-detect: find /tmp/tttt-[0-9]+.sock
             match find_tttt_socket() {
-                Some(path) => path,
-                None => {
+                SocketResult::Found(path) => path,
+                SocketResult::None => {
                     eprintln!("No running tttt instance found. Specify socket with -s.");
+                    std::process::exit(1);
+                }
+                SocketResult::Multiple(sockets) => {
+                    eprintln!("Multiple running tttt instances found:");
+                    for socket in sockets {
+                        eprintln!("  {}", socket);
+                    }
+                    eprintln!("Please use -s <socket path> to connect.");
                     std::process::exit(1);
                 }
             }
@@ -185,19 +193,42 @@ fn run_attach(socket: Option<String>) {
     }
 }
 
-fn find_tttt_socket() -> Option<String> {
-    let read_dir = std::fs::read_dir("/tmp").ok()?;
+enum SocketResult {
+    None,
+    Found(String),
+    Multiple(Vec<String>),
+}
+
+fn find_tttt_socket() -> SocketResult {
+    let read_dir = match std::fs::read_dir("/tmp") {
+        Ok(d) => d,
+        Err(_) => return SocketResult::None,
+    };
+    
+    let mut sockets: Vec<String> = Vec::new();
+    
     for entry in read_dir.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
+        // Match pattern: tttt-[digits].sock
         if name.starts_with("tttt-") && name.ends_with(".sock") {
-            let path = entry.path().to_string_lossy().to_string();
-            // Check if socket is alive by trying to connect
-            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
-                return Some(path);
+            // Extract the numeric part to validate the pattern
+            let stem = name.strip_prefix("tttt-").unwrap();
+            let stem = stem.strip_suffix(".sock").unwrap();
+            if stem.parse::<u64>().is_ok() {
+                let path = entry.path().to_string_lossy().to_string();
+                // Check if socket is alive by trying to connect
+                if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                    sockets.push(path);
+                }
             }
         }
     }
-    None
+    
+    match sockets.len() {
+        0 => SocketResult::None,
+        1 => SocketResult::Found(sockets.pop().unwrap()),
+        _ => SocketResult::Multiple(sockets),
+    }
 }
 
 /// Proxy MCP server mode — forwards JSON-RPC between Claude (stdio) and tttt TUI (socket).
