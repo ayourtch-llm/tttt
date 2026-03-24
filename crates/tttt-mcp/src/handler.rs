@@ -514,7 +514,12 @@ impl NotificationToolHandler {
 
         let mut mgr = self.sessions.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
         let session = mgr.get_mut(session_id)?;
-        session.send_raw(text.as_bytes())?;
+        let mut bytes = text.as_bytes().to_vec();
+        // Always auto-submit: append \r if not already present
+        if bytes.last() != Some(&b'\r') {
+            bytes.push(b'\r');
+        }
+        session.send_raw(&bytes)?;
         Ok(json!({"status": "ok"}))
     }
 }

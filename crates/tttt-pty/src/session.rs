@@ -348,6 +348,24 @@ mod tests {
     }
 
     #[test]
+    fn test_session_send_keys_large_message() {
+        // Verify that large messages (>1KB) can be sent without error.
+        // This exercises the write path that previously failed with EAGAIN on real PTYs.
+        let mock = MockPty::new(80, 24);
+        let mut session = PtySession::new("t1".to_string(), mock, "bash".to_string(), 80, 24);
+        let large_msg = "x".repeat(2000);
+        session.send_keys(&large_msg).unwrap();
+    }
+
+    #[test]
+    fn test_session_send_raw_large_message() {
+        let mock = MockPty::new(80, 24);
+        let mut session = PtySession::new("t1".to_string(), mock, "bash".to_string(), 80, 24);
+        let large_data = vec![b'A'; 4096];
+        session.send_raw(&large_data).unwrap();
+    }
+
+    #[test]
     fn test_session_get_scrollback() {
         let mut mock = MockPty::new(80, 5);
         // Queue output that overflows the 5-row screen

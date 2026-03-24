@@ -170,7 +170,7 @@ pub fn notification_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "tttt_notify_on_prompt",
-            "description": "Register a one-shot notification: when the target session's screen matches the pattern, inject text into the specified session. Eliminates polling.",
+            "description": "Register a one-shot notification: when the target session's screen matches the pattern, inject text into the specified session and auto-submit (Enter). Eliminates polling.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -184,7 +184,7 @@ pub fn notification_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "tttt_notify_on_pattern",
-            "description": "Register a recurring notification: fires every time the pattern matches (not removed after firing).",
+            "description": "Register a recurring notification: fires every time the pattern matches (not removed after firing). Auto-submits (Enter) after injection.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -217,7 +217,7 @@ pub fn notification_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "tttt_self_inject",
-            "description": "Inject text into a session's PTY stdin, as if typed by the user. Can be used to inject commands, /compact, reminders, etc.",
+            "description": "Inject text into a session's PTY stdin and auto-submit (Enter). Can be used to inject commands, /compact, reminders, etc.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

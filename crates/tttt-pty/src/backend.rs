@@ -140,7 +140,39 @@ impl RealPty {
 
 impl PtyBackend for RealPty {
     fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.writer.write_all(data)?;
+        // Write in chunks to avoid EAGAIN (os error 35) on non-blocking PTY fds.
+        // The master fd is set to non-blocking for reads, which also affects writes.
+        // Large writes (>~1KB) can overflow the kernel PTY buffer.
+        const CHUNK_SIZE: usize = 512;
+        const MAX_RETRIES: usize = 100;
+
+        let mut offset = 0;
+        while offset < data.len() {
+            let end = (offset + CHUNK_SIZE).min(data.len());
+            let mut retries = 0;
+            loop {
+                match self.writer.write(&data[offset..end]) {
+                    Ok(0) => {
+                        return Err(PtyError::Io(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "PTY write returned 0 bytes",
+                        )));
+                    }
+                    Ok(n) => {
+                        offset += n;
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        retries += 1;
+                        if retries >= MAX_RETRIES {
+                            return Err(PtyError::Io(e));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => return Err(PtyError::Io(e)),
+                }
+            }
+        }
         self.writer.flush()?;
         Ok(())
     }

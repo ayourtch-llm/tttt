@@ -121,6 +121,10 @@ pub struct App {
     first_dirty_time: Option<Instant>,
     /// When the last PTY data was received (for burst-end detection).
     last_pty_data_time: Option<Instant>,
+    /// Queued notification injections, drained one at a time to avoid garbling input.
+    pending_injection_queue: Vec<(String, String)>,
+    /// When the last injection was performed (for pacing).
+    last_injection_time: Option<Instant>,
 }
 
 impl App {
@@ -149,6 +153,8 @@ impl App {
             server_render_dirty: false,
             last_root_screen: None,
             first_dirty_time: None,
+            pending_injection_queue: Vec::new(),
+            last_injection_time: None,
             last_pty_data_time: None,
             config,
         }
@@ -442,34 +448,42 @@ impl App {
                 }
             }
 
-            // Check notification watchers against all sessions
-            let pending_injections = {
+            // Check notification watchers against all sessions — queue new injections
+            {
                 let mgr = self.sessions.lock().unwrap();
                 let ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
-                let mut injections = Vec::new();
                 let mut notif = self.notifications.lock().unwrap();
                 for sid in &ids {
                     if let Ok(session) = mgr.get(sid) {
                         let screen_text = session.get_screen();
                         for inj in notif.check_session(sid, &screen_text) {
-                            injections.push((inj.target_session_id, inj.text));
+                            self.pending_injection_queue.push((inj.target_session_id, inj.text));
                         }
                     }
                 }
-                injections
-            };
-            // Perform injections (separate lock scope)
-            if !pending_injections.is_empty() {
-                let mut mgr = self.sessions.lock().unwrap();
-                for (target_id, text) in &pending_injections {
-                    if let Ok(session) = mgr.get_mut(target_id) {
-                        let bytes = text.replace("[ENTER]", "\r").into_bytes();
+            }
+            // Drain one queued injection per tick with pacing (100ms between injections)
+            // to avoid garbling the user's in-progress typing.
+            const INJECTION_PACE_MS: u64 = 100;
+            if !self.pending_injection_queue.is_empty() {
+                let can_inject = self.last_injection_time
+                    .map_or(true, |t| t.elapsed() >= std::time::Duration::from_millis(INJECTION_PACE_MS));
+                if can_inject {
+                    let (target_id, text) = self.pending_injection_queue.remove(0);
+                    let mut mgr = self.sessions.lock().unwrap();
+                    if let Ok(session) = mgr.get_mut(&target_id) {
+                        let mut bytes = text.replace("[ENTER]", "\r").into_bytes();
+                        // Always auto-submit: append \r if not already present
+                        if bytes.last() != Some(&b'\r') {
+                            bytes.push(b'\r');
+                        }
                         let _ = session.send_raw(&bytes);
                     }
                     let _ = self.logger.log_event(&LogEvent::new(
                         target_id.clone(), Direction::Meta,
                         format!("[NOTIFICATION] {}", text).into_bytes(),
                     ));
+                    self.last_injection_time = Some(Instant::now());
                 }
             }
 
