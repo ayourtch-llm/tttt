@@ -406,15 +406,15 @@ use crate::notification::NotificationRegistry;
 pub type SharedNotificationRegistry = Arc<Mutex<NotificationRegistry>>;
 
 /// Handles notification and self-injection tool calls.
-pub struct NotificationToolHandler {
+pub struct NotificationToolHandler<B: PtyBackend = tttt_pty::RealPty> {
     registry: SharedNotificationRegistry,
-    sessions: SharedSessionManager<tttt_pty::RealPty>,
+    sessions: SharedSessionManager<B>,
 }
 
-impl NotificationToolHandler {
+impl<B: PtyBackend> NotificationToolHandler<B> {
     pub fn new(
         registry: SharedNotificationRegistry,
-        sessions: SharedSessionManager<tttt_pty::RealPty>,
+        sessions: SharedSessionManager<B>,
     ) -> Self {
         Self { registry, sessions }
     }
@@ -524,7 +524,7 @@ impl NotificationToolHandler {
     }
 }
 
-impl ToolHandler for NotificationToolHandler {
+impl<B: PtyBackend + 'static> ToolHandler for NotificationToolHandler<B> {
     fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
         match name {
             "tttt_notify_on_prompt" => self.handle_notify_on_prompt(args),
@@ -903,8 +903,8 @@ mod tests {
 
     // --- Notification tool handler tests ---
 
-    fn make_notification_handler() -> NotificationToolHandler {
-        let sessions = Arc::new(Mutex::new(SessionManager::<tttt_pty::RealPty>::new()));
+    fn make_notification_handler() -> NotificationToolHandler<MockPty> {
+        let sessions = Arc::new(Mutex::new(SessionManager::<MockPty>::new()));
         let registry = Arc::new(Mutex::new(NotificationRegistry::new()));
         NotificationToolHandler::new(registry, sessions)
     }
@@ -1028,5 +1028,62 @@ mod tests {
             &json!({"session_id": "nonexistent", "text": "hello"}),
         );
         assert!(result.is_err());
+    }
+
+    fn make_notification_handler_with_session() -> (NotificationToolHandler<MockPty>, String) {
+        let sessions = Arc::new(Mutex::new(SessionManager::<MockPty>::new()));
+        let registry = Arc::new(Mutex::new(NotificationRegistry::new()));
+        let id = {
+            let mut mgr = sessions.lock().unwrap();
+            let id = mgr.generate_id();
+            let mock = MockPty::new(80, 24);
+            let session = tttt_pty::PtySession::new(id.clone(), mock, "bash".to_string(), 80, 24);
+            mgr.add_session(session).unwrap();
+            id
+        };
+        (NotificationToolHandler::new(registry, sessions), id)
+    }
+
+    #[test]
+    fn test_self_inject_appends_cr() {
+        // Verify that self_inject always appends \r for auto-submit.
+        let (mut handler, id) = make_notification_handler_with_session();
+        handler
+            .handle_tool_call(
+                "tttt_self_inject",
+                &json!({"session_id": id, "text": "hello"}),
+            )
+            .unwrap();
+
+        // Inspect what was written to the MockPty
+        let sessions = handler.sessions.lock().unwrap();
+        let session = sessions.get(&id).unwrap();
+        let backend = session.backend();
+        assert!(
+            backend.input_buf.ends_with(b"\r"),
+            "self_inject should auto-append \\r, got: {:?}",
+            String::from_utf8_lossy(&backend.input_buf)
+        );
+        assert_eq!(backend.input_buf, b"hello\r");
+    }
+
+    #[test]
+    fn test_self_inject_does_not_double_cr() {
+        // If text already ends with \r, don't add another.
+        let (mut handler, id) = make_notification_handler_with_session();
+        handler
+            .handle_tool_call(
+                "tttt_self_inject",
+                &json!({"session_id": id, "text": "world\r"}),
+            )
+            .unwrap();
+
+        let sessions = handler.sessions.lock().unwrap();
+        let session = sessions.get(&id).unwrap();
+        let backend = session.backend();
+        assert_eq!(
+            backend.input_buf, b"world\r",
+            "should not double the \\r"
+        );
     }
 }
