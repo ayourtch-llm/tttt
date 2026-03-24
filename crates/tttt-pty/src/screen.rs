@@ -76,7 +76,11 @@ impl ScreenBuffer {
     }
 
     /// Set scrollback buffer depth. Recreates the parser.
+    /// No-op if depth hasn't changed (avoids wiping screen content).
     pub fn set_scrollback(&mut self, lines: usize) {
+        if self.scrollback_lines == lines {
+            return;
+        }
         self.scrollback_lines = lines;
         self.parser = vt100::Parser::new(self.rows, self.cols, lines);
         self.prev_screen = self.parser.screen().clone();
@@ -187,6 +191,17 @@ mod tests {
         let mut buf = ScreenBuffer::new(80, 24);
         buf.set_scrollback(2000);
         assert_eq!(buf.scrollback_lines(), 2000);
+    }
+
+    #[test]
+    fn test_set_scrollback_same_preserves_content() {
+        let mut buf = ScreenBuffer::with_scrollback(80, 24, 1000);
+        buf.process(b"important content");
+        assert!(buf.contents().contains("important content"));
+        // Setting same scrollback depth should be a no-op
+        buf.set_scrollback(1000);
+        assert!(buf.contents().contains("important content"),
+            "set_scrollback with same depth should not wipe content");
     }
 
     #[test]
