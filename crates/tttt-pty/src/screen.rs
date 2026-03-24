@@ -63,15 +63,15 @@ impl ScreenBuffer {
         (self.cols, self.rows)
     }
 
-    /// Resize the screen buffer. Resets the parser state.
-    /// No-op if dimensions haven't changed (avoids wiping screen content).
+    /// Resize the screen buffer.
+    /// No-op if dimensions haven't changed (avoids unnecessary work).
     pub fn resize(&mut self, cols: u16, rows: u16) {
         if self.cols == cols && self.rows == rows {
             return;
         }
         self.cols = cols;
         self.rows = rows;
-        self.parser = vt100::Parser::new(rows, cols, self.scrollback_lines);
+        self.parser.set_size(rows, cols);
         self.prev_screen = self.parser.screen().clone();
     }
 
@@ -151,10 +151,11 @@ mod tests {
     fn test_resize() {
         let mut buf = ScreenBuffer::new(80, 24);
         buf.process(b"some content");
+        let cursor_before = buf.cursor_position();
         buf.resize(120, 40);
         assert_eq!(buf.size(), (120, 40));
-        // screen is reset after resize
-        assert_eq!(buf.cursor_position(), (0, 0));
+        // cursor position should be preserved after resize
+        assert_eq!(buf.cursor_position(), cursor_before);
     }
 
     #[test]
