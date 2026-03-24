@@ -57,7 +57,8 @@ impl SidebarRenderer {
                     }
                 }
             };
-            let label = format!("{}{} {}", i, status_char, truncate(&session.id, usable_width.saturating_sub(3)));
+            let display_name = session.name.as_deref().unwrap_or(&session.id);
+            let label = format!("{}{} {}", i, status_char, truncate(display_name, usable_width.saturating_sub(3)));
             lines.push(self.make_line(row, sidebar_col, &self.pad(&label, usable_width), is_active));
             row += 1;
         }
