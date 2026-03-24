@@ -581,6 +581,7 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     cursor_row,
                     cursor_col,
                 } => {
+                    eprintln!("[CLIENT] ScreenUpdate: data_len={}, cursor=({},{})", screen_data.len(), cursor_row, cursor_col);
                     if !screen_data.is_empty() {
                         // Apply to virtual screen (fresh parser for clean state)
                         virtual_screen = vt100::Parser::new(term_rows, term_cols, 0);

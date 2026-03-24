@@ -813,6 +813,10 @@ impl App {
                         client.renderer = PaneRenderer::new(pty_cols, pty_rows, 1, 1);
                         client.active_session = self.active_session.clone();
                         client.invalidate();
+                        let _ = self.logger.log_event(&LogEvent::new(
+                            "viewer".to_string(), Direction::Meta,
+                            format!("ACCEPT: viewer connected, active_session={:?}, pty={}x{}", self.active_session, pty_cols, pty_rows).into_bytes(),
+                        ));
                         self.viewer_clients.push(client);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -837,6 +841,10 @@ impl App {
                     self.viewer_clients[i].read_buf.drain(..consumed);
                     match msg {
                         protocol::ClientMsg::KeyInput { bytes } => {
+                            let _ = self.logger.log_event(&LogEvent::new(
+                                "viewer".to_string(), Direction::Meta,
+                                format!("INPUT: KeyInput len={}, active_session={:?}", bytes.len(), self.viewer_clients[i].active_session).into_bytes(),
+                            ));
                             // Forward keystrokes to the viewer's active session
                             if let Some(ref sid) = self.viewer_clients[i].active_session.clone() {
                                 let mut mgr = self.sessions.lock().unwrap();
@@ -853,6 +861,10 @@ impl App {
                             }
                         }
                         protocol::ClientMsg::Resize { cols, rows } => {
+                            let _ = self.logger.log_event(&LogEvent::new(
+                                "viewer".to_string(), Direction::Meta,
+                                format!("RESIZE: cols={}, rows={}", cols, rows).into_bytes(),
+                            ));
                             // cols = usable PTY width reported by client
                             // (client subtracts its own sidebar if it has one)
                             self.viewer_clients[i].cols = cols;
@@ -905,57 +917,63 @@ impl App {
             min_rows = min_rows.min(r);
         }
 
-        // Resize all sessions
-        let mut mgr = self.sessions.lock().unwrap();
-        let ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
-        for id in ids {
-            if let Ok(session) = mgr.get_mut(&id) {
-                let _ = session.resize(min_cols, min_rows);
-            }
-        }
-        drop(mgr);
+        // Check if dimensions actually changed
+        let (old_cols, old_rows) = self.pane_renderer.dimensions();
+        let changed = min_cols != old_cols || min_rows != old_rows;
 
-        // Resize main pane renderer and invalidate for full redraw
-        self.pane_renderer.resize(min_cols, min_rows);
-
-        // Clear main terminal to remove stale content from the old wider PTY
-        let _ = write_all(stdout_fd, clear_screen().as_bytes());
-
-        // Force full redraw of active session on main terminal
-        {
+        if changed {
+            // Resize all sessions (ScreenBuffer::resize is a no-op for same dimensions)
             let mut mgr = self.sessions.lock().unwrap();
-            if let Some(ref id) = self.active_session.clone() {
-                if let Ok(session) = mgr.get_mut(id) {
-                    let pane_output = self.pane_renderer.render(session.screen().screen());
-                    let _ = write_all(stdout_fd, &pane_output);
+            let ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
+            for id in ids {
+                if let Ok(session) = mgr.get_mut(&id) {
+                    let _ = session.resize(min_cols, min_rows);
                 }
             }
-        }
-        // Fill gap between PTY area and sidebar with gray dots
-        let max_pty_cols = self.screen_cols.saturating_sub(self.config.sidebar_width);
-        if min_cols < max_pty_cols {
-            let dot_attr = "\x1b[2;90m"; // dim + gray
-            let reset = "\x1b[0m";
-            let dots: String = ".".repeat((max_pty_cols - min_cols) as usize);
-            for row in 0..min_rows {
-                let _ = write_all(
-                    stdout_fd,
-                    format!(
-                        "\x1b[{};{}H{}{}{}",
-                        row + 1,
-                        min_cols + 1,
-                        dot_attr,
-                        dots,
-                        reset
-                    )
-                    .as_bytes(),
-                );
+            drop(mgr);
+
+            // Resize main pane renderer and invalidate for full redraw
+            self.pane_renderer.resize(min_cols, min_rows);
+
+            // Clear main terminal to remove stale content from the old wider PTY
+            let _ = write_all(stdout_fd, clear_screen().as_bytes());
+
+            // Force full redraw of active session on main terminal
+            {
+                let mut mgr = self.sessions.lock().unwrap();
+                if let Some(ref id) = self.active_session.clone() {
+                    if let Ok(session) = mgr.get_mut(id) {
+                        let pane_output = self.pane_renderer.render(session.screen().screen());
+                        let _ = write_all(stdout_fd, &pane_output);
+                    }
+                }
             }
+            // Fill gap between PTY area and sidebar with gray dots
+            let max_pty_cols = self.screen_cols.saturating_sub(self.config.sidebar_width);
+            if min_cols < max_pty_cols {
+                let dot_attr = "\x1b[2;90m"; // dim + gray
+                let reset = "\x1b[0m";
+                let dots: String = ".".repeat((max_pty_cols - min_cols) as usize);
+                for row in 0..min_rows {
+                    let _ = write_all(
+                        stdout_fd,
+                        format!(
+                            "\x1b[{};{}H{}{}{}",
+                            row + 1,
+                            min_cols + 1,
+                            dot_attr,
+                            dots,
+                            reset
+                        )
+                        .as_bytes(),
+                    );
+                }
+            }
+
+            let _ = self.render_sidebar(stdout_fd);
         }
 
-        let _ = self.render_sidebar(stdout_fd);
-
-        // Resize all viewer renderers and invalidate
+        // Always resize and invalidate viewer renderers so they get a fresh update
         for client in &mut self.viewer_clients {
             client.renderer.resize(min_cols, min_rows);
             client.invalidate();
@@ -971,8 +989,24 @@ impl App {
             if let Some(ref sid) = client.active_session.clone() {
                 if let Ok(session) = mgr.get(sid) {
                     let (row, col) = session.cursor_position();
-                    client.send_screen_update(session.screen().screen(), row, col);
+                    let screen = session.screen().screen();
+                    let screen_data_len = screen.contents_formatted().len();
+                    let sent = client.send_screen_update(screen, row, col);
+                    let _ = self.logger.log_event(&LogEvent::new(
+                        "viewer".to_string(), Direction::Meta,
+                        format!("UPDATE: sid={}, sent={}, screen_data_len={}, cursor=({},{})", sid, sent, screen_data_len, row, col).into_bytes(),
+                    ));
+                } else {
+                    let _ = self.logger.log_event(&LogEvent::new(
+                        "viewer".to_string(), Direction::Meta,
+                        format!("UPDATE: session {} not found!", sid).into_bytes(),
+                    ));
                 }
+            } else {
+                let _ = self.logger.log_event(&LogEvent::new(
+                    "viewer".to_string(), Direction::Meta,
+                    "UPDATE: no active_session!".to_string().into_bytes(),
+                ));
             }
         }
     }

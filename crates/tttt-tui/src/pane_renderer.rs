@@ -185,6 +185,11 @@ impl PaneRenderer {
         self.force_redraw = true;
     }
 
+    /// Get current pane dimensions.
+    pub fn dimensions(&self) -> (u16, u16) {
+        (self.pane_cols, self.pane_rows)
+    }
+
     /// Resize the pane renderer.
     pub fn resize(&mut self, pane_cols: u16, pane_rows: u16) {
         self.pane_cols = pane_cols;

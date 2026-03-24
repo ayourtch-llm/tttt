@@ -66,7 +66,7 @@ impl ViewerClient {
             && cursor_row == self.last_cursor_row
             && cursor_col == self.last_cursor_col
         {
-            return true;
+            return true; // SKIPPED - no changes
         }
         self.last_cursor_row = cursor_row;
         self.last_cursor_col = cursor_col;

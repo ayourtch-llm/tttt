@@ -64,7 +64,11 @@ impl ScreenBuffer {
     }
 
     /// Resize the screen buffer. Resets the parser state.
+    /// No-op if dimensions haven't changed (avoids wiping screen content).
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        if self.cols == cols && self.rows == rows {
+            return;
+        }
         self.cols = cols;
         self.rows = rows;
         self.parser = vt100::Parser::new(rows, cols, self.scrollback_lines);
