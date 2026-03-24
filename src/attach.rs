@@ -593,7 +593,8 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     tracing::trace!("[CLIENT] ScreenUpdate: data_len={}, cursor=({},{})", screen_data.len(), cursor_row, cursor_col);
                     if !screen_data.is_empty() {
                         // Apply to virtual screen (fresh parser for clean state)
-                        virtual_screen = vt100::Parser::new(term_rows, term_cols, 0);
+                        // Use current terminal dimensions, not initial ones
+                        virtual_screen = vt100::Parser::new(cur_rows, cur_cols, 0);
                         virtual_screen.process(&screen_data);
                         virtual_dirty = true;
                     }
