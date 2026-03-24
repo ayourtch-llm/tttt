@@ -479,6 +479,13 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut paste_mode = PasteMode::None;
 
+    // Last time we rendered to the real terminal (for max latency cap)
+    let mut last_render_time = std::time::Instant::now();
+    // Maximum time to wait before forcing a render, even if data is still arriving
+    const RENDER_FORCE_MS: u64 = 100;
+    // Debug: count messages received
+    let mut msg_count = 0;
+
     loop {
         // Handle terminal resize
         if winch.load(std::sync::atomic::Ordering::Relaxed) {
@@ -575,13 +582,15 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         // Process ALL pending messages into virtual screen
         while let Some((msg, consumed)) = decode_message::<ServerMsg>(&read_buf) {
             read_buf.drain(..consumed);
+            msg_count += 1;
+            tracing::trace!("[CLIENT] msg #{}: {:?}", msg_count, std::mem::discriminant(&msg));
             match msg {
                 ServerMsg::ScreenUpdate {
                     screen_data,
                     cursor_row,
                     cursor_col,
                 } => {
-                    eprintln!("[CLIENT] ScreenUpdate: data_len={}, cursor=({},{})", screen_data.len(), cursor_row, cursor_col);
+                    tracing::trace!("[CLIENT] ScreenUpdate: data_len={}, cursor=({},{})", screen_data.len(), cursor_row, cursor_col);
                     if !screen_data.is_empty() {
                         // Apply to virtual screen (fresh parser for clean state)
                         virtual_screen = vt100::Parser::new(term_rows, term_cols, 0);
@@ -590,7 +599,9 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     last_cursor = (cursor_row, cursor_col);
                 }
-                ServerMsg::SessionList { .. } => {}
+                ServerMsg::SessionList { .. } => {
+                    tracing::trace!("[CLIENT] SessionList received");
+                }
                 ServerMsg::Goodbye => return Ok(()),
             }
         }
@@ -602,10 +613,18 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         // This is the key insight: if data is still arriving, we keep
         // updating the virtual screen and skip the real terminal render.
         // Only when the socket goes quiet do we render the final state.
-        if virtual_dirty && !got_server_data {
+        //
+        // FORCE RENDER: If it's been RENDER_FORCE_MS since last render and we have data,
+        // force a render to avoid blank screen issues.
+        let should_force_render = virtual_dirty 
+            && last_render_time.elapsed().as_millis() >= RENDER_FORCE_MS as u128;
+        
+        if virtual_dirty && (!got_server_data || should_force_render) {
+            tracing::trace!("[CLIENT] Rendering: got_server_data={}, should_force={}", got_server_data, should_force_render);
             // Render PTY cells via PaneRenderer (minimal diff).
             let output = renderer.render(virtual_screen.screen());
             if !output.is_empty() {
+                tracing::trace!("[CLIENT] Render output len={}", output.len());
                 write_fd(stdout_fd, &output);
             }
 
@@ -638,6 +657,7 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 cursor_goto(new_cursor.0, new_cursor.1).as_bytes(),
             );
             virtual_dirty = false;
+            last_render_time = std::time::Instant::now();
         }
     }
 
