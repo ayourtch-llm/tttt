@@ -192,7 +192,7 @@ mod tests {
             .process_line(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#)
             .unwrap();
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
     }
 
     #[test]

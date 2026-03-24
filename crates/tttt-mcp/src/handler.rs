@@ -141,6 +141,40 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         Ok(json!({"lines": lines}))
     }
 
+    fn handle_pty_wait_for(&self, args: &Value) -> Result<Value> {
+        let session_id = args["session_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
+        let pattern = args["pattern"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("pattern required".to_string()))?;
+        let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(30000);
+
+        let re = regex::Regex::new(pattern)
+            .map_err(|e| McpError::InvalidParams(format!("invalid regex '{}': {}", pattern, e)))?;
+
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+        loop {
+            {
+                let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+                let session = mgr.get_mut(session_id)?;
+                session.pump()?;
+                let screen = session.get_screen();
+                if re.is_match(&screen) {
+                    return Ok(json!({"status": "matched", "screen": screen}));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(McpError::Protocol(format!(
+                    "timeout waiting for pattern '{}' after {}ms",
+                    pattern, timeout_ms
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn handle_pty_set_scrollback(&self, args: &Value) -> Result<Value> {
         let session_id = args["session_id"]
             .as_str()
@@ -216,6 +250,7 @@ impl ToolHandler for PtyToolHandler<tttt_pty::RealPty> {
             "tttt_pty_resize" => self.handle_pty_resize(args),
             "tttt_pty_get_scrollback" => self.handle_pty_get_scrollback(args),
             "tttt_pty_set_scrollback" => self.handle_pty_set_scrollback(args),
+            "tttt_pty_wait_for" => self.handle_pty_wait_for(args),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
     }
@@ -237,6 +272,7 @@ impl ToolHandler for PtyToolHandler<MockPty> {
             "tttt_pty_resize" => self.handle_pty_resize(args),
             "tttt_pty_get_scrollback" => self.handle_pty_get_scrollback(args),
             "tttt_pty_set_scrollback" => self.handle_pty_set_scrollback(args),
+            "tttt_pty_wait_for" => self.handle_pty_wait_for(args),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
     }
@@ -769,7 +805,7 @@ mod tests {
         let handler = make_handler();
         composite.add_handler(Box::new(handler));
         let defs = composite.tool_definitions();
-        assert_eq!(defs.len(), 9);
+        assert_eq!(defs.len(), 10);
     }
 
     #[test]
@@ -952,9 +988,9 @@ mod tests {
         composite.add_handler(Box::new(make_handler()));
         composite.add_handler(Box::new(make_scheduler_handler()));
 
-        // Should have 9 PTY + 4 scheduler = 13 tool definitions
+        // Should have 10 PTY + 4 scheduler = 14 tool definitions
         let defs = composite.tool_definitions();
-        assert_eq!(defs.len(), 13);
+        assert_eq!(defs.len(), 14);
 
         // PTY tool should work
         let result = composite.handle_tool_call("tttt_pty_list", &json!({}));
@@ -1226,6 +1262,109 @@ mod tests {
         let mut handler = make_scratchpad_handler();
         let result = handler.handle_tool_call("tttt_scratchpad_read", &json!({"key": "nope"}));
         assert!(result.is_err());
+    }
+
+    // --- tttt_pty_wait_for tests ---
+
+    #[test]
+    fn test_pty_wait_for_immediate_match() {
+        let handler = make_handler();
+        let id = {
+            let mut mgr = handler.manager().lock().unwrap();
+            let id = mgr.generate_id();
+            let mut mock = MockPty::new(80, 24);
+            mock.queue_output(b"ready$ ");
+            let mut session = PtySession::new(id.clone(), mock, "bash".to_string(), 80, 24);
+            session.pump().unwrap();
+            mgr.add_session(session).unwrap();
+            id
+        };
+
+        let mut handler = handler;
+        let result = handler
+            .handle_tool_call(
+                "tttt_pty_wait_for",
+                &json!({"session_id": id, "pattern": "ready\\$", "timeout_ms": 1000}),
+            )
+            .unwrap();
+        assert_eq!(result["status"].as_str().unwrap(), "matched");
+        assert!(result["screen"].is_string());
+    }
+
+    #[test]
+    fn test_pty_wait_for_timeout() {
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+
+        let mut handler = handler;
+        let result = handler.handle_tool_call(
+            "tttt_pty_wait_for",
+            &json!({"session_id": id, "pattern": "never_matches", "timeout_ms": 200}),
+        );
+        assert!(result.is_err(), "should error on timeout");
+    }
+
+    #[test]
+    fn test_pty_wait_for_invalid_regex() {
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+
+        let mut handler = handler;
+        let result = handler.handle_tool_call(
+            "tttt_pty_wait_for",
+            &json!({"session_id": id, "pattern": "[invalid", "timeout_ms": 1000}),
+        );
+        assert!(result.is_err(), "should error on invalid regex");
+    }
+
+    #[test]
+    fn test_pty_wait_for_missing_session() {
+        let mut handler = make_handler();
+        let result = handler.handle_tool_call(
+            "tttt_pty_wait_for",
+            &json!({"session_id": "nonexistent", "pattern": "foo", "timeout_ms": 200}),
+        );
+        assert!(result.is_err(), "should error on missing session");
+    }
+
+    #[test]
+    fn test_pty_wait_for_default_timeout() {
+        // Call without timeout_ms, verify it parses (uses default 30000).
+        // We use a pattern that matches immediately so we don't wait 30s.
+        let handler = make_handler();
+        let id = {
+            let mut mgr = handler.manager().lock().unwrap();
+            let id = mgr.generate_id();
+            let mut mock = MockPty::new(80, 24);
+            mock.queue_output(b"prompt> ");
+            let mut session = PtySession::new(id.clone(), mock, "bash".to_string(), 80, 24);
+            session.pump().unwrap();
+            mgr.add_session(session).unwrap();
+            id
+        };
+
+        let mut handler = handler;
+        let result = handler
+            .handle_tool_call(
+                "tttt_pty_wait_for",
+                &json!({"session_id": id, "pattern": "prompt>"}),
+            )
+            .unwrap();
+        assert_eq!(result["status"].as_str().unwrap(), "matched");
+    }
+
+    #[test]
+    fn test_pty_wait_for_in_definitions() {
+        let defs = crate::tools::pty_tool_definitions();
+        let wait_for = defs
+            .iter()
+            .find(|t| t["name"] == "tttt_pty_wait_for")
+            .expect("tttt_pty_wait_for should be in pty_tool_definitions");
+        let required = wait_for["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.contains(&Value::from("session_id")));
+        assert!(required.contains(&Value::from("pattern")));
+        // timeout_ms should NOT be required (it's optional)
+        assert!(!required.contains(&Value::from("timeout_ms")));
     }
 
 }

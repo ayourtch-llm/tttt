@@ -112,6 +112,19 @@ pub fn pty_tool_definitions() -> Vec<Value> {
                 "required": ["session_id"]
             }
         }),
+        json!({
+            "name": "tttt_pty_wait_for",
+            "description": "Block until a regex pattern appears in the session's screen content, or timeout",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Target session ID" },
+                    "pattern": { "type": "string", "description": "Regex pattern to match against screen content" },
+                    "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default: 30000)" }
+                },
+                "required": ["session_id", "pattern"]
+            }
+        }),
     ]
 }
 
@@ -266,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_pty_tool_count() {
-        assert_eq!(pty_tool_definitions().len(), 9);
+        assert_eq!(pty_tool_definitions().len(), 10);
     }
 
     #[test]

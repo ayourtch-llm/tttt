@@ -185,9 +185,9 @@ fn test_mcp_full_run_loop() {
     assert_eq!(responses[1]["id"], 2);
     assert_eq!(responses[2]["id"], 3);
 
-    // tools/list should have 9 tools
+    // tools/list should have 10 tools
     let tools = responses[2]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 9);
+    assert_eq!(tools.len(), 10);
 }
 
 #[test]
