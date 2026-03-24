@@ -65,6 +65,18 @@ impl Drop for TerminalState {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        // Clean up socket files on exit
+        if let Some(ref path) = self.socket_path {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(ref path) = self.mcp_socket_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn terminal_size() -> (u16, u16) {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
