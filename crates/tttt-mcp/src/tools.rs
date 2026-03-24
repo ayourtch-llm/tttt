@@ -24,7 +24,7 @@ pub fn pty_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "tttt_pty_send_keys",
-            "description": "Send keystrokes to a terminal session. Keys are sent as-is. Use [ENTER] to submit.",
+            "description": "Send keystrokes to a terminal session. Keys are sent as-is. Use [ENTER] to submit. IMPORTANT: When sending multi-line text to Claude Code or similar TUI apps, send the text and [ENTER] as TWO SEPARATE calls — the app buffers pasted multi-line text and needs a separate Enter to submit it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -230,6 +230,36 @@ pub fn notification_tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// Returns tool definitions for scratchpad tools.
+pub fn scratchpad_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "tttt_scratchpad_write",
+            "description": "Write or append content to a named scratchpad key. Use for private working notes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Scratchpad key name" },
+                    "content": { "type": "string", "description": "Content to write" },
+                    "append": { "type": "boolean", "description": "Append to existing content instead of overwriting (default: false)" }
+                },
+                "required": ["key", "content"]
+            }
+        }),
+        json!({
+            "name": "tttt_scratchpad_read",
+            "description": "Read content from a named scratchpad key.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Scratchpad key name" }
+                },
+                "required": ["key"]
+            }
+        }),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +314,7 @@ mod tests {
             .into_iter()
             .chain(scheduler_tool_definitions())
             .chain(notification_tool_definitions())
+            .chain(scratchpad_tool_definitions())
             .collect();
         let names: Vec<&str> = all.iter().map(|t| t["name"].as_str().unwrap()).collect();
         let mut unique = names.clone();
@@ -291,4 +322,10 @@ mod tests {
         unique.dedup();
         assert_eq!(names.len(), unique.len(), "duplicate tool names found");
     }
+
+    #[test]
+    fn test_scratchpad_tool_definitions_count() {
+        assert_eq!(scratchpad_tool_definitions().len(), 2);
+    }
+
 }

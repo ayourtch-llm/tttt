@@ -752,7 +752,7 @@ impl App {
                         let work_dir = self.config.work_dir.clone();
                         std::thread::spawn(move || {
                             use tttt_mcp::proxy::handle_proxy_client;
-                            use tttt_mcp::{PtyToolHandler, SchedulerToolHandler, NotificationToolHandler, CompositeToolHandler};
+                            use tttt_mcp::{PtyToolHandler, SchedulerToolHandler, NotificationToolHandler, ScratchpadToolHandler, CompositeToolHandler};
 
                             // Set the stream to blocking mode for the handler
                             let _ = stream.set_nonblocking(false);
@@ -760,10 +760,12 @@ impl App {
                             let pty_handler = PtyToolHandler::new(sessions.clone(), work_dir);
                             let scheduler_handler = SchedulerToolHandler::new(scheduler);
                             let notif_handler = NotificationToolHandler::new(notifications, sessions);
+                            let scratchpad_handler = ScratchpadToolHandler::new();
                             let mut composite = CompositeToolHandler::new();
                             composite.add_handler(Box::new(pty_handler));
                             composite.add_handler(Box::new(scheduler_handler));
                             composite.add_handler(Box::new(notif_handler));
+                            composite.add_handler(Box::new(scratchpad_handler));
 
                             if let Err(e) = handle_proxy_client(stream, &mut composite, "tttt") {
                                 // Client disconnected or error — normal

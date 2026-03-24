@@ -218,6 +218,7 @@ fn run_proxy_mcp_server(socket_path: &str) {
 fn run_standalone_mcp_server(workdir: Option<PathBuf>) {
     use tttt_mcp::{
         CompositeToolHandler, McpServer, PtyToolHandler, SchedulerToolHandler,
+        ScratchpadToolHandler,
     };
     use tttt_pty::{RealPty, SessionManager};
     use tttt_scheduler::Scheduler;
@@ -232,9 +233,12 @@ fn run_standalone_mcp_server(workdir: Option<PathBuf>) {
     let scheduler = Scheduler::new();
     let scheduler_handler = SchedulerToolHandler::new_owned(scheduler);
 
+    let scratchpad_handler = ScratchpadToolHandler::new();
+
     let mut composite = CompositeToolHandler::new();
     composite.add_handler(Box::new(pty_handler));
     composite.add_handler(Box::new(scheduler_handler));
+    composite.add_handler(Box::new(scratchpad_handler));
 
     let stdin = std::io::stdin().lock();
     let stdout = std::io::stdout().lock();

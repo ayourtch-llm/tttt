@@ -1,5 +1,6 @@
 use crate::error::{McpError, Result};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tttt_pty::{MockPty, PtyBackend, PtySession, SessionManager, SessionStatus};
@@ -538,6 +539,76 @@ impl<B: PtyBackend + 'static> ToolHandler for NotificationToolHandler<B> {
 
     fn tool_definitions(&self) -> Vec<Value> {
         crate::tools::notification_tool_definitions()
+    }
+}
+
+// === Scratchpad tool handler ===
+
+/// Handles scratchpad read/write tool calls using an in-memory HashMap.
+pub struct ScratchpadToolHandler {
+    store: HashMap<String, String>,
+}
+
+impl ScratchpadToolHandler {
+    pub fn new() -> Self {
+        Self {
+            store: HashMap::new(),
+        }
+    }
+
+    fn handle_scratchpad_write(&mut self, args: &Value) -> Result<Value> {
+        let key = args["key"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("key required".into()))?
+            .to_string();
+        let content = args["content"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("content required".into()))?
+            .to_string();
+        let append = args["append"].as_bool().unwrap_or(false);
+
+        if append {
+            self.store
+                .entry(key)
+                .and_modify(|v| v.push_str(&content))
+                .or_insert(content);
+        } else {
+            self.store.insert(key, content);
+        }
+        Ok(json!({"status": "ok"}))
+    }
+
+    fn handle_scratchpad_read(&self, args: &Value) -> Result<Value> {
+        let key = args["key"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("key required".into()))?;
+        match self.store.get(key) {
+            Some(content) => Ok(json!({"content": content})),
+            None => Err(McpError::InvalidParams(format!(
+                "scratchpad key not found: {}",
+                key
+            ))),
+        }
+    }
+}
+
+impl Default for ScratchpadToolHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToolHandler for ScratchpadToolHandler {
+    fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
+        match name {
+            "tttt_scratchpad_write" => self.handle_scratchpad_write(args),
+            "tttt_scratchpad_read" => self.handle_scratchpad_read(args),
+            _ => Err(McpError::ToolNotFound(name.to_string())),
+        }
+    }
+
+    fn tool_definitions(&self) -> Vec<Value> {
+        crate::tools::scratchpad_tool_definitions()
     }
 }
 
@@ -1086,4 +1157,75 @@ mod tests {
             "should not double the \\r"
         );
     }
+
+    // --- Scratchpad tool handler tests ---
+
+    fn make_scratchpad_handler() -> ScratchpadToolHandler {
+        ScratchpadToolHandler::new()
+    }
+
+    #[test]
+    fn test_scratchpad_write_and_read() {
+        let mut handler = make_scratchpad_handler();
+        handler
+            .handle_tool_call(
+                "tttt_scratchpad_write",
+                &json!({"key": "notes", "content": "hello world"}),
+            )
+            .unwrap();
+        let result = handler
+            .handle_tool_call("tttt_scratchpad_read", &json!({"key": "notes"}))
+            .unwrap();
+        assert_eq!(result["content"].as_str().unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_scratchpad_write_overwrites() {
+        let mut handler = make_scratchpad_handler();
+        handler
+            .handle_tool_call(
+                "tttt_scratchpad_write",
+                &json!({"key": "k", "content": "first"}),
+            )
+            .unwrap();
+        handler
+            .handle_tool_call(
+                "tttt_scratchpad_write",
+                &json!({"key": "k", "content": "second"}),
+            )
+            .unwrap();
+        let result = handler
+            .handle_tool_call("tttt_scratchpad_read", &json!({"key": "k"}))
+            .unwrap();
+        assert_eq!(result["content"].as_str().unwrap(), "second");
+    }
+
+    #[test]
+    fn test_scratchpad_append() {
+        let mut handler = make_scratchpad_handler();
+        handler
+            .handle_tool_call(
+                "tttt_scratchpad_write",
+                &json!({"key": "log", "content": "line1\n"}),
+            )
+            .unwrap();
+        handler
+            .handle_tool_call(
+                "tttt_scratchpad_write",
+                &json!({"key": "log", "content": "line2\n", "append": true}),
+            )
+            .unwrap();
+        let result = handler
+            .handle_tool_call("tttt_scratchpad_read", &json!({"key": "log"}))
+            .unwrap();
+        assert_eq!(result["content"].as_str().unwrap(), "line1\nline2\n");
+    }
+
+    #[test]
+    fn test_scratchpad_read_missing_key() {
+        let mut handler = make_scratchpad_handler();
+        let result = handler.handle_tool_call("tttt_scratchpad_read", &json!({"key": "nope"}));
+        assert!(result.is_err());
+    }
+
 }
