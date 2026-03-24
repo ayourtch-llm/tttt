@@ -142,6 +142,7 @@ mod tests {
             status,
             cols: 80,
             rows: 24,
+            name: None,
             created_at: None,
         }
     }

@@ -8,6 +8,7 @@ const DEFAULT_MAX_SESSIONS: usize = 15;
 /// Manages multiple PTY sessions.
 pub struct SessionManager<B: PtyBackend> {
     sessions: HashMap<SessionId, PtySession<B>>,
+    names: HashMap<String, SessionId>,
     max_sessions: usize,
     next_id: u64,
 }
@@ -17,6 +18,7 @@ impl<B: PtyBackend> SessionManager<B> {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            names: HashMap::new(),
             max_sessions: DEFAULT_MAX_SESSIONS,
             next_id: 1,
         }
@@ -26,6 +28,7 @@ impl<B: PtyBackend> SessionManager<B> {
     pub fn with_max_sessions(max: usize) -> Self {
         Self {
             sessions: HashMap::new(),
+            names: HashMap::new(),
             max_sessions: max,
             next_id: 1,
         }
@@ -48,29 +51,74 @@ impl<B: PtyBackend> SessionManager<B> {
         Ok(id)
     }
 
-    /// Get a reference to a session by ID.
+    /// Add a session with an optional unique name. Errors if name is already taken.
+    pub fn add_session_with_name(&mut self, mut session: PtySession<B>, name: String) -> Result<SessionId> {
+        if self.names.contains_key(&name) {
+            return Err(PtyError::DuplicateName(name));
+        }
+        if self.sessions.len() >= self.max_sessions {
+            return Err(PtyError::MaxSessionsReached(self.max_sessions));
+        }
+        let id = session.id.clone();
+        session.set_name(name.clone());
+        self.names.insert(name, id.clone());
+        self.sessions.insert(id.clone(), session);
+        Ok(id)
+    }
+
+    /// Resolve a session ID or name to the actual session ID.
+    pub fn resolve_id<'a>(&'a self, id_or_name: &'a str) -> Result<&'a str> {
+        if self.sessions.contains_key(id_or_name) {
+            return Ok(id_or_name);
+        }
+        if let Some(session_id) = self.names.get(id_or_name) {
+            return Ok(session_id.as_str());
+        }
+        Err(PtyError::SessionNotFound(id_or_name.to_string()))
+    }
+
+    /// Get a reference to a session by ID or name.
     pub fn get(&self, id: &str) -> Result<&PtySession<B>> {
-        self.sessions
-            .get(id)
-            .ok_or_else(|| PtyError::SessionNotFound(id.to_string()))
+        if let Some(session) = self.sessions.get(id) {
+            return Ok(session);
+        }
+        if let Some(session_id) = self.names.get(id) {
+            return self.sessions.get(session_id.as_str())
+                .ok_or_else(|| PtyError::SessionNotFound(id.to_string()));
+        }
+        Err(PtyError::SessionNotFound(id.to_string()))
     }
 
-    /// Get a mutable reference to a session by ID.
+    /// Get a mutable reference to a session by ID or name.
     pub fn get_mut(&mut self, id: &str) -> Result<&mut PtySession<B>> {
-        self.sessions
-            .get_mut(id)
-            .ok_or_else(|| PtyError::SessionNotFound(id.to_string()))
+        if self.sessions.contains_key(id) {
+            return self.sessions.get_mut(id)
+                .ok_or_else(|| PtyError::SessionNotFound(id.to_string()));
+        }
+        if let Some(session_id) = self.names.get(id).cloned() {
+            return self.sessions.get_mut(&session_id)
+                .ok_or_else(|| PtyError::SessionNotFound(id.to_string()));
+        }
+        Err(PtyError::SessionNotFound(id.to_string()))
     }
 
-    /// Kill and remove a session.
+    /// Kill and remove a session by ID or name.
     pub fn kill_session(&mut self, id: &str) -> Result<()> {
+        let session_id = if self.sessions.contains_key(id) {
+            id.to_string()
+        } else if let Some(sid) = self.names.get(id).cloned() {
+            sid
+        } else {
+            return Err(PtyError::SessionNotFound(id.to_string()));
+        };
         let session = self.sessions
-            .get_mut(id)
+            .get_mut(&session_id)
             .ok_or_else(|| PtyError::SessionNotFound(id.to_string()))?;
         if *session.status() == SessionStatus::Running {
             session.kill()?;
         }
-        self.sessions.remove(id);
+        self.sessions.remove(&session_id);
+        self.names.retain(|_, v| v != &session_id);
         Ok(())
     }
 
@@ -98,9 +146,9 @@ impl<B: PtyBackend> SessionManager<B> {
         self.sessions.len()
     }
 
-    /// Check if a session exists.
+    /// Check if a session exists by ID or name.
     pub fn exists(&self, id: &str) -> bool {
-        self.sessions.contains_key(id)
+        self.sessions.contains_key(id) || self.names.contains_key(id)
     }
 
     /// Pump all sessions (read PTY output into screen buffers).
@@ -273,5 +321,89 @@ mod tests {
         let mgr: SessionManager<MockPty> = SessionManager::default();
         assert_eq!(mgr.session_count(), 0);
         assert_eq!(mgr.max_sessions(), DEFAULT_MAX_SESSIONS);
+    }
+
+    #[test]
+    fn test_add_session_with_name() {
+        let mut mgr: SessionManager<MockPty> = SessionManager::new();
+        let id = mgr.generate_id();
+        let session = make_session(&id);
+        let returned_id = mgr.add_session_with_name(session, "myname".to_string()).unwrap();
+        assert_eq!(returned_id, id);
+        // Can get by name
+        let s = mgr.get("myname").unwrap();
+        assert_eq!(s.id, id);
+    }
+
+    #[test]
+    fn test_add_session_duplicate_name() {
+        let mut mgr: SessionManager<MockPty> = SessionManager::new();
+        let id1 = mgr.generate_id();
+        let id2 = mgr.generate_id();
+        let s1 = make_session(&id1);
+        let s2 = make_session(&id2);
+        mgr.add_session_with_name(s1, "myname".to_string()).unwrap();
+        let result = mgr.add_session_with_name(s2, "myname".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_id_by_name() {
+        let mut mgr: SessionManager<MockPty> = SessionManager::new();
+        let id = mgr.generate_id();
+        let session = make_session(&id);
+        mgr.add_session_with_name(session, "myname".to_string()).unwrap();
+        let resolved = mgr.resolve_id("myname").unwrap();
+        assert_eq!(resolved, id);
+    }
+
+    #[test]
+    fn test_resolve_id_by_id() {
+        let mut mgr: SessionManager<MockPty> = SessionManager::new();
+        let id = mgr.generate_id();
+        let session = make_session(&id);
+        mgr.add_session(session).unwrap();
+        let resolved = mgr.resolve_id(&id).unwrap();
+        assert_eq!(resolved, id);
+    }
+
+    #[test]
+    fn test_resolve_id_unknown() {
+        let mgr: SessionManager<MockPty> = SessionManager::new();
+        let result = mgr.resolve_id("unknown");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_kill_session_by_name() {
+        let mut mgr: SessionManager<MockPty> = SessionManager::new();
+        let id = mgr.generate_id();
+        let session = make_session(&id);
+        mgr.add_session_with_name(session, "myname".to_string()).unwrap();
+        mgr.kill_session("myname").unwrap();
+        assert_eq!(mgr.session_count(), 0);
+        assert!(!mgr.exists("myname"));
+        assert!(!mgr.exists(&id));
+    }
+
+    #[test]
+    fn test_exists_by_name() {
+        let mut mgr: SessionManager<MockPty> = SessionManager::new();
+        let id = mgr.generate_id();
+        let session = make_session(&id);
+        mgr.add_session_with_name(session, "myname".to_string()).unwrap();
+        assert!(mgr.exists("myname"));
+        assert!(!mgr.exists("othername"));
+    }
+
+    #[test]
+    fn test_list_includes_name() {
+        let mut mgr: SessionManager<MockPty> = SessionManager::new();
+        let id = mgr.generate_id();
+        let session = make_session(&id);
+        mgr.add_session_with_name(session, "myname".to_string()).unwrap();
+        let list = mgr.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, Some("myname".to_string()));
     }
 }

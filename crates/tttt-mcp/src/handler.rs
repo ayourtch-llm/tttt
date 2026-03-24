@@ -195,13 +195,22 @@ impl PtyToolHandler<MockPty> {
         let cols = args["cols"].as_u64().unwrap_or(self.default_cols as u64) as u16;
         let rows = args["rows"].as_u64().unwrap_or(self.default_rows as u64) as u16;
         let command = args["command"].as_str().unwrap_or("bash").to_string();
+        let name = args["name"].as_str().map(|s| s.to_string());
 
         let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
         let id = mgr.generate_id();
         let mock = MockPty::new(cols, rows);
         let session = PtySession::new(id.clone(), mock, command, cols, rows);
-        mgr.add_session(session)?;
-        Ok(json!({"session_id": id}))
+        if let Some(n) = name.clone() {
+            mgr.add_session_with_name(session, n)?;
+        } else {
+            mgr.add_session(session)?;
+        }
+        let mut resp = json!({"session_id": id});
+        if let Some(n) = name {
+            resp["name"] = json!(n);
+        }
+        Ok(resp)
     }
 }
 
@@ -218,6 +227,7 @@ impl PtyToolHandler<tttt_pty::RealPty> {
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
+        let name = args["name"].as_str().map(|s| s.to_string());
 
         let cwd = args["working_dir"]
             .as_str()
@@ -233,8 +243,16 @@ impl PtyToolHandler<tttt_pty::RealPty> {
         let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
         let id = mgr.generate_id();
         let session = PtySession::new(id.clone(), backend, command.to_string(), cols, rows);
-        mgr.add_session(session)?;
-        Ok(json!({"session_id": id}))
+        if let Some(n) = name.clone() {
+            mgr.add_session_with_name(session, n)?;
+        } else {
+            mgr.add_session(session)?;
+        }
+        let mut resp = json!({"session_id": id});
+        if let Some(n) = name {
+            resp["name"] = json!(n);
+        }
+        Ok(resp)
     }
 }
 
@@ -1365,6 +1383,33 @@ mod tests {
         assert!(required.contains(&Value::from("pattern")));
         // timeout_ms should NOT be required (it's optional)
         assert!(!required.contains(&Value::from("timeout_ms")));
+    }
+
+    #[test]
+    fn test_pty_launch_with_name() {
+        let handler = make_handler();
+        let result = handler.handle_pty_launch_mock(&json!({"name": "mysession"})).unwrap();
+        assert!(result["session_id"].is_string());
+        assert_eq!(result["name"].as_str().unwrap(), "mysession");
+    }
+
+    #[test]
+    fn test_pty_launch_duplicate_name() {
+        let handler = make_handler();
+        handler.handle_pty_launch_mock(&json!({"name": "mysession"})).unwrap();
+        let result = handler.handle_pty_launch_mock(&json!({"name": "mysession"}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pty_get_screen_by_name() {
+        let handler = make_handler();
+        handler.handle_pty_launch_mock(&json!({"name": "mysession"})).unwrap();
+        let mut handler = handler;
+        let result = handler
+            .handle_tool_call("tttt_pty_get_screen", &json!({"session_id": "mysession"}))
+            .unwrap();
+        assert!(result["screen"].is_string());
     }
 
 }

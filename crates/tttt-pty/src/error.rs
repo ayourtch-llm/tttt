@@ -8,6 +8,9 @@ pub enum PtyError {
     #[error("max sessions reached: {0}")]
     MaxSessionsReached(usize),
 
+    #[error("session name already taken: {0}")]
+    DuplicateName(String),
+
     #[error("session already exited")]
     SessionExited,
 

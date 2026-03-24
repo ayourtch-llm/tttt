@@ -23,6 +23,8 @@ pub struct SessionMetadata {
     pub status: SessionStatus,
     pub cols: u16,
     pub rows: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(skip)]
     pub created_at: Option<Instant>,
 }
@@ -33,6 +35,7 @@ pub struct SessionMetadata {
 /// The session is synchronous — the caller drives I/O via `pump()`.
 pub struct PtySession<B: PtyBackend> {
     pub id: SessionId,
+    pub name: Option<String>,
     backend: B,
     screen: ScreenBuffer,
     status: SessionStatus,
@@ -45,12 +48,18 @@ impl<B: PtyBackend> PtySession<B> {
     pub fn new(id: SessionId, backend: B, command: String, cols: u16, rows: u16) -> Self {
         Self {
             id,
+            name: None,
             backend,
             screen: ScreenBuffer::new(cols, rows),
             status: SessionStatus::Running,
             command,
             created_at: Instant::now(),
         }
+    }
+
+    /// Set the optional name for this session.
+    pub fn set_name(&mut self, name: String) {
+        self.name = Some(name);
     }
 
     /// Read available output from the PTY and feed it to the screen buffer.
@@ -139,6 +148,7 @@ impl<B: PtyBackend> PtySession<B> {
             status: self.status.clone(),
             cols: self.screen.size().0,
             rows: self.screen.size().1,
+            name: self.name.clone(),
             created_at: Some(self.created_at),
         }
     }

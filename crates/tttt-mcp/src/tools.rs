@@ -18,6 +18,10 @@ pub fn pty_tool_definitions() -> Vec<Value> {
                         "type": "string",
                         "description": "Sandbox profile: 'none', 'read_only_worktree', 'read_write_worktree', 'own_worktree'",
                         "enum": ["none", "read_only_worktree", "read_write_worktree", "own_worktree"]
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional unique name for the session (can be used instead of session_id in other tools)"
                     }
                 }
             }

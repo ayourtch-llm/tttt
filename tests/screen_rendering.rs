@@ -412,6 +412,7 @@ fn test_sidebar_does_not_overlap_pty_area() {
         status: SessionStatus::Running,
         cols: 90,
         rows: 24,
+        name: None,
         created_at: None,
     }];
 
