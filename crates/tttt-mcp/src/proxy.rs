@@ -10,12 +10,75 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 
+/// Maximum number of reconnect attempts before giving up on a single request.
+const MAX_RECONNECT_ATTEMPTS: u32 = 30;
+
+/// Base delay between reconnect attempts (doubles each retry, capped at 2s).
+const RECONNECT_BASE_DELAY_MS: u64 = 100;
+
+/// Send a request over the socket and read the response.
+/// Returns Ok(Some(response_bytes)) for normal requests, Ok(None) for notifications.
+/// Returns Err on connection failure (caller should reconnect).
+fn send_and_receive(
+    socket: &mut UnixStream,
+    request: &[u8],
+    is_notification: bool,
+) -> Result<Option<Vec<u8>>, std::io::Error> {
+    let len = request.len() as u32;
+    socket.write_all(&len.to_be_bytes())?;
+    socket.write_all(request)?;
+    socket.flush()?;
+
+    if is_notification {
+        return Ok(None);
+    }
+
+    let mut len_buf = [0u8; 4];
+    socket.read_exact(&mut len_buf)?;
+    let resp_len = u32::from_be_bytes(len_buf) as usize;
+
+    let mut resp_buf = vec![0u8; resp_len];
+    socket.read_exact(&mut resp_buf)?;
+    Ok(Some(resp_buf))
+}
+
+/// Try to connect to the socket, retrying with backoff.
+fn connect_with_retry(socket_path: &str, max_attempts: u32) -> Result<UnixStream, std::io::Error> {
+    let mut delay_ms = RECONNECT_BASE_DELAY_MS;
+    for attempt in 0..max_attempts {
+        match UnixStream::connect(socket_path) {
+            Ok(stream) => return Ok(stream),
+            Err(_) if attempt + 1 < max_attempts => {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(2000);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "max reconnect attempts exceeded",
+    ))
+}
+
+/// Re-initialize the MCP session after reconnecting to a new server instance.
+fn reinitialize(socket: &mut UnixStream) -> Result<(), Box<dyn std::error::Error>> {
+    let init_req = r#"{"jsonrpc":"2.0","id":"_reconnect_init","method":"initialize","params":{}}"#;
+    let _resp = send_and_receive(socket, init_req.as_bytes(), false)?;
+    let initialized = r#"{"jsonrpc":"2.0","id":null,"method":"initialized","params":{}}"#;
+    send_and_receive(socket, initialized.as_bytes(), true)?;
+    Ok(())
+}
+
 /// Run the MCP proxy: forward JSON-RPC between stdio and a Unix socket.
 ///
 /// - Reads JSON-RPC lines from `reader` (Claude's stdin)
 /// - Forwards each line to the Unix socket (tttt TUI)
 /// - Reads response from socket
 /// - Writes response to `writer` (Claude's stdout)
+///
+/// On socket disconnection (e.g., during tttt live reload via execv),
+/// automatically reconnects and retries the current request.
 pub fn run_proxy<R: BufRead, W: Write>(
     mut reader: R,
     mut writer: W,
@@ -35,41 +98,26 @@ pub fn run_proxy<R: BufRead, W: Write>(
             continue;
         }
 
-        // Check if this is a notification (no response expected)
         let is_notification = is_jsonrpc_notification(trimmed);
+        let request_bytes = trimmed.as_bytes();
 
-        // Forward request to TUI over socket
-        // Protocol: length-prefixed line (4 bytes big-endian + line bytes + newline)
-        let line_bytes = trimmed.as_bytes();
-        let len = line_bytes.len() as u32;
-        socket.write_all(&len.to_be_bytes())?;
-        socket.write_all(line_bytes)?;
-        socket.flush()?;
+        // Try to send request; on failure, reconnect and retry
+        let response = match send_and_receive(&mut socket, request_bytes, is_notification) {
+            Ok(resp) => resp,
+            Err(_) => {
+                // Connection lost — likely a live reload. Reconnect.
+                socket = connect_with_retry(socket_path, MAX_RECONNECT_ATTEMPTS)?;
+                reinitialize(&mut socket)?;
+                send_and_receive(&mut socket, request_bytes, is_notification)
+                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?
+            }
+        };
 
-        if is_notification {
-            continue; // Don't wait for response for notifications
+        if let Some(resp_buf) = response {
+            writer.write_all(&resp_buf)?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
         }
-
-        // Read response from TUI
-        let mut len_buf = [0u8; 4];
-        match socket.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(Box::new(e)),
-        }
-        let resp_len = u32::from_be_bytes(len_buf) as usize;
-        
-        let mut resp_buf = vec![0u8; resp_len];
-        match socket.read_exact(&mut resp_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(Box::new(e)),
-        }
-
-        // Write response to Claude
-        writer.write_all(&resp_buf)?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
     }
 
     Ok(())

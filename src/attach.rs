@@ -13,6 +13,12 @@ use std::os::unix::net::UnixStream;
 use tttt_tui::protocol::{decode_message, encode_message, ClientMsg, ServerMsg};
 use tttt_tui::{clear_screen, cursor_goto, PaneRenderer};
 
+/// Maximum number of reconnect attempts for the attach client.
+const ATTACH_MAX_RECONNECT_ATTEMPTS: u32 = 30;
+
+/// Base delay between attach reconnect attempts (doubles each retry, capped at 2s).
+const ATTACH_RECONNECT_BASE_DELAY_MS: u64 = 100;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PasteMode {
     None,
@@ -432,16 +438,86 @@ mod tests {
     }
 }
 
+/// Try to connect to the viewer socket, retrying with backoff.
+fn attach_connect_with_retry(
+    socket_path: &str,
+    max_attempts: u32,
+) -> Result<UnixStream, std::io::Error> {
+    let mut delay_ms = ATTACH_RECONNECT_BASE_DELAY_MS;
+    for attempt in 0..max_attempts {
+        match UnixStream::connect(socket_path) {
+            Ok(stream) => return Ok(stream),
+            Err(_) if attempt + 1 < max_attempts => {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(2000);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "max reconnect attempts exceeded",
+    ))
+}
+
+/// Reason the inner event loop exited.
+enum AttachLoopExit {
+    /// User requested detach or stdin EOF — stop entirely.
+    Detach,
+    /// Server disconnected — try to reconnect.
+    Disconnected,
+}
+
 /// Run the attach client.
 pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stream = UnixStream::connect(socket_path)?;
-    stream.set_nonblocking(true)?;
-
     // Enter raw terminal mode BEFORE any output
     let _raw = RawMode::enter();
 
     let stdout_fd = std::io::stdout().as_raw_fd();
     let stdin_fd = std::io::stdin().as_raw_fd();
+
+    // Register SIGWINCH handler for terminal resize
+    let winch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _ = signal_hook::flag::register(libc::SIGWINCH, std::sync::Arc::clone(&winch));
+
+    let mut paste_mode = PasteMode::None;
+
+    loop {
+        let stream = match attach_connect_with_retry(socket_path, ATTACH_MAX_RECONNECT_ATTEMPTS) {
+            Ok(s) => s,
+            Err(_) => {
+                write_fd(stdout_fd, b"\r\n[tttt attach] Could not connect.\r\n");
+                return Ok(());
+            }
+        };
+
+        let result = run_attach_loop(
+            stream, stdout_fd, stdin_fd, &winch, &mut paste_mode,
+        );
+
+        match result {
+            AttachLoopExit::Detach => return Ok(()),
+            AttachLoopExit::Disconnected => {
+                write_fd(
+                    stdout_fd,
+                    b"\r\n[tttt attach] Disconnected. Reconnecting...\r\n",
+                );
+                // Loop back to reconnect
+                continue;
+            }
+        }
+    }
+}
+
+/// Inner event loop for the attach client. Returns the reason it exited.
+fn run_attach_loop(
+    mut stream: UnixStream,
+    stdout_fd: i32,
+    stdin_fd: i32,
+    winch: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    paste_mode: &mut PasteMode,
+) -> AttachLoopExit {
+    let _ = stream.set_nonblocking(true);
     let stream_fd = stream.as_raw_fd();
 
     // Get our terminal size
@@ -461,10 +537,6 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let _ = stream.set_nonblocking(true);
     }
 
-    // Register SIGWINCH handler for terminal resize
-    let winch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _ = signal_hook::flag::register(libc::SIGWINCH, std::sync::Arc::clone(&winch));
-
     let mut cur_cols = term_cols;
     let mut cur_rows = term_rows;
 
@@ -476,8 +548,6 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut virtual_dirty = false;
 
     let mut read_buf = Vec::new();
-
-    let mut paste_mode = PasteMode::None;
 
     // Last time we rendered to the real terminal (for max latency cap)
     let mut last_render_time = std::time::Instant::now();
@@ -527,16 +597,16 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             if flags.contains(PollFlags::POLLIN) {
                 let mut buf = [0u8; 4096];
                 match nix::unistd::read(stdin_fd, &mut buf) {
-                    Ok(0) => break,
+                    Ok(0) => return AttachLoopExit::Detach,
                     Ok(n) => {
                         let mut contains_detach_key = false;
-                        process_paste_bytes(&buf[..n], &mut paste_mode, &mut contains_detach_key);
+                        process_paste_bytes(&buf[..n], paste_mode, &mut contains_detach_key);
                         if contains_detach_key {
                             let msg = ClientMsg::Detach;
                             let _ = stream.set_nonblocking(false);
                             let _ = stream.write_all(&encode_message(&msg));
                             let _ = stream.set_nonblocking(true);
-                            break;
+                            return AttachLoopExit::Detach;
                         }
                         let msg = ClientMsg::KeyInput {
                             bytes: buf[..n].to_vec(),
@@ -546,7 +616,7 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let _ = stream.set_nonblocking(true);
                     }
                     Err(nix::errno::Errno::EAGAIN) => {}
-                    Err(_) => break,
+                    Err(_) => return AttachLoopExit::Detach,
                 }
             }
         }
@@ -561,20 +631,20 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     match stream.read(&mut tmp) {
                         Ok(0) => {
                             // EOF — server disconnected
-                            return Ok(());
+                            return AttachLoopExit::Disconnected;
                         }
                         Ok(n) => {
                             read_buf.extend_from_slice(&tmp[..n]);
                             got_server_data = true;
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => return Ok(()),
+                        Err(_) => return AttachLoopExit::Disconnected,
                     }
                 }
             }
             if let Some(flags) = fds[1].revents() {
                 if flags.contains(PollFlags::POLLHUP) {
-                    return Ok(());
+                    return AttachLoopExit::Disconnected;
                 }
             }
         }
@@ -614,7 +684,7 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     renderer.invalidate();
                     virtual_dirty = true;
                 }
-                ServerMsg::Goodbye => return Ok(()),
+                ServerMsg::Goodbye => return AttachLoopExit::Disconnected,
             }
         }
 
@@ -628,9 +698,9 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         //
         // FORCE RENDER: If it's been RENDER_FORCE_MS since last render and we have data,
         // force a render to avoid blank screen issues.
-        let should_force_render = virtual_dirty 
+        let should_force_render = virtual_dirty
             && last_render_time.elapsed().as_millis() >= RENDER_FORCE_MS as u128;
-        
+
         if virtual_dirty && (!got_server_data || should_force_render) {
             tracing::trace!("[CLIENT] Rendering: got_server_data={}, should_force={}", got_server_data, should_force_render);
             // Render PTY cells via PaneRenderer (minimal diff).
@@ -673,8 +743,6 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             last_render_time = std::time::Instant::now();
         }
     }
-
-    Ok(())
 }
 
 fn terminal_size() -> (u16, u16) {
