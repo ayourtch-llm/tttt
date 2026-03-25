@@ -165,6 +165,19 @@ pub fn pty_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "tttt_pty_handle_rate_limit",
+            "description": "Detect a Claude Code rate limit dialog, wait until the limit resets, then auto-continue. Blocks until the session is resumed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session to check and handle" },
+                    "safety_margin_minutes": { "type": "number", "description": "Extra minutes to wait after reset time (default: 15)" },
+                    "continuation_prompt": { "type": "string", "description": "Text to inject after resuming (default: 'Continue from where you left off.')" }
+                },
+                "required": ["session_id"]
+            }
+        }),
+        json!({
             "name": "tttt_get_status",
             "description": "Get a dashboard summary of all sessions and system state. Returns session list with last output line and idle time, plus counts of pending reminders and active watchers.",
             "inputSchema": {
@@ -351,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_pty_tool_count() {
-        assert_eq!(pty_tool_definitions().len(), 14);
+        assert_eq!(pty_tool_definitions().len(), 15);
     }
 
     #[test]

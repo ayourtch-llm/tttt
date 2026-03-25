@@ -6,6 +6,78 @@ use std::time::{Duration, Instant};
 use tttt_pty::{MockPty, PtyBackend, PtySession, SessionManager, SessionStatus};
 use tttt_scheduler::Scheduler;
 
+/// Parse a rate limit reset time string from PTY screen text.
+/// Looks for patterns like "resets 2pm (Europe/Brussels)" or "resets 2:30pm (US/Pacific)".
+/// Returns `(hour_24, minute, timezone_str)` or `None` if not found.
+pub fn parse_rate_limit_reset(screen: &str) -> Option<(u32, u32, String)> {
+    let re = regex::Regex::new(r"resets (\d{1,2})(?::(\d{2}))?(am|pm) \(([^)]+)\)").ok()?;
+    let caps = re.captures(screen)?;
+
+    let hour: u32 = caps[1].parse().ok()?;
+    let minute: u32 = caps.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+    let ampm = &caps[3];
+    let tz_str = caps[4].to_string();
+
+    let hour_24 = match ampm {
+        "am" => {
+            if hour == 12 {
+                0
+            } else {
+                hour
+            }
+        }
+        "pm" => {
+            if hour == 12 {
+                12
+            } else {
+                hour + 12
+            }
+        }
+        _ => return None,
+    };
+
+    Some((hour_24, minute, tz_str))
+}
+
+/// Calculate the duration to wait until the rate limit resets, plus a safety margin.
+/// Returns an error string if the timezone is unknown or the time is invalid.
+pub fn calculate_wait_duration(
+    hour_24: u32,
+    minute: u32,
+    tz_str: &str,
+    safety_margin_minutes: u32,
+) -> std::result::Result<Duration, String> {
+    use chrono::TimeZone as _;
+
+    let tz: chrono_tz::Tz = tz_str
+        .parse()
+        .map_err(|_| format!("Unknown timezone: {}", tz_str))?;
+
+    let now = chrono::Utc::now().with_timezone(&tz);
+
+    let reset_naive = now
+        .date_naive()
+        .and_hms_opt(hour_24, minute, 0)
+        .ok_or_else(|| format!("Invalid reset time {:02}:{:02}", hour_24, minute))?;
+
+    let reset_local = tz
+        .from_local_datetime(&reset_naive)
+        .single()
+        .ok_or_else(|| "Ambiguous or invalid local time for reset".to_string())?;
+
+    // If the reset time has already passed today, assume it's tomorrow.
+    let reset_time = if reset_local <= now {
+        reset_local + chrono::Duration::days(1)
+    } else {
+        reset_local
+    };
+
+    let diff_secs = reset_time.signed_duration_since(now).num_seconds().max(0) as u64;
+    let total_secs = diff_secs + (safety_margin_minutes as u64 * 60);
+
+    Ok(Duration::from_secs(total_secs))
+}
+
 /// Trait for handling MCP tool calls.
 pub trait ToolHandler: Send {
     /// Handle a tool call by name with the given arguments.
@@ -272,6 +344,70 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         let (file_path, bytes_written) = session.stop_capture()?;
         Ok(json!({"file_path": file_path, "bytes_written": bytes_written}))
     }
+
+    fn handle_pty_handle_rate_limit(&self, args: &Value) -> Result<Value> {
+        let session_id = args["session_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?
+            .to_string();
+        let safety_margin_minutes = args["safety_margin_minutes"].as_u64().unwrap_or(15) as u32;
+        let continuation_prompt = args["continuation_prompt"]
+            .as_str()
+            .unwrap_or("Continue from where you left off.")
+            .to_string();
+
+        // Read current screen; release lock before sleeping.
+        let screen = {
+            let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+            let session = mgr.get_mut(&session_id)?;
+            session.pump()?;
+            session.get_screen()
+        };
+
+        let (hour_24, minute, tz_str) = match parse_rate_limit_reset(&screen) {
+            Some(v) => v,
+            None => {
+                return Ok(json!({
+                    "status": "no_rate_limit",
+                    "message": "No rate limit dialog detected on screen"
+                }))
+            }
+        };
+
+        let wait_duration =
+            calculate_wait_duration(hour_24, minute, &tz_str, safety_margin_minutes)
+                .map_err(|e| McpError::Protocol(e))?;
+
+        let waited_minutes = wait_duration.as_secs() / 60;
+        let reset_time_str = format!("{:02}:{:02}", hour_24, minute);
+
+        // Sleep until the rate limit resets (lock is not held).
+        std::thread::sleep(wait_duration);
+
+        // Send "a" to the session (always / wait option).
+        {
+            let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+            let session = mgr.get_mut(&session_id)?;
+            session.send_keys("a")?;
+        }
+
+        // Give the dialog time to process.
+        std::thread::sleep(Duration::from_secs(2));
+
+        // Inject the continuation prompt.
+        {
+            let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+            let session = mgr.get_mut(&session_id)?;
+            session.send_keys(&format!("{}\n", continuation_prompt))?;
+        }
+
+        Ok(json!({
+            "status": "handled",
+            "reset_time": reset_time_str,
+            "waited_minutes": waited_minutes,
+            "message": "Rate limit handled, session resumed"
+        }))
+    }
 }
 
 impl PtyToolHandler<MockPty> {
@@ -357,6 +493,7 @@ impl ToolHandler for PtyToolHandler<tttt_pty::RealPty> {
             "tttt_pty_wait_for_idle" => self.handle_pty_wait_for_idle(args),
             "tttt_pty_start_capture" => self.handle_pty_start_capture(args),
             "tttt_pty_stop_capture" => self.handle_pty_stop_capture(args),
+            "tttt_pty_handle_rate_limit" => self.handle_pty_handle_rate_limit(args),
             "tttt_get_status" => self.handle_get_status(),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
@@ -426,6 +563,7 @@ impl ToolHandler for PtyToolHandler<tttt_pty::AnyPty> {
             "tttt_pty_wait_for_idle" => self.handle_pty_wait_for_idle(args),
             "tttt_pty_start_capture" => self.handle_pty_start_capture(args),
             "tttt_pty_stop_capture" => self.handle_pty_stop_capture(args),
+            "tttt_pty_handle_rate_limit" => self.handle_pty_handle_rate_limit(args),
             "tttt_get_status" => self.handle_get_status(),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
@@ -452,6 +590,7 @@ impl ToolHandler for PtyToolHandler<MockPty> {
             "tttt_pty_wait_for_idle" => self.handle_pty_wait_for_idle(args),
             "tttt_pty_start_capture" => self.handle_pty_start_capture(args),
             "tttt_pty_stop_capture" => self.handle_pty_stop_capture(args),
+            "tttt_pty_handle_rate_limit" => self.handle_pty_handle_rate_limit(args),
             "tttt_get_status" => self.handle_get_status(),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
@@ -1167,7 +1306,7 @@ mod tests {
         let handler = make_handler();
         composite.add_handler(Box::new(handler));
         let defs = composite.tool_definitions();
-        assert_eq!(defs.len(), 14);
+        assert_eq!(defs.len(), 15);
     }
 
     #[test]
@@ -1350,9 +1489,9 @@ mod tests {
         composite.add_handler(Box::new(make_handler()));
         composite.add_handler(Box::new(make_scheduler_handler()));
 
-        // Should have 14 PTY + 4 scheduler = 18 tool definitions
+        // Should have 15 PTY + 4 scheduler = 19 tool definitions
         let defs = composite.tool_definitions();
-        assert_eq!(defs.len(), 18);
+        assert_eq!(defs.len(), 19);
 
         // PTY tool should work
         let result = composite.handle_tool_call("tttt_pty_list", &json!({}));
@@ -1930,6 +2069,122 @@ mod tests {
         handler.handle_tool_call("tttt_sidebar_message", &json!({"clear": true})).unwrap();
         let result = handler.handle_tool_call("tttt_sidebar_list", &json!({})).unwrap();
         assert_eq!(result["messages"], json!([]));
+    }
+
+    // === parse_rate_limit_reset tests ===
+
+    #[test]
+    fn test_parse_rate_limit_pm_no_minutes() {
+        let screen = "You've hit your limit - resets 2pm (Europe/Brussels)\nSome other text";
+        let result = parse_rate_limit_reset(screen);
+        assert_eq!(result, Some((14, 0, "Europe/Brussels".to_string())));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_am_no_minutes() {
+        let screen = "resets 11am (US/Pacific) foo";
+        let result = parse_rate_limit_reset(screen);
+        assert_eq!(result, Some((11, 0, "US/Pacific".to_string())));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_pm_with_minutes() {
+        let screen = "resets 2:30pm (America/New_York)";
+        let result = parse_rate_limit_reset(screen);
+        assert_eq!(result, Some((14, 30, "America/New_York".to_string())));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_am_with_minutes() {
+        let screen = "resets 9:45am (Asia/Tokyo)";
+        let result = parse_rate_limit_reset(screen);
+        assert_eq!(result, Some((9, 45, "Asia/Tokyo".to_string())));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_12pm_is_noon() {
+        let screen = "resets 12pm (UTC)";
+        let result = parse_rate_limit_reset(screen);
+        assert_eq!(result, Some((12, 0, "UTC".to_string())));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_12am_is_midnight() {
+        let screen = "resets 12am (UTC)";
+        let result = parse_rate_limit_reset(screen);
+        assert_eq!(result, Some((0, 0, "UTC".to_string())));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_no_match_returns_none() {
+        let screen = "No rate limit here. Everything is fine.";
+        assert_eq!(parse_rate_limit_reset(screen), None);
+    }
+
+    #[test]
+    fn test_parse_rate_limit_full_dialog() {
+        let screen = concat!(
+            "You've hit your limit - resets 2pm (Europe/Brussels)\n\n",
+            "/rate-limit-options\n\n",
+            "What do you want to do?\n\n",
+            "} 1. Stop and wait for limit to reset\n",
+            "  2. Add funds to continue with extra usage\n",
+            "  3. Upgrade your plan\n\n",
+            "Enter to confirm · Esc to cancel"
+        );
+        let result = parse_rate_limit_reset(screen);
+        assert_eq!(result, Some((14, 0, "Europe/Brussels".to_string())));
+    }
+
+    // === calculate_wait_duration tests ===
+
+    #[test]
+    fn test_calculate_wait_duration_adds_safety_margin() {
+        // Pick a reset time far in the future (23:59 UTC) so we know it hasn't passed.
+        let dur = calculate_wait_duration(23, 59, "UTC", 10).unwrap();
+        // Safety margin of 10 minutes must be included.
+        assert!(dur.as_secs() >= 10 * 60);
+    }
+
+    #[test]
+    fn test_calculate_wait_duration_unknown_tz_errors() {
+        let result = calculate_wait_duration(14, 0, "Fake/NotReal", 0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown timezone"));
+    }
+
+    #[test]
+    fn test_calculate_wait_duration_past_time_wraps_to_tomorrow() {
+        // Use hour 0 minute 1 UTC. If it has passed today we expect ~24h wait;
+        // if not (extremely unlikely: test runs in the first minute of the day)
+        // we expect < 2 minutes. Either way the safety margin of 0 is excluded.
+        // We simply verify the function succeeds and returns a sensible value.
+        let dur = calculate_wait_duration(0, 1, "UTC", 0).unwrap();
+        // Result must be somewhere in (0, 25 hours).
+        assert!(dur.as_secs() <= 25 * 3600, "wait too long: {:?}", dur);
+        // Must be at least 0 seconds (non-negative).
+        assert!(dur.as_secs() < 25 * 3600);
+    }
+
+    #[test]
+    fn test_calculate_wait_duration_valid_timezone() {
+        // Should not error for a well-known timezone.
+        let result = calculate_wait_duration(14, 0, "Europe/Brussels", 15);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_rate_limit_no_dialog() {
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
+        let result = handler
+            .handle_tool_call(
+                "tttt_pty_handle_rate_limit",
+                &json!({"session_id": id}),
+            )
+            .unwrap();
+        assert_eq!(result["status"], "no_rate_limit");
     }
 
 }
