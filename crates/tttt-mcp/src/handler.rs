@@ -720,6 +720,53 @@ impl<B: PtyBackend + 'static> ToolHandler for NotificationToolHandler<B> {
     }
 }
 
+// === Sidebar message tool handler ===
+
+/// Shared sidebar messages type.
+pub type SharedSidebarMessages = Arc<Mutex<Vec<String>>>;
+
+/// Handles sidebar message tool calls, writing messages into the sidebar REMINDERS section.
+pub struct SidebarMessageToolHandler {
+    messages: SharedSidebarMessages,
+}
+
+impl SidebarMessageToolHandler {
+    pub fn new(messages: SharedSidebarMessages) -> Self {
+        Self { messages }
+    }
+
+    fn handle_sidebar_message(&self, args: &Value) -> Result<Value> {
+        let clear = args["clear"].as_bool().unwrap_or(false);
+        let mut msgs = self.messages.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        if clear {
+            msgs.clear();
+            return Ok(json!({"status": "ok", "count": 0}));
+        }
+        let message = args["message"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("message required".into()))?
+            .to_string();
+        if msgs.len() >= 10 {
+            msgs.remove(0);
+        }
+        msgs.push(message);
+        Ok(json!({"status": "ok", "count": msgs.len()}))
+    }
+}
+
+impl ToolHandler for SidebarMessageToolHandler {
+    fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
+        match name {
+            "tttt_sidebar_message" => self.handle_sidebar_message(args),
+            _ => Err(McpError::ToolNotFound(name.to_string())),
+        }
+    }
+
+    fn tool_definitions(&self) -> Vec<Value> {
+        crate::tools::sidebar_tool_definitions()
+    }
+}
+
 // === Scratchpad tool handler ===
 
 /// Shared scratchpad store type.
@@ -1259,9 +1306,9 @@ mod tests {
         composite.add_handler(Box::new(make_handler()));
         composite.add_handler(Box::new(make_scheduler_handler()));
 
-        // Should have 10 PTY + 4 scheduler = 14 tool definitions
+        // Should have 13 PTY + 4 scheduler = 17 tool definitions
         let defs = composite.tool_definitions();
-        assert_eq!(defs.len(), 14);
+        assert_eq!(defs.len(), 17);
 
         // PTY tool should work
         let result = composite.handle_tool_call("tttt_pty_list", &json!({}));
@@ -1695,6 +1742,58 @@ mod tests {
             .handle_tool_call("tttt_pty_get_screen", &json!({"session_id": "mysession"}))
             .unwrap();
         assert!(result["screen"].is_string());
+    }
+
+    // === SidebarMessageToolHandler tests ===
+
+    fn make_sidebar_handler() -> SidebarMessageToolHandler {
+        SidebarMessageToolHandler::new(Arc::new(Mutex::new(Vec::new())))
+    }
+
+    #[test]
+    fn test_sidebar_message_add() {
+        let mut handler = make_sidebar_handler();
+        let result = handler.handle_tool_call("tttt_sidebar_message", &json!({"message": "hello"})).unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["count"], 1);
+    }
+
+    #[test]
+    fn test_sidebar_message_caps_at_10() {
+        let mut handler = make_sidebar_handler();
+        for i in 0..11 {
+            handler.handle_tool_call("tttt_sidebar_message", &json!({"message": format!("msg {}", i)})).unwrap();
+        }
+        let msgs = handler.messages.lock().unwrap();
+        assert_eq!(msgs.len(), 10);
+        // Oldest (msg 0) should have been dropped; newest should be msg 10
+        assert_eq!(msgs[9], "msg 10");
+        assert_eq!(msgs[0], "msg 1");
+    }
+
+    #[test]
+    fn test_sidebar_message_clear() {
+        let mut handler = make_sidebar_handler();
+        handler.handle_tool_call("tttt_sidebar_message", &json!({"message": "hello"})).unwrap();
+        let result = handler.handle_tool_call("tttt_sidebar_message", &json!({"clear": true})).unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["count"], 0);
+        assert!(handler.messages.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_sidebar_message_missing_message_errors() {
+        let mut handler = make_sidebar_handler();
+        let result = handler.handle_tool_call("tttt_sidebar_message", &json!({}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sidebar_tool_definitions() {
+        let handler = make_sidebar_handler();
+        let defs = handler.tool_definitions();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0]["name"], "tttt_sidebar_message");
     }
 
 }

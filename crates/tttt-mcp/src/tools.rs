@@ -162,6 +162,23 @@ pub fn pty_tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// Returns the tool definition for the sidebar message tool.
+pub fn sidebar_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "tttt_sidebar_message",
+            "description": "Display a message in the tttt sidebar REMINDERS section. Messages persist until cleared. Maximum 10 messages (oldest dropped when full).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string", "description": "Message to display in the sidebar" },
+                    "clear": { "type": "boolean", "description": "If true, clear all sidebar messages (message param ignored)" }
+                }
+            }
+        }),
+    ]
+}
+
 /// Returns tool definitions for scheduler tools.
 pub fn scheduler_tool_definitions() -> Vec<Value> {
     vec![
@@ -317,6 +334,11 @@ mod tests {
     }
 
     #[test]
+    fn test_sidebar_tool_count() {
+        assert_eq!(sidebar_tool_definitions().len(), 1);
+    }
+
+    #[test]
     fn test_scheduler_tool_count() {
         assert_eq!(scheduler_tool_definitions().len(), 4);
     }
@@ -356,12 +378,21 @@ mod tests {
     }
 
     #[test]
+    fn test_sidebar_message_tool_present() {
+        let tools = sidebar_tool_definitions();
+        let tool = tools.iter().find(|t| t["name"] == "tttt_sidebar_message").unwrap();
+        assert!(tool["inputSchema"]["properties"]["message"].is_object());
+        assert!(tool["inputSchema"]["properties"]["clear"].is_object());
+    }
+
+    #[test]
     fn test_tool_names_unique() {
         let all: Vec<Value> = pty_tool_definitions()
             .into_iter()
             .chain(scheduler_tool_definitions())
             .chain(notification_tool_definitions())
             .chain(scratchpad_tool_definitions())
+            .chain(sidebar_tool_definitions())
             .collect();
         let names: Vec<&str> = all.iter().map(|t| t["name"].as_str().unwrap()).collect();
         let mut unique = names.clone();

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tttt_log::{Direction, LogEvent, LogSink, MultiLogger, SqliteLogger, TextLogger};
 use tttt_mcp::notification::NotificationRegistry;
-use tttt_mcp::{SharedNotificationRegistry, SharedScheduler, SharedScratchpad};
+use tttt_mcp::{SharedNotificationRegistry, SharedScheduler, SharedScratchpad, SharedSidebarMessages};
 use tttt_pty::{AnyPty, PtySession, RealPty, SessionManager, SessionStatus};
 use tttt_scheduler::{Scheduler, SchedulerEvent};
 use std::os::unix::net::UnixListener;
@@ -113,6 +113,7 @@ pub struct App {
     scheduler: SharedScheduler,
     notifications: SharedNotificationRegistry,
     scratchpad: SharedScratchpad,
+    sidebar_messages: SharedSidebarMessages,
     active_session: Option<String>,
     session_order: Vec<String>,
     screen_cols: u16,
@@ -162,6 +163,7 @@ impl App {
             scheduler: Arc::new(Mutex::new(Scheduler::new())),
             notifications: Arc::new(Mutex::new(NotificationRegistry::new())),
             scratchpad: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            sidebar_messages: Arc::new(Mutex::new(Vec::new())),
             active_session: None,
             session_order: Vec::new(),
             screen_cols: cols,
@@ -934,7 +936,7 @@ impl App {
         let mgr = self.sessions.lock().unwrap();
         let sessions = mgr.list();
         drop(mgr);
-        let reminders: Vec<String> = Vec::new();
+        let reminders: Vec<String> = self.sidebar_messages.lock().unwrap().clone();
         let uptime_secs = self.server_start_time.elapsed().as_secs();
         let uptime = format!("Uptime: {}s", uptime_secs);
         let lines = self.sidebar.render_with_build_info(
@@ -1050,10 +1052,11 @@ impl App {
                         let notifications = self.notifications.clone();
                         let scheduler = self.scheduler.clone();
                         let scratchpad = self.scratchpad.clone();
+                        let sidebar_messages = self.sidebar_messages.clone();
                         let work_dir = self.config.work_dir.clone();
                         std::thread::spawn(move || {
                             use tttt_mcp::proxy::handle_proxy_client;
-                            use tttt_mcp::{PtyToolHandler, SchedulerToolHandler, NotificationToolHandler, ScratchpadToolHandler, CompositeToolHandler};
+                            use tttt_mcp::{PtyToolHandler, SchedulerToolHandler, NotificationToolHandler, ScratchpadToolHandler, SidebarMessageToolHandler, CompositeToolHandler};
 
                             // Set the stream to blocking mode for the handler
                             let _ = stream.set_nonblocking(false);
@@ -1062,11 +1065,13 @@ impl App {
                             let scheduler_handler = SchedulerToolHandler::new(scheduler);
                             let notif_handler = NotificationToolHandler::new(notifications, sessions);
                             let scratchpad_handler = ScratchpadToolHandler::new_shared(scratchpad);
+                            let sidebar_handler = SidebarMessageToolHandler::new(sidebar_messages);
                             let mut composite = CompositeToolHandler::new();
                             composite.add_handler(Box::new(pty_handler));
                             composite.add_handler(Box::new(scheduler_handler));
                             composite.add_handler(Box::new(notif_handler));
                             composite.add_handler(Box::new(scratchpad_handler));
+                            composite.add_handler(Box::new(sidebar_handler));
 
                             if let Err(e) = handle_proxy_client(stream, &mut composite, "tttt") {
                                 // Client disconnected or error — normal

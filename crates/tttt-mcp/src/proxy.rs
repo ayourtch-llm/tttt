@@ -311,7 +311,7 @@ mod tests {
 
         let resp: serde_json::Value = serde_json::from_slice(&resp_buf).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10); // 10 PTY tools
+        assert_eq!(tools.len(), 13); // 13 PTY tools
 
         drop(client);
         server_handle.join().unwrap();
