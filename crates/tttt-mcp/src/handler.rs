@@ -188,6 +188,35 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         Ok(json!({"status": "ok"}))
     }
 
+    fn handle_get_status(&self) -> Result<Value> {
+        let mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let sessions: Vec<Value> = mgr
+            .list()
+            .iter()
+            .filter_map(|meta| {
+                mgr.get(&meta.id).ok().map(|session| {
+                    let status_str = match meta.status {
+                        SessionStatus::Running => "Running".to_string(),
+                        SessionStatus::Exited(code) => format!("Exited({})", code),
+                    };
+                    json!({
+                        "id": meta.id,
+                        "name": meta.name,
+                        "status": status_str,
+                        "command": meta.command,
+                        "last_output_line": session.last_non_empty_line(),
+                        "idle_seconds": session.idle_seconds(),
+                    })
+                })
+            })
+            .collect();
+        Ok(json!({
+            "sessions": sessions,
+            "pending_reminders": 0,
+            "active_watchers": 0,
+        }))
+    }
+
     fn handle_pty_start_capture(&self, args: &Value) -> Result<Value> {
         let session_id = args["session_id"]
             .as_str()
@@ -291,6 +320,7 @@ impl ToolHandler for PtyToolHandler<tttt_pty::RealPty> {
             "tttt_pty_wait_for" => self.handle_pty_wait_for(args),
             "tttt_pty_start_capture" => self.handle_pty_start_capture(args),
             "tttt_pty_stop_capture" => self.handle_pty_stop_capture(args),
+            "tttt_get_status" => self.handle_get_status(),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
     }
@@ -358,6 +388,7 @@ impl ToolHandler for PtyToolHandler<tttt_pty::AnyPty> {
             "tttt_pty_wait_for" => self.handle_pty_wait_for(args),
             "tttt_pty_start_capture" => self.handle_pty_start_capture(args),
             "tttt_pty_stop_capture" => self.handle_pty_stop_capture(args),
+            "tttt_get_status" => self.handle_get_status(),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
     }
@@ -382,6 +413,7 @@ impl ToolHandler for PtyToolHandler<MockPty> {
             "tttt_pty_wait_for" => self.handle_pty_wait_for(args),
             "tttt_pty_start_capture" => self.handle_pty_start_capture(args),
             "tttt_pty_stop_capture" => self.handle_pty_stop_capture(args),
+            "tttt_get_status" => self.handle_get_status(),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
     }
@@ -909,6 +941,55 @@ mod tests {
     }
 
     #[test]
+    fn test_get_status_empty() {
+        let mut handler = make_handler();
+        let result = handler.handle_tool_call("tttt_get_status", &json!({})).unwrap();
+        assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
+        assert_eq!(result["pending_reminders"], 0);
+        assert_eq!(result["active_watchers"], 0);
+    }
+
+    #[test]
+    fn test_get_status_with_session() {
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        // Queue some output
+        {
+            let mut mgr = handler.manager().lock().unwrap();
+            let session = mgr.get_mut(&id).unwrap();
+            session.backend_mut().queue_output(b"hello world\r\n");
+            session.pump().unwrap();
+        }
+        let mut handler = handler;
+        let result = handler.handle_tool_call("tttt_get_status", &json!({})).unwrap();
+        let sessions = result["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s["id"].as_str().unwrap(), id);
+        assert_eq!(s["status"], "Running");
+        assert_eq!(s["last_output_line"], "hello world");
+        assert!(s["idle_seconds"].as_f64().unwrap() < 1.0);
+    }
+
+    #[test]
+    fn test_get_status_idle_seconds_present() {
+        let handler = make_handler_with_session();
+        let mut handler = handler;
+        let result = handler.handle_tool_call("tttt_get_status", &json!({})).unwrap();
+        let sessions = result["sessions"].as_array().unwrap();
+        assert!(sessions[0]["idle_seconds"].is_number());
+    }
+
+    #[test]
+    fn test_get_status_empty_screen_last_line() {
+        let handler = make_handler_with_session();
+        let mut handler = handler;
+        let result = handler.handle_tool_call("tttt_get_status", &json!({})).unwrap();
+        let sessions = result["sessions"].as_array().unwrap();
+        assert_eq!(sessions[0]["last_output_line"], "");
+    }
+
+    #[test]
     fn test_pty_start_capture_returns_capture_id_and_file_path() {
         let handler = make_handler_with_session();
         let id = handler.manager().lock().unwrap().list()[0].id.clone();
@@ -984,7 +1065,7 @@ mod tests {
         let handler = make_handler();
         composite.add_handler(Box::new(handler));
         let defs = composite.tool_definitions();
-        assert_eq!(defs.len(), 12);
+        assert_eq!(defs.len(), 13);
     }
 
     #[test]

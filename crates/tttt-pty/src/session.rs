@@ -42,6 +42,7 @@ pub struct PtySession<B: PtyBackend> {
     status: SessionStatus,
     command: String,
     created_at: Instant,
+    last_output_time: Instant,
     capture_file: Option<std::fs::File>,
     capture_path: Option<String>,
     capture_bytes: u64,
@@ -58,6 +59,7 @@ impl<B: PtyBackend> PtySession<B> {
             status: SessionStatus::Running,
             command,
             created_at: Instant::now(),
+            last_output_time: Instant::now(),
             capture_file: None,
             capture_path: None,
             capture_bytes: 0,
@@ -86,6 +88,7 @@ impl<B: PtyBackend> PtySession<B> {
         let n = self.backend.read(&mut buf)?;
         if n > 0 {
             self.screen.process(&buf[..n]);
+            self.last_output_time = Instant::now();
             if let Some(ref mut file) = self.capture_file {
                 file.write_all(&buf[..n])?;
                 self.capture_bytes += n as u64;
@@ -225,6 +228,24 @@ impl<B: PtyBackend> PtySession<B> {
     /// Set scrollback buffer depth.
     pub fn set_scrollback(&mut self, lines: usize) {
         self.screen.set_scrollback(lines);
+    }
+
+    /// Seconds since the session last produced any output.
+    pub fn idle_seconds(&self) -> f64 {
+        self.last_output_time.elapsed().as_secs_f64()
+    }
+
+    /// The last non-empty line of visible screen content, trimmed.
+    /// Returns an empty string if the screen is blank.
+    pub fn last_non_empty_line(&self) -> String {
+        let contents = self.screen.contents();
+        for line in contents.lines().rev() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        String::new()
     }
 
     /// Check and update the session status from the backend.
@@ -514,6 +535,56 @@ mod tests {
         let (_, bytes) = session.stop_capture().unwrap();
         assert_eq!(bytes, 0);
         let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_idle_seconds_initially_small() {
+        let session = make_session();
+        assert!(session.idle_seconds() < 1.0);
+    }
+
+    #[test]
+    fn test_idle_seconds_resets_after_output() {
+        let mut mock = MockPty::new(80, 24);
+        mock.queue_output(b"hello");
+        let mut session = PtySession::new("t1".to_string(), mock, "bash".to_string(), 80, 24);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        session.pump().unwrap();
+        // After pumping output, idle_seconds should be near zero
+        assert!(session.idle_seconds() < 0.5);
+    }
+
+    #[test]
+    fn test_last_non_empty_line_with_content() {
+        let mut mock = MockPty::new(80, 24);
+        mock.queue_output(b"first line\r\nsecond line\r\n");
+        let mut session = PtySession::new("t1".to_string(), mock, "bash".to_string(), 80, 24);
+        session.pump().unwrap();
+        assert_eq!(session.last_non_empty_line(), "second line");
+    }
+
+    #[test]
+    fn test_last_non_empty_line_skips_trailing_empty() {
+        let mut mock = MockPty::new(80, 24);
+        mock.queue_output(b"some text\r\n\r\n\r\n");
+        let mut session = PtySession::new("t1".to_string(), mock, "bash".to_string(), 80, 24);
+        session.pump().unwrap();
+        assert_eq!(session.last_non_empty_line(), "some text");
+    }
+
+    #[test]
+    fn test_last_non_empty_line_empty_screen() {
+        let session = make_session();
+        assert_eq!(session.last_non_empty_line(), "");
+    }
+
+    #[test]
+    fn test_last_non_empty_line_single_line() {
+        let mut mock = MockPty::new(80, 24);
+        mock.queue_output(b"prompt$ ");
+        let mut session = PtySession::new("t1".to_string(), mock, "bash".to_string(), 80, 24);
+        session.pump().unwrap();
+        assert_eq!(session.last_non_empty_line(), "prompt$");
     }
 
     #[test]

@@ -151,6 +151,14 @@ pub fn pty_tool_definitions() -> Vec<Value> {
                 "required": ["session_id"]
             }
         }),
+        json!({
+            "name": "tttt_get_status",
+            "description": "Get a dashboard summary of all sessions and system state. Returns session list with last output line and idle time, plus counts of pending reminders and active watchers.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
     ]
 }
 
@@ -305,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_pty_tool_count() {
-        assert_eq!(pty_tool_definitions().len(), 12);
+        assert_eq!(pty_tool_definitions().len(), 13);
     }
 
     #[test]
