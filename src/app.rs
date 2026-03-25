@@ -360,6 +360,22 @@ impl App {
         Ok(())
     }
 
+    /// Set up a one-shot notification watcher that auto-injects "Continue from where
+    /// you left off." when the root session shows the Claude prompt. This allows
+    /// autonomous SIGUSR2 restarts without waiting for human input.
+    pub fn setup_auto_continue(&self, root_session_id: &str) {
+        let mut notif = self.notifications.lock().unwrap();
+        if let Err(e) = notif.add_watcher(
+            root_session_id.to_string(),
+            r"❯\s*$",
+            "Continue from where you left off.\n".to_string(),
+            root_session_id.to_string(),
+            true, // one-shot
+        ) {
+            eprintln!("Warning: failed to set up auto-continue watcher: {}", e);
+        }
+    }
+
     /// Remove a session ID from the session order list.
     pub fn remove_from_session_order(&mut self, id: &str) {
         self.session_order.retain(|s| s != id);

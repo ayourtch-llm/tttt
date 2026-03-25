@@ -240,9 +240,16 @@ fn run_restored(restore_file: &str) {
         if let Some(root_id) = state.session_order.first() {
             app.remove_from_session_order(root_id);
         }
-        if let Err(e) = app.launch_root() {
-            eprintln!("Failed to relaunch root session: {}", e);
-            std::process::exit(1);
+        match app.launch_root() {
+            Ok(new_root_id) => {
+                // Auto-inject "Continue" when Claude shows its prompt,
+                // so it resumes without waiting for human input.
+                app.setup_auto_continue(&new_root_id);
+            }
+            Err(e) => {
+                eprintln!("Failed to relaunch root session: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 
