@@ -6,6 +6,8 @@ Think of it as **tmux designed for AI agents**: session management, screen readi
 
 ![tttt in action — sidebar shows 4 sessions and reminder messages](images/screenshot.jpg)
 
+> **WARNING: This software gives AI agents direct access to terminal sessions, including the ability to execute commands, send keystrokes, and manage processes. Session sandboxing is not yet implemented. Use only in experimental / proof-of-concept environments and always supervise the running agents. Do not deploy in production or on systems with sensitive data without proper isolation in place.**
+
 ## Why This Exists
 
 Current AI coding assistants run as single agents in a single terminal. When tasks get complex, you want multiple agents working in parallel — but coordinating them requires infrastructure that doesn't exist in standard terminal multiplexers.
