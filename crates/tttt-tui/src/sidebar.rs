@@ -30,6 +30,18 @@ impl SidebarRenderer {
         screen_rows: u16,
         reminders: &[String],
     ) -> Vec<SidebarLine> {
+        self.render_with_build_info(sessions, active_id, screen_cols, screen_rows, reminders, None)
+    }
+
+    pub fn render_with_build_info(
+        &self,
+        sessions: &[SessionMetadata],
+        active_id: Option<&str>,
+        screen_cols: u16,
+        screen_rows: u16,
+        reminders: &[String],
+        build_info: Option<&str>,
+    ) -> Vec<SidebarLine> {
         let mut lines = Vec::new();
         let sidebar_col = screen_cols.saturating_sub(self.width) + 1;
         let usable_width = (self.width as usize).saturating_sub(3); // "| " prefix + padding
@@ -37,8 +49,13 @@ impl SidebarRenderer {
         // Header
         lines.push(self.make_line(1, sidebar_col, &self.pad("TERMINALS", usable_width), false));
 
-        // Separator
-        lines.push(self.make_line(2, sidebar_col, &self.pad(&"-".repeat(usable_width), usable_width), false));
+        // Build info or separator on row 2
+        let row2_content = if let Some(info) = build_info {
+            truncate(info, usable_width)
+        } else {
+            "-".repeat(usable_width)
+        };
+        lines.push(self.make_line(2, sidebar_col, &self.pad(&row2_content, usable_width), false));
 
         // Session list
         let mut row = 3u16;

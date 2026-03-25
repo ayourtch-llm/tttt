@@ -1,6 +1,7 @@
 mod app;
 mod attach;
 mod config;
+mod reload;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -56,6 +57,13 @@ enum Commands {
 }
 
 fn main() {
+    // Check for restore mode FIRST — before parsing CLI args
+    if let Ok(restore_file) = std::env::var(reload::RESTORE_ENV_VAR) {
+        std::env::remove_var(reload::RESTORE_ENV_VAR);
+        run_restored(&restore_file);
+        return;
+    }
+
     let cli = Cli::parse();
 
     match cli.subcommand {
@@ -133,6 +141,15 @@ fn run_tui(cli: Cli) {
         std::process::exit(1);
     }
 
+    // If reload was requested, perform execv (does not return on success)
+    if app.reload_requested {
+        if let Err(e) = app.execute_reload() {
+            eprintln!("Reload failed: {}", e);
+            eprintln!("Continuing with current process...");
+            // Fall through to normal exit
+        }
+    }
+
     // Show root session's last screen on exit for diagnostics
     if let Some((screen, status)) = &app.last_root_screen {
         let screen_trimmed = screen.trim();
@@ -152,6 +169,67 @@ fn run_tui(cli: Cli) {
                 eprintln!("... ({} more lines, use --full-dump to show all)", lines.len() - 10);
             }
             eprintln!("---");
+        }
+    }
+
+    // Clean up sockets
+    if let Some(ref path) = app.socket_path {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Some(ref path) = app.mcp_socket_path {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Restore from a saved state file after execv().
+fn run_restored(restore_file: &str) {
+    let state = match reload::SavedState::read_from_file(restore_file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to read restore state: {}", e);
+            eprintln!("Starting fresh instead.");
+            // Parse CLI and start normally
+            let cli = Cli::parse();
+            run_tui(cli);
+            return;
+        }
+    };
+
+    let config = state.config.clone();
+    let mut app = app::App::new(config);
+
+    if let Err(e) = app.init_loggers() {
+        eprintln!("Warning: failed to initialize loggers: {}", e);
+    }
+
+    // Restore sessions from inherited FDs
+    if let Err(e) = app.restore_sessions(&state) {
+        eprintln!("Warning: failed to restore some sessions: {}", e);
+    }
+
+    // Re-create socket listeners
+    if let Err(e) = app.start_mcp_listener() {
+        eprintln!("Warning: failed to start MCP listener: {}", e);
+    }
+    if let Err(e) = app.start_viewer_listener() {
+        eprintln!("Warning: failed to start viewer listener: {}", e);
+    }
+
+    // Restore cron jobs
+    app.restore_cron_jobs(&state.cron_jobs);
+
+    // Restore notification watchers
+    app.restore_watchers(&state.watchers);
+
+    if let Err(e) = app.run() {
+        eprintln!("\nError: {}", e);
+        std::process::exit(1);
+    }
+
+    // Handle reload request from restored instance
+    if app.reload_requested {
+        if let Err(e) = app.execute_reload() {
+            eprintln!("Reload failed: {}", e);
         }
     }
 

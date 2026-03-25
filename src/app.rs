@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::reload::{self, SavedState, SavedSession, SavedCronJob, SavedWatcher};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,7 +8,7 @@ use std::time::Instant;
 use tttt_log::{Direction, LogEvent, LogSink, MultiLogger, SqliteLogger, TextLogger};
 use tttt_mcp::notification::NotificationRegistry;
 use tttt_mcp::{SharedNotificationRegistry, SharedScheduler};
-use tttt_pty::{PtySession, RealPty, SessionManager, SessionStatus};
+use tttt_pty::{AnyPty, PtySession, RealPty, SessionManager, SessionStatus};
 use tttt_scheduler::{Scheduler, SchedulerEvent};
 use std::os::unix::net::UnixListener;
 use tttt_tui::{
@@ -104,7 +105,7 @@ fn write_all(fd: i32, data: &[u8]) -> nix::Result<()> {
 /// Main application state.
 pub struct App {
     config: Config,
-    sessions: Arc<Mutex<SessionManager<RealPty>>>,
+    sessions: Arc<Mutex<SessionManager<AnyPty>>>,
     input_parser: InputParser,
     sidebar: SidebarRenderer,
     pane_renderer: PaneRenderer,
@@ -137,6 +138,8 @@ pub struct App {
     pending_injection_queue: Vec<(String, String)>,
     /// When the last injection was performed (for pacing).
     last_injection_time: Option<Instant>,
+    /// Set to true when a live reload has been requested (prefix+R or SIGUSR1).
+    pub reload_requested: bool,
 }
 
 impl App {
@@ -168,13 +171,111 @@ impl App {
             pending_injection_queue: Vec::new(),
             last_injection_time: None,
             last_pty_data_time: None,
+            reload_requested: false,
             config,
         }
     }
 
     /// Get a shared reference to the session manager (for the MCP server thread).
-    pub fn shared_sessions(&self) -> Arc<Mutex<SessionManager<RealPty>>> {
+    pub fn shared_sessions(&self) -> Arc<Mutex<SessionManager<AnyPty>>> {
         self.sessions.clone()
+    }
+
+    /// Restore sessions from a SavedState (after execv reload).
+    pub fn restore_sessions(&mut self, state: &SavedState) -> Result<(), Box<dyn std::error::Error>> {
+        use tttt_pty::RestoredPty;
+
+        let mut mgr = self.sessions.lock().unwrap();
+        let mut errors = Vec::new();
+
+        for saved in &state.sessions {
+            // Only restore running sessions
+            if saved.status != SessionStatus::Running {
+                continue;
+            }
+
+            match RestoredPty::from_raw_fd(saved.master_fd, saved.child_pid) {
+                Ok(restored_backend) => {
+                    let backend = AnyPty::Restored(restored_backend);
+                    let mut session = PtySession::new(
+                        saved.id.clone(),
+                        backend,
+                        saved.command.clone(),
+                        saved.cols,
+                        saved.rows,
+                    );
+
+                    // Replay formatted screen contents to restore visual state
+                    if !saved.screen_contents_formatted.is_empty() {
+                        session.inject_screen_data(&saved.screen_contents_formatted);
+                    }
+
+                    if let Some(ref name) = saved.name {
+                        if let Err(e) = mgr.add_session_with_name(session, name.clone()) {
+                            errors.push(format!("session {}: {}", saved.id, e));
+                        }
+                    } else if let Err(e) = mgr.add_session(session) {
+                        errors.push(format!("session {}: {}", saved.id, e));
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!("session {} (fd {}): {}", saved.id, saved.master_fd, e));
+                }
+            }
+        }
+        drop(mgr);
+
+        // Restore session order and active session
+        self.session_order = state.session_order.clone();
+        self.active_session = state.active_session.clone();
+
+        // Set the next_id counter to avoid ID collisions
+        // We need to set it high enough that generate_id() won't collide
+        {
+            let mut mgr = self.sessions.lock().unwrap();
+            // Generate IDs up to the saved next_id to advance the counter
+            while mgr.next_id() < state.next_session_id {
+                let _ = mgr.generate_id();
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; ").into())
+        }
+    }
+
+    /// Restore cron jobs from saved state.
+    pub fn restore_cron_jobs(&self, cron_jobs: &[reload::SavedCronJob]) {
+        let mut sched = self.scheduler.lock().unwrap();
+        let now = std::time::Instant::now();
+        for job in cron_jobs {
+            if let Err(e) = sched.add_cron(
+                job.expression.clone(),
+                job.command.clone(),
+                job.session_id.clone(),
+                now,
+            ) {
+                eprintln!("Warning: failed to restore cron job {}: {}", job.id, e);
+            }
+        }
+    }
+
+    /// Restore notification watchers from saved state.
+    pub fn restore_watchers(&self, watchers: &[reload::SavedWatcher]) {
+        let mut notif = self.notifications.lock().unwrap();
+        for w in watchers {
+            if let Err(e) = notif.add_watcher(
+                w.watch_session_id.clone(),
+                &w.pattern,
+                w.inject_text.clone(),
+                w.inject_session_id.clone(),
+                w.one_shot,
+            ) {
+                eprintln!("Warning: failed to restore watcher {}: {}", w.id, e);
+            }
+        }
     }
 
     /// Start listening for viewer connections on a Unix socket.
@@ -259,10 +360,11 @@ impl App {
 
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let tttt_pid = std::process::id();
-        let backend = RealPty::spawn_with_cwd_and_env(
+        let real_backend = RealPty::spawn_with_cwd_and_env(
             &self.config.root_command, &args_refs, Some(&self.config.work_dir), pty_cols, pty_rows,
             [("TTTT_PID".to_string(), tttt_pid.to_string())],
         )?;
+        let backend = AnyPty::Real(real_backend);
         let mut mgr = self.sessions.lock().unwrap();
         let id = mgr.generate_id();
         let session = PtySession::new(id.clone(), backend, self.config.root_command.clone(), pty_cols, pty_rows);
@@ -280,10 +382,11 @@ impl App {
 
         let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         let tttt_pid = std::process::id();
-        let backend = RealPty::spawn_with_cwd_and_env(
+        let real_backend = RealPty::spawn_with_cwd_and_env(
             &default_shell, &[], Some(&self.config.work_dir), pty_cols, pty_rows,
             [("TTTT_PID".to_string(), tttt_pid.to_string())],
         )?;
+        let backend = AnyPty::Real(real_backend);
         let mut mgr = self.sessions.lock().unwrap();
         let id = mgr.generate_id();
         let session = PtySession::new(id.clone(), backend, default_shell, pty_cols, pty_rows);
@@ -294,10 +397,110 @@ impl App {
         Ok(())
     }
 
+    /// Build the SavedState for a live reload. Does NOT call execv.
+    pub fn prepare_reload(&self) -> Result<SavedState, Box<dyn std::error::Error>> {
+        let mgr = self.sessions.lock().unwrap();
+        let mut sessions = Vec::new();
+
+        for meta in mgr.list() {
+            if let Ok(session) = mgr.get(&meta.id) {
+                let master_fd = session.backend().reader_raw_fd();
+                // Try to discover child PID via TIOCGPGRP
+                let child_pid = {
+                    let mut pgid: libc::pid_t = 0;
+                    let ret = unsafe { libc::ioctl(master_fd, libc::TIOCGPGRP, &mut pgid) };
+                    if ret == 0 && pgid > 0 { Some(pgid) } else { None }
+                };
+                let screen_contents_formatted = session.get_screen_formatted();
+
+                sessions.push(SavedSession {
+                    id: meta.id.clone(),
+                    name: meta.name.clone(),
+                    command: meta.command.clone(),
+                    status: meta.status.clone(),
+                    cols: meta.cols,
+                    rows: meta.rows,
+                    master_fd,
+                    child_pid,
+                    screen_contents_formatted,
+                });
+            }
+        }
+        drop(mgr);
+
+        // Save cron jobs from scheduler
+        let cron_jobs: Vec<SavedCronJob> = {
+            let sched = self.scheduler.lock().unwrap();
+            sched.list_cron().iter().map(|job| SavedCronJob {
+                id: job.id.clone(),
+                expression: job.expression.clone(),
+                command: job.command.clone(),
+                session_id: job.session_id.clone(),
+            }).collect()
+        };
+
+        // Save notification watchers
+        let watchers: Vec<SavedWatcher> = {
+            let notif = self.notifications.lock().unwrap();
+            notif.list_watchers().iter().map(|w| SavedWatcher {
+                id: w.id.clone(),
+                watch_session_id: w.watch_session_id.clone(),
+                pattern: w.pattern.clone(),
+                inject_text: w.inject_text.clone(),
+                inject_session_id: w.inject_session_id.clone(),
+                one_shot: w.one_shot,
+            }).collect()
+        };
+
+        Ok(SavedState {
+            version: reload::STATE_VERSION,
+            sessions,
+            active_session: self.active_session.clone(),
+            session_order: self.session_order.clone(),
+            next_session_id: self.sessions.lock().unwrap().next_id(),
+            cron_jobs,
+            watchers,
+            scratchpad: std::collections::HashMap::new(), // TODO: expose scratchpad from MCP handler
+            config: self.config.clone(),
+            screen_cols: self.screen_cols,
+            screen_rows: self.screen_rows,
+        })
+    }
+
+    /// Perform the live reload: save state, clear CLOEXEC on PTY FDs, and execv.
+    /// This function does not return on success.
+    pub fn execute_reload(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let state = self.prepare_reload()?;
+
+        // Clear CLOEXEC on all PTY master FDs so they survive exec
+        for session in &state.sessions {
+            reload::clear_cloexec(session.master_fd)?;
+        }
+
+        // Write state file
+        let path = state.write_to_file()?;
+        std::env::set_var(reload::RESTORE_ENV_VAR, &path);
+
+        // Close socket listeners (will be re-created after exec)
+        // (They are dropped when App is dropped, but we want explicit cleanup)
+        if let Some(ref socket_path) = self.socket_path {
+            let _ = std::fs::remove_file(socket_path);
+        }
+        if let Some(ref mcp_socket_path) = self.mcp_socket_path {
+            let _ = std::fs::remove_file(mcp_socket_path);
+        }
+
+        // execv replaces the process image — does not return on success
+        reload::exec_self()?;
+        unreachable!()
+    }
+
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let _terminal_state = TerminalState::enter_raw_mode();
         let winch = Arc::new(AtomicBool::new(false));
         let _ = signal_hook::flag::register(libc::SIGWINCH, Arc::clone(&winch));
+        let sigusr1 = Arc::new(AtomicBool::new(false));
+        let _ = signal_hook::flag::register(libc::SIGUSR1, Arc::clone(&sigusr1));
 
         let stdout_fd = std::io::stdout().as_raw_fd();
         let stdin_fd = std::io::stdin().as_raw_fd();
@@ -334,6 +537,12 @@ impl App {
             if winch.load(Ordering::Relaxed) {
                 winch.store(false, Ordering::Relaxed);
                 self.handle_resize(stdout_fd)?;
+            }
+
+            if sigusr1.load(Ordering::Relaxed) {
+                sigusr1.store(false, Ordering::Relaxed);
+                self.reload_requested = true;
+                break;
             }
 
             // Read PTY output — pump into screen buffer but defer rendering
@@ -571,6 +780,10 @@ impl App {
             InputEvent::CreateTerminal => {
                 self.create_session(stdout_fd)?;
             }
+            InputEvent::Reload => {
+                self.reload_requested = true;
+                return Ok(false);
+            }
         }
         Ok(true)
     }
@@ -626,13 +839,15 @@ impl App {
             {}  n    Next terminal\
             {}  p    Previous terminal\
             {}  d    Detach/quit\
+            {}  r    Live reload (execv)\
             {}  ?    This help\
             {}  {p}{p}  Send literal prefix\
             {}Press any key to dismiss...",
             clear_screen(), cursor_goto(2, 4), prefix_name,
             cursor_goto(4, 4), cursor_goto(5, 4), cursor_goto(6, 4),
             cursor_goto(7, 4), cursor_goto(8, 4),
-            cursor_goto(10, 4), cursor_goto(12, 4), p = prefix_name,
+            cursor_goto(9, 4), cursor_goto(11, 4),
+            cursor_goto(13, 4), p = prefix_name,
         );
         write_all(stdout_fd, help.as_bytes())?;
         let stdin_fd = std::io::stdin().as_raw_fd();
@@ -650,9 +865,11 @@ impl App {
         let sessions = mgr.list();
         drop(mgr);
         let reminders: Vec<String> = Vec::new();
-        let lines = self.sidebar.render(
+        let build_info = concat!("built ", env!("BUILD_TIMESTAMP"));
+        let lines = self.sidebar.render_with_build_info(
             &sessions, self.active_session.as_deref(),
             self.screen_cols, self.screen_rows, &reminders,
+            Some(build_info),
         );
         for line in &lines {
             write_all(stdout_fd, line.content.as_bytes())?;

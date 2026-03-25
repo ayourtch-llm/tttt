@@ -278,6 +278,71 @@ impl ToolHandler for PtyToolHandler<tttt_pty::RealPty> {
     }
 }
 
+impl PtyToolHandler<tttt_pty::AnyPty> {
+    /// Launch a real PTY session wrapped in AnyPty.
+    pub fn handle_pty_launch_any(&self, args: &Value) -> Result<Value> {
+        let cols = args["cols"].as_u64().unwrap_or(self.default_cols as u64) as u16;
+        let rows = args["rows"].as_u64().unwrap_or(self.default_rows as u64) as u16;
+        let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let command = args["command"]
+            .as_str()
+            .unwrap_or(&default_shell);
+        let cmd_args: Vec<&str> = args["args"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let name = args["name"].as_str().map(|s| s.to_string());
+
+        let cwd = args["working_dir"]
+            .as_str()
+            .map(std::path::PathBuf::from)
+            .or_else(|| Some(self.work_dir.clone()));
+        let real_backend = tttt_pty::RealPty::spawn_with_cwd(
+            command,
+            &cmd_args,
+            cwd.as_deref(),
+            cols,
+            rows,
+        )?;
+        let backend = tttt_pty::AnyPty::Real(real_backend);
+        let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let id = mgr.generate_id();
+        let session = PtySession::new(id.clone(), backend, command.to_string(), cols, rows);
+        if let Some(n) = name.clone() {
+            mgr.add_session_with_name(session, n)?;
+        } else {
+            mgr.add_session(session)?;
+        }
+        let mut resp = json!({"session_id": id});
+        if let Some(n) = name {
+            resp["name"] = json!(n);
+        }
+        Ok(resp)
+    }
+}
+
+impl ToolHandler for PtyToolHandler<tttt_pty::AnyPty> {
+    fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
+        match name {
+            "tttt_pty_launch" => self.handle_pty_launch_any(args),
+            "tttt_pty_list" => self.handle_pty_list(),
+            "tttt_pty_get_screen" => self.handle_pty_get_screen(args),
+            "tttt_pty_send_keys" => self.handle_pty_send_keys(args),
+            "tttt_pty_kill" => self.handle_pty_kill(args),
+            "tttt_pty_get_cursor" => self.handle_pty_get_cursor(args),
+            "tttt_pty_resize" => self.handle_pty_resize(args),
+            "tttt_pty_get_scrollback" => self.handle_pty_get_scrollback(args),
+            "tttt_pty_set_scrollback" => self.handle_pty_set_scrollback(args),
+            "tttt_pty_wait_for" => self.handle_pty_wait_for(args),
+            _ => Err(McpError::ToolNotFound(name.to_string())),
+        }
+    }
+
+    fn tool_definitions(&self) -> Vec<Value> {
+        crate::tools::pty_tool_definitions()
+    }
+}
+
 impl ToolHandler for PtyToolHandler<MockPty> {
     fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
         match name {

@@ -153,6 +153,12 @@ impl<B: PtyBackend> PtySession<B> {
         }
     }
 
+    /// Feed raw bytes directly into the screen buffer (bypassing the PTY backend).
+    /// Used to replay saved screen state after a live reload.
+    pub fn inject_screen_data(&mut self, data: &[u8]) {
+        self.screen.process(data);
+    }
+
     /// Access the screen buffer directly.
     pub fn screen(&self) -> &ScreenBuffer {
         &self.screen
@@ -373,6 +379,22 @@ mod tests {
         let mut session = PtySession::new("t1".to_string(), mock, "bash".to_string(), 80, 24);
         let large_data = vec![b'A'; 4096];
         session.send_raw(&large_data).unwrap();
+    }
+
+    #[test]
+    fn test_session_inject_screen_data() {
+        let mut session = make_session();
+        session.inject_screen_data(b"injected content");
+        assert!(session.get_screen().contains("injected content"));
+    }
+
+    #[test]
+    fn test_session_inject_screen_data_with_ansi() {
+        let mut session = make_session();
+        session.inject_screen_data(b"\x1b[1mBOLD\x1b[0m normal");
+        let screen = session.get_screen();
+        assert!(screen.contains("BOLD"));
+        assert!(screen.contains("normal"));
     }
 
     #[test]

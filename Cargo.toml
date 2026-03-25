@@ -49,6 +49,7 @@ shell-words = "1"
 vt100 = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+base64 = "0.22"
 
 [dev-dependencies]
 serde_json = { workspace = true }
