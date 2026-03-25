@@ -376,6 +376,11 @@ impl App {
         }
     }
 
+    /// Queue a text injection into a session. Will be drained by the event loop.
+    pub fn queue_injection(&mut self, session_id: &str, text: &str) {
+        self.pending_injection_queue.push((session_id.to_string(), text.to_string()));
+    }
+
     /// Remove a session ID from the session order list.
     pub fn remove_from_session_order(&mut self, id: &str) {
         self.session_order.retain(|s| s != id);

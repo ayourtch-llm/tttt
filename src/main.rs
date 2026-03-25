@@ -253,6 +253,15 @@ fn run_restored(restore_file: &str) {
         }
     }
 
+    // For lightweight reloads (SIGUSR1), the root session is still alive but Claude
+    // may go quiet. Queue a "Continue" injection into the root session so it gets
+    // kicked automatically after the event loop starts.
+    if !restart_root {
+        if let Some(root_id) = state.session_order.first() {
+            app.queue_injection(root_id, "Continue from where you left off.");
+        }
+    }
+
     // Restore cron jobs
     app.restore_cron_jobs(&state.cron_jobs);
 
