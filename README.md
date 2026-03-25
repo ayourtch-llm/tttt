@@ -57,6 +57,21 @@ All of this happened in a single 3-hour session where 16 features were implement
 - **MCP proxy auto-reconnect** — The MCP proxy detects socket disconnection during reload and reconnects with backoff
 - **Attach viewer auto-reconnect** — Remote viewers (`tttt attach`) survive reloads seamlessly
 
+### Keyboard Shortcuts
+
+All keybindings use a prefix key: **`Ctrl+\`** (like tmux's `Ctrl+b`).
+
+| Keys | Action |
+|------|--------|
+| `Ctrl+\` then `0`-`9` | Switch to terminal N |
+| `Ctrl+\` then `n` | Next terminal |
+| `Ctrl+\` then `p` | Previous terminal |
+| `Ctrl+\` then `c` | Create new terminal session |
+| `Ctrl+\` then `r` | Live reload (SIGUSR1 equivalent) |
+| `Ctrl+\` then `d` | Detach / quit |
+| `Ctrl+\` then `?` | Show help |
+| `Ctrl+\` then `Ctrl+\` | Send literal `Ctrl+\` to the terminal |
+
 ### Remote Monitoring
 - **`tttt attach`** — Connect from another terminal (or phone via SSH) to watch the AI work in real-time
 - **Virtual screen rendering** — Attach uses a virtual vt100 screen to absorb rapid updates, only rendering the final state
