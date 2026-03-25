@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tttt_log::{Direction, LogEvent, LogSink, MultiLogger, SqliteLogger, TextLogger};
 use tttt_mcp::notification::NotificationRegistry;
-use tttt_mcp::{SharedNotificationRegistry, SharedScheduler};
+use tttt_mcp::{SharedNotificationRegistry, SharedScheduler, SharedScratchpad};
 use tttt_pty::{AnyPty, PtySession, RealPty, SessionManager, SessionStatus};
 use tttt_scheduler::{Scheduler, SchedulerEvent};
 use std::os::unix::net::UnixListener;
@@ -112,6 +112,7 @@ pub struct App {
     logger: MultiLogger,
     scheduler: SharedScheduler,
     notifications: SharedNotificationRegistry,
+    scratchpad: SharedScratchpad,
     active_session: Option<String>,
     session_order: Vec<String>,
     screen_cols: u16,
@@ -160,6 +161,7 @@ impl App {
             logger: MultiLogger::new(),
             scheduler: Arc::new(Mutex::new(Scheduler::new())),
             notifications: Arc::new(Mutex::new(NotificationRegistry::new())),
+            scratchpad: Arc::new(Mutex::new(std::collections::HashMap::new())),
             active_session: None,
             session_order: Vec::new(),
             screen_cols: cols,
@@ -298,6 +300,12 @@ impl App {
                 eprintln!("Warning: failed to restore watcher {}: {}", w.id, e);
             }
         }
+    }
+
+    /// Restore scratchpad data from saved state.
+    pub fn restore_scratchpad(&self, data: &std::collections::HashMap<String, String>) {
+        let mut store = self.scratchpad.lock().unwrap();
+        store.extend(data.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
 
     /// Start listening for viewer connections on a Unix socket.
@@ -512,7 +520,7 @@ impl App {
             next_session_id: self.sessions.lock().unwrap().next_id(),
             cron_jobs,
             watchers,
-            scratchpad: std::collections::HashMap::new(), // TODO: expose scratchpad from MCP handler
+            scratchpad: self.scratchpad.lock().unwrap().clone(),
             config: self.config.clone(),
             screen_cols: self.screen_cols,
             screen_rows: self.screen_rows,
@@ -1041,6 +1049,7 @@ impl App {
                         let sessions = self.sessions.clone();
                         let notifications = self.notifications.clone();
                         let scheduler = self.scheduler.clone();
+                        let scratchpad = self.scratchpad.clone();
                         let work_dir = self.config.work_dir.clone();
                         std::thread::spawn(move || {
                             use tttt_mcp::proxy::handle_proxy_client;
@@ -1052,7 +1061,7 @@ impl App {
                             let pty_handler = PtyToolHandler::new(sessions.clone(), work_dir);
                             let scheduler_handler = SchedulerToolHandler::new(scheduler);
                             let notif_handler = NotificationToolHandler::new(notifications, sessions);
-                            let scratchpad_handler = ScratchpadToolHandler::new();
+                            let scratchpad_handler = ScratchpadToolHandler::new_shared(scratchpad);
                             let mut composite = CompositeToolHandler::new();
                             composite.add_handler(Box::new(pty_handler));
                             composite.add_handler(Box::new(scheduler_handler));

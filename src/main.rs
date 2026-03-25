@@ -268,6 +268,9 @@ fn run_restored(restore_file: &str) {
     // Restore notification watchers
     app.restore_watchers(&state.watchers);
 
+    // Restore scratchpad
+    app.restore_scratchpad(&state.scratchpad);
+
     if let Err(e) = app.run() {
         eprintln!("\nError: {}", e);
         std::process::exit(1);

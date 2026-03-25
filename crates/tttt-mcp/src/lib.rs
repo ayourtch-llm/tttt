@@ -9,8 +9,8 @@ mod tools;
 pub use error::{McpError, Result};
 pub use handler::{
     CompositeToolHandler, NotificationToolHandler, PtyToolHandler, SchedulerToolHandler,
-    ScratchpadToolHandler, SharedNotificationRegistry, SharedScheduler, SharedSessionManager,
-    ToolHandler,
+    ScratchpadToolHandler, SharedNotificationRegistry, SharedScheduler, SharedScratchpad,
+    SharedSessionManager, ToolHandler,
 };
 pub use protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use server::McpServer;

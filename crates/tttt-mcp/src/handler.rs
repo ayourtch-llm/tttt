@@ -722,16 +722,24 @@ impl<B: PtyBackend + 'static> ToolHandler for NotificationToolHandler<B> {
 
 // === Scratchpad tool handler ===
 
-/// Handles scratchpad read/write tool calls using an in-memory HashMap.
+/// Shared scratchpad store type.
+pub type SharedScratchpad = Arc<Mutex<HashMap<String, String>>>;
+
+/// Handles scratchpad read/write tool calls using a shared HashMap.
 pub struct ScratchpadToolHandler {
-    store: HashMap<String, String>,
+    store: SharedScratchpad,
 }
 
 impl ScratchpadToolHandler {
     pub fn new() -> Self {
         Self {
-            store: HashMap::new(),
+            store: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Create a handler that shares an existing scratchpad store.
+    pub fn new_shared(store: SharedScratchpad) -> Self {
+        Self { store }
     }
 
     fn handle_scratchpad_write(&mut self, args: &Value) -> Result<Value> {
@@ -745,13 +753,14 @@ impl ScratchpadToolHandler {
             .to_string();
         let append = args["append"].as_bool().unwrap_or(false);
 
+        let mut store = self.store.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
         if append {
-            self.store
+            store
                 .entry(key)
                 .and_modify(|v| v.push_str(&content))
                 .or_insert(content);
         } else {
-            self.store.insert(key, content);
+            store.insert(key, content);
         }
         Ok(json!({"status": "ok"}))
     }
@@ -760,7 +769,8 @@ impl ScratchpadToolHandler {
         let key = args["key"]
             .as_str()
             .ok_or_else(|| McpError::InvalidParams("key required".into()))?;
-        match self.store.get(key) {
+        let store = self.store.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        match store.get(key) {
             Some(content) => Ok(json!({"content": content})),
             None => Err(McpError::InvalidParams(format!(
                 "scratchpad key not found: {}",
@@ -1523,6 +1533,38 @@ mod tests {
         let mut handler = make_scratchpad_handler();
         let result = handler.handle_tool_call("tttt_scratchpad_read", &json!({"key": "nope"}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_scratchpad_shared_store_visible_across_handlers() {
+        let shared = Arc::new(Mutex::new(HashMap::new()));
+        let mut writer = ScratchpadToolHandler::new_shared(shared.clone());
+        let mut reader = ScratchpadToolHandler::new_shared(shared.clone());
+
+        writer
+            .handle_tool_call(
+                "tttt_scratchpad_write",
+                &json!({"key": "x", "content": "shared_value"}),
+            )
+            .unwrap();
+
+        let result = reader
+            .handle_tool_call("tttt_scratchpad_read", &json!({"key": "x"}))
+            .unwrap();
+        assert_eq!(result["content"].as_str().unwrap(), "shared_value");
+    }
+
+    #[test]
+    fn test_scratchpad_restore_from_saved_data() {
+        let mut pre_existing = HashMap::new();
+        pre_existing.insert("restored_key".to_string(), "restored_value".to_string());
+        let shared = Arc::new(Mutex::new(pre_existing));
+        let mut handler = ScratchpadToolHandler::new_shared(shared);
+
+        let result = handler
+            .handle_tool_call("tttt_scratchpad_read", &json!({"key": "restored_key"}))
+            .unwrap();
+        assert_eq!(result["content"].as_str().unwrap(), "restored_value");
     }
 
     // --- tttt_pty_wait_for tests ---
