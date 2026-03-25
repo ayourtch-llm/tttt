@@ -1,6 +1,6 @@
-# tttt — Terminal Harness for Autonomous AI Agent Teams
+# tttt — Takes Two To Tango
 
-**tttt** (Terminal Tool for Terminal Teams) is a Rust-based terminal multiplexer purpose-built for AI agent orchestration. It allows a root AI agent (e.g., Claude Opus) to spawn, monitor, and coordinate multiple worker agents (e.g., Claude Sonnet, local models like Qwen) — each running in its own PTY session — while maintaining full control through MCP (Model Context Protocol) tools.
+**tttt** (*Takes Two To Tango*) is a Rust-based terminal multiplexer purpose-built for AI agent orchestration. It allows a root AI agent (e.g., Claude Opus) to spawn, monitor, and coordinate multiple worker agents (e.g., Claude Sonnet, local models like Qwen) — each running in its own PTY session — while maintaining full control through MCP (Model Context Protocol) tools.
 
 Think of it as **tmux designed for AI agents**: session management, screen reading, keystroke injection, pattern-based notifications, live reload, and remote monitoring — all exposed as MCP tools that AI agents can call programmatically.
 
