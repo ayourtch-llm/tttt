@@ -361,13 +361,14 @@ impl App {
     }
 
     /// Set up a one-shot notification watcher that auto-injects "Continue from where
-    /// you left off." when the root session shows the Claude prompt. This allows
-    /// autonomous SIGUSR2 restarts without waiting for human input.
+    /// you left off." when the root session shows Claude Code is fully ready.
+    /// We match "? for shortcuts" which only appears when Claude is loaded and
+    /// waiting for input, avoiding false triggers during startup rendering.
     pub fn setup_auto_continue(&self, root_session_id: &str) {
         let mut notif = self.notifications.lock().unwrap();
         if let Err(e) = notif.add_watcher(
             root_session_id.to_string(),
-            r"❯\s*$",
+            r"\? for shortcuts",
             "Continue from where you left off.\n".to_string(),
             root_session_id.to_string(),
             true, // one-shot
