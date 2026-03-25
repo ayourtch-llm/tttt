@@ -186,6 +186,15 @@ impl App {
 
     /// Restore sessions from a SavedState (after execv reload).
     pub fn restore_sessions(&mut self, state: &SavedState) -> Result<(), Box<dyn std::error::Error>> {
+        self.restore_sessions_filtered(state, |_| true)
+    }
+
+    /// Restore sessions from saved state, with a filter predicate.
+    /// Sessions for which the predicate returns false are skipped.
+    pub fn restore_sessions_filtered<F>(&mut self, state: &SavedState, mut should_restore: F) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: FnMut(&SavedSession) -> bool,
+    {
         use tttt_pty::RestoredPty;
 
         let mut mgr = self.sessions.lock().unwrap();
@@ -194,6 +203,13 @@ impl App {
         for saved in &state.sessions {
             // Only restore running sessions
             if saved.status != SessionStatus::Running {
+                continue;
+            }
+
+            // Check filter predicate
+            if !should_restore(saved) {
+                // Close the inherited FD so it doesn't leak
+                unsafe { libc::close(saved.master_fd); }
                 continue;
             }
 
@@ -339,6 +355,14 @@ impl App {
         let sqlite_logger = SqliteLogger::new(&self.config.db_path)?;
         self.logger.add_sink(Box::new(sqlite_logger));
         Ok(())
+    }
+
+    /// Remove a session ID from the session order list.
+    pub fn remove_from_session_order(&mut self, id: &str) {
+        self.session_order.retain(|s| s != id);
+        if self.active_session.as_deref() == Some(id) {
+            self.active_session = self.session_order.first().cloned();
+        }
     }
 
     pub fn launch_root(&mut self) -> Result<String, Box<dyn std::error::Error>> {

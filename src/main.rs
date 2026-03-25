@@ -196,14 +196,30 @@ fn run_restored(restore_file: &str) {
     };
 
     let config = state.config.clone();
+
+    // Check if root session should be restarted (has --resume, so it can recover)
+    let root_has_resume = config.root_args.iter().any(|a| a == "--resume");
+
     let mut app = app::App::new(config);
 
     if let Err(e) = app.init_loggers() {
         eprintln!("Warning: failed to initialize loggers: {}", e);
     }
 
-    // Restore sessions from inherited FDs
-    if let Err(e) = app.restore_sessions(&state) {
+    // Restore sessions from inherited FDs.
+    // If root has --resume, skip the root session (pty-1) so we can relaunch it fresh
+    // with updated MCP tool definitions.
+    if let Err(e) = app.restore_sessions_filtered(&state, |saved| {
+        if root_has_resume && state.session_order.first().map(|s| s.as_str()) == Some(&saved.id) {
+            // Kill the old root process so it doesn't linger
+            if let Some(pid) = saved.child_pid {
+                unsafe { libc::kill(pid, libc::SIGTERM); }
+            }
+            false // skip restoring this session
+        } else {
+            true // restore normally
+        }
+    }) {
         eprintln!("Warning: failed to restore some sessions: {}", e);
     }
 
@@ -213,6 +229,18 @@ fn run_restored(restore_file: &str) {
     }
     if let Err(e) = app.start_viewer_listener() {
         eprintln!("Warning: failed to start viewer listener: {}", e);
+    }
+
+    // If root was skipped, remove it from session_order and relaunch fresh
+    // (gets new MCP config + tool discovery)
+    if root_has_resume {
+        if let Some(root_id) = state.session_order.first() {
+            app.remove_from_session_order(root_id);
+        }
+        if let Err(e) = app.launch_root() {
+            eprintln!("Failed to relaunch root session: {}", e);
+            std::process::exit(1);
+        }
     }
 
     // Restore cron jobs
