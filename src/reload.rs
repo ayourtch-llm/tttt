@@ -44,6 +44,10 @@ pub struct SavedState {
     /// Terminal dimensions at time of save.
     pub screen_cols: u16,
     pub screen_rows: u16,
+
+    /// If true, the root session should be killed and relaunched (SIGUSR2 reload).
+    #[serde(default)]
+    pub restart_root: bool,
 }
 
 /// Saved state for a single PTY session.
@@ -197,12 +201,14 @@ mod tests {
             config: Config::default(),
             screen_cols: 120,
             screen_rows: 40,
+            restart_root: false,
         };
 
         let json = serde_json::to_string(&state).unwrap();
         let restored: SavedState = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.version, STATE_VERSION);
+        assert!(!restored.restart_root);
         assert_eq!(restored.sessions.len(), 1);
         assert_eq!(restored.sessions[0].id, "pty-1");
         assert_eq!(restored.sessions[0].master_fd, 5);
@@ -231,6 +237,7 @@ mod tests {
             config: Config::default(),
             screen_cols: 80,
             screen_rows: 24,
+            restart_root: false,
         };
 
         let path = state.write_to_file().unwrap();

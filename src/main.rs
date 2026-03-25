@@ -197,8 +197,11 @@ fn run_restored(restore_file: &str) {
 
     let config = state.config.clone();
 
-    // Check if root session should be restarted (has --resume, so it can recover)
-    let root_has_resume = config.root_args.iter().any(|a| a == "--resume");
+    // Check if root session should be restarted:
+    // - Explicitly requested via SIGUSR2 (restart_root flag in saved state)
+    // - Only if root command has --resume so it can recover its conversation
+    let restart_root = state.restart_root
+        && config.root_args.iter().any(|a| a == "--resume");
 
     let mut app = app::App::new(config);
 
@@ -210,7 +213,7 @@ fn run_restored(restore_file: &str) {
     // If root has --resume, skip the root session (pty-1) so we can relaunch it fresh
     // with updated MCP tool definitions.
     if let Err(e) = app.restore_sessions_filtered(&state, |saved| {
-        if root_has_resume && state.session_order.first().map(|s| s.as_str()) == Some(&saved.id) {
+        if restart_root && state.session_order.first().map(|s| s.as_str()) == Some(&saved.id) {
             // Kill the old root process so it doesn't linger
             if let Some(pid) = saved.child_pid {
                 unsafe { libc::kill(pid, libc::SIGTERM); }
@@ -233,7 +236,7 @@ fn run_restored(restore_file: &str) {
 
     // If root was skipped, remove it from session_order and relaunch fresh
     // (gets new MCP config + tool discovery)
-    if root_has_resume {
+    if restart_root {
         if let Some(root_id) = state.session_order.first() {
             app.remove_from_session_order(root_id);
         }

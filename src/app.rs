@@ -140,6 +140,8 @@ pub struct App {
     last_injection_time: Option<Instant>,
     /// Set to true when a live reload has been requested (prefix+R or SIGUSR1).
     pub reload_requested: bool,
+    /// Set to true when a full reload (with root restart) has been requested (SIGUSR2).
+    pub restart_root_requested: bool,
     /// When the server started (for uptime display).
     server_start_time: Instant,
 }
@@ -174,6 +176,7 @@ impl App {
             last_injection_time: None,
             last_pty_data_time: None,
             reload_requested: false,
+            restart_root_requested: false,
             server_start_time: Instant::now(),
             config,
         }
@@ -491,6 +494,7 @@ impl App {
             config: self.config.clone(),
             screen_cols: self.screen_cols,
             screen_rows: self.screen_rows,
+            restart_root: self.restart_root_requested,
         })
     }
 
@@ -528,6 +532,8 @@ impl App {
         let _ = signal_hook::flag::register(libc::SIGWINCH, Arc::clone(&winch));
         let sigusr1 = Arc::new(AtomicBool::new(false));
         let _ = signal_hook::flag::register(libc::SIGUSR1, Arc::clone(&sigusr1));
+        let sigusr2 = Arc::new(AtomicBool::new(false));
+        let _ = signal_hook::flag::register(libc::SIGUSR2, Arc::clone(&sigusr2));
 
         let stdout_fd = std::io::stdout().as_raw_fd();
         let stdin_fd = std::io::stdin().as_raw_fd();
@@ -569,6 +575,13 @@ impl App {
             if sigusr1.load(Ordering::Relaxed) {
                 sigusr1.store(false, Ordering::Relaxed);
                 self.reload_requested = true;
+                break;
+            }
+
+            if sigusr2.load(Ordering::Relaxed) {
+                sigusr2.store(false, Ordering::Relaxed);
+                self.reload_requested = true;
+                self.restart_root_requested = true;
                 break;
             }
 
