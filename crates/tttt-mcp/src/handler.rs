@@ -175,6 +175,41 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         }
     }
 
+    fn handle_pty_wait_for_idle(&self, args: &Value) -> Result<Value> {
+        let session_id = args["session_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
+        let idle_threshold = args["idle_seconds"].as_f64().unwrap_or(10.0);
+        let timeout_secs = args["timeout"].as_f64().unwrap_or(300.0);
+
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs_f64(timeout_secs);
+
+        loop {
+            let (current_idle, last_line) = {
+                let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+                let session = mgr.get_mut(session_id)?;
+                session.pump()?;
+                (session.idle_seconds(), session.last_non_empty_line())
+            };
+            if current_idle >= idle_threshold {
+                return Ok(json!({
+                    "status": "idle",
+                    "idle_seconds": current_idle,
+                    "last_output_line": last_line,
+                }));
+            }
+            if Instant::now() >= deadline {
+                return Ok(json!({
+                    "status": "timeout",
+                    "idle_seconds": current_idle,
+                    "last_output_line": last_line,
+                }));
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
     fn handle_pty_set_scrollback(&self, args: &Value) -> Result<Value> {
         let session_id = args["session_id"]
             .as_str()
@@ -319,6 +354,7 @@ impl ToolHandler for PtyToolHandler<tttt_pty::RealPty> {
             "tttt_pty_get_scrollback" => self.handle_pty_get_scrollback(args),
             "tttt_pty_set_scrollback" => self.handle_pty_set_scrollback(args),
             "tttt_pty_wait_for" => self.handle_pty_wait_for(args),
+            "tttt_pty_wait_for_idle" => self.handle_pty_wait_for_idle(args),
             "tttt_pty_start_capture" => self.handle_pty_start_capture(args),
             "tttt_pty_stop_capture" => self.handle_pty_stop_capture(args),
             "tttt_get_status" => self.handle_get_status(),
@@ -387,6 +423,7 @@ impl ToolHandler for PtyToolHandler<tttt_pty::AnyPty> {
             "tttt_pty_get_scrollback" => self.handle_pty_get_scrollback(args),
             "tttt_pty_set_scrollback" => self.handle_pty_set_scrollback(args),
             "tttt_pty_wait_for" => self.handle_pty_wait_for(args),
+            "tttt_pty_wait_for_idle" => self.handle_pty_wait_for_idle(args),
             "tttt_pty_start_capture" => self.handle_pty_start_capture(args),
             "tttt_pty_stop_capture" => self.handle_pty_stop_capture(args),
             "tttt_get_status" => self.handle_get_status(),
@@ -412,6 +449,7 @@ impl ToolHandler for PtyToolHandler<MockPty> {
             "tttt_pty_get_scrollback" => self.handle_pty_get_scrollback(args),
             "tttt_pty_set_scrollback" => self.handle_pty_set_scrollback(args),
             "tttt_pty_wait_for" => self.handle_pty_wait_for(args),
+            "tttt_pty_wait_for_idle" => self.handle_pty_wait_for_idle(args),
             "tttt_pty_start_capture" => self.handle_pty_start_capture(args),
             "tttt_pty_stop_capture" => self.handle_pty_stop_capture(args),
             "tttt_get_status" => self.handle_get_status(),
@@ -1129,7 +1167,7 @@ mod tests {
         let handler = make_handler();
         composite.add_handler(Box::new(handler));
         let defs = composite.tool_definitions();
-        assert_eq!(defs.len(), 13);
+        assert_eq!(defs.len(), 14);
     }
 
     #[test]
@@ -1312,9 +1350,9 @@ mod tests {
         composite.add_handler(Box::new(make_handler()));
         composite.add_handler(Box::new(make_scheduler_handler()));
 
-        // Should have 13 PTY + 4 scheduler = 17 tool definitions
+        // Should have 14 PTY + 4 scheduler = 18 tool definitions
         let defs = composite.tool_definitions();
-        assert_eq!(defs.len(), 17);
+        assert_eq!(defs.len(), 18);
 
         // PTY tool should work
         let result = composite.handle_tool_call("tttt_pty_list", &json!({}));
@@ -1721,6 +1759,72 @@ mod tests {
         assert!(required.contains(&Value::from("pattern")));
         // timeout_ms should NOT be required (it's optional)
         assert!(!required.contains(&Value::from("timeout_ms")));
+    }
+
+    // --- tttt_pty_wait_for_idle tests ---
+
+    #[test]
+    fn test_pty_wait_for_idle_missing_session_id() {
+        let mut handler = make_handler();
+        let result = handler.handle_tool_call("tttt_pty_wait_for_idle", &json!({}));
+        assert!(result.is_err(), "should error when session_id is missing");
+    }
+
+    #[test]
+    fn test_pty_wait_for_idle_missing_session() {
+        let mut handler = make_handler();
+        let result = handler.handle_tool_call(
+            "tttt_pty_wait_for_idle",
+            &json!({"session_id": "nonexistent", "idle_seconds": 5.0, "timeout": 0.5}),
+        );
+        assert!(result.is_err(), "should error on missing session");
+    }
+
+    #[test]
+    fn test_pty_wait_for_idle_detects_idle_immediately() {
+        // idle_seconds threshold of 0.0 is satisfied by any positive idle time
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
+        let result = handler
+            .handle_tool_call(
+                "tttt_pty_wait_for_idle",
+                &json!({"session_id": id, "idle_seconds": 0.0, "timeout": 30.0}),
+            )
+            .unwrap();
+        assert_eq!(result["status"].as_str().unwrap(), "idle");
+        assert!(result["idle_seconds"].as_f64().unwrap() >= 0.0);
+        assert!(result["last_output_line"].is_string());
+    }
+
+    #[test]
+    fn test_pty_wait_for_idle_timeout() {
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
+        let result = handler
+            .handle_tool_call(
+                "tttt_pty_wait_for_idle",
+                &json!({"session_id": id, "idle_seconds": 99999.0, "timeout": 0.5}),
+            )
+            .unwrap();
+        assert_eq!(result["status"].as_str().unwrap(), "timeout");
+        assert!(result["idle_seconds"].as_f64().unwrap() < 99999.0);
+        assert!(result["last_output_line"].is_string());
+    }
+
+    #[test]
+    fn test_pty_wait_for_idle_default_params() {
+        // Verify optional params have defaults by checking the tool definition
+        let defs = crate::tools::pty_tool_definitions();
+        let tool = defs
+            .iter()
+            .find(|t| t["name"] == "tttt_pty_wait_for_idle")
+            .expect("tttt_pty_wait_for_idle should be in pty_tool_definitions");
+        let required = tool["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.contains(&Value::from("session_id")));
+        assert!(!required.contains(&Value::from("idle_seconds")));
+        assert!(!required.contains(&Value::from("timeout")));
     }
 
     #[test]

@@ -130,6 +130,19 @@ pub fn pty_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "tttt_pty_wait_for_idle",
+            "description": "Block until a session has produced no output for idle_seconds, or timeout expires. Returns status 'idle' or 'timeout'.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Target session ID" },
+                    "idle_seconds": { "type": "number", "description": "Seconds of silence to consider idle (default: 10)" },
+                    "timeout": { "type": "number", "description": "Max seconds to wait before returning timeout (default: 300)" }
+                },
+                "required": ["session_id"]
+            }
+        }),
+        json!({
             "name": "tttt_pty_start_capture",
             "description": "Begin capturing raw PTY output (including ANSI sequences) to a temp file. Only one capture per session at a time.",
             "inputSchema": {
@@ -338,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_pty_tool_count() {
-        assert_eq!(pty_tool_definitions().len(), 13);
+        assert_eq!(pty_tool_definitions().len(), 14);
     }
 
     #[test]
