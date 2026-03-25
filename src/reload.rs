@@ -38,6 +38,10 @@ pub struct SavedState {
     /// Scratchpad key-value store.
     pub scratchpad: HashMap<String, String>,
 
+    /// Sidebar messages (REMINDERS section).
+    #[serde(default)]
+    pub sidebar_messages: Vec<String>,
+
     /// App configuration.
     pub config: Config,
 
@@ -198,6 +202,7 @@ mod tests {
                 m.insert("key1".to_string(), "value1".to_string());
                 m
             },
+            sidebar_messages: vec!["hello".to_string(), "world".to_string()],
             config: Config::default(),
             screen_cols: 120,
             screen_rows: 40,
@@ -221,6 +226,7 @@ mod tests {
         assert_eq!(restored.cron_jobs.len(), 1);
         assert_eq!(restored.watchers.len(), 1);
         assert_eq!(restored.scratchpad.get("key1").unwrap(), "value1");
+        assert_eq!(restored.sidebar_messages, vec!["hello", "world"]);
     }
 
     #[test]
@@ -234,6 +240,7 @@ mod tests {
             cron_jobs: vec![],
             watchers: vec![],
             scratchpad: HashMap::new(),
+            sidebar_messages: vec![],
             config: Config::default(),
             screen_cols: 80,
             screen_rows: 24,

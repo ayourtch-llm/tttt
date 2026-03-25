@@ -176,6 +176,14 @@ pub fn sidebar_tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "name": "tttt_sidebar_list",
+            "description": "Return the current sidebar messages as a JSON array.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
     ]
 }
 
@@ -335,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_sidebar_tool_count() {
-        assert_eq!(sidebar_tool_definitions().len(), 1);
+        assert_eq!(sidebar_tool_definitions().len(), 2);
     }
 
     #[test]

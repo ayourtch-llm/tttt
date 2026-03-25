@@ -271,6 +271,9 @@ fn run_restored(restore_file: &str) {
     // Restore scratchpad
     app.restore_scratchpad(&state.scratchpad);
 
+    // Restore sidebar messages
+    app.restore_sidebar_messages(&state.sidebar_messages);
+
     if let Err(e) = app.run() {
         eprintln!("\nError: {}", e);
         std::process::exit(1);

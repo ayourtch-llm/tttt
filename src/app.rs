@@ -310,6 +310,12 @@ impl App {
         store.extend(data.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
 
+    /// Restore sidebar messages from saved state.
+    pub fn restore_sidebar_messages(&self, messages: &[String]) {
+        let mut msgs = self.sidebar_messages.lock().unwrap();
+        msgs.extend_from_slice(messages);
+    }
+
     /// Start listening for viewer connections on a Unix socket.
     /// Start the MCP proxy socket listener.
     /// Returns the socket path that `tttt mcp-server --connect` should use.
@@ -523,6 +529,7 @@ impl App {
             cron_jobs,
             watchers,
             scratchpad: self.scratchpad.lock().unwrap().clone(),
+            sidebar_messages: self.sidebar_messages.lock().unwrap().clone(),
             config: self.config.clone(),
             screen_cols: self.screen_cols,
             screen_rows: self.screen_rows,

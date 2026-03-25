@@ -735,6 +735,11 @@ impl SidebarMessageToolHandler {
         Self { messages }
     }
 
+    fn handle_sidebar_list(&self) -> Result<Value> {
+        let msgs = self.messages.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        Ok(json!({"messages": *msgs}))
+    }
+
     fn handle_sidebar_message(&self, args: &Value) -> Result<Value> {
         let clear = args["clear"].as_bool().unwrap_or(false);
         let mut msgs = self.messages.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
@@ -758,6 +763,7 @@ impl ToolHandler for SidebarMessageToolHandler {
     fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
         match name {
             "tttt_sidebar_message" => self.handle_sidebar_message(args),
+            "tttt_sidebar_list" => self.handle_sidebar_list(),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
     }
@@ -1792,8 +1798,34 @@ mod tests {
     fn test_sidebar_tool_definitions() {
         let handler = make_sidebar_handler();
         let defs = handler.tool_definitions();
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0]["name"], "tttt_sidebar_message");
+        assert_eq!(defs.len(), 2);
+        assert!(defs.iter().any(|d| d["name"] == "tttt_sidebar_message"));
+        assert!(defs.iter().any(|d| d["name"] == "tttt_sidebar_list"));
+    }
+
+    #[test]
+    fn test_sidebar_list_empty() {
+        let mut handler = make_sidebar_handler();
+        let result = handler.handle_tool_call("tttt_sidebar_list", &json!({})).unwrap();
+        assert_eq!(result["messages"], json!([]));
+    }
+
+    #[test]
+    fn test_sidebar_list_returns_messages() {
+        let mut handler = make_sidebar_handler();
+        handler.handle_tool_call("tttt_sidebar_message", &json!({"message": "alpha"})).unwrap();
+        handler.handle_tool_call("tttt_sidebar_message", &json!({"message": "beta"})).unwrap();
+        let result = handler.handle_tool_call("tttt_sidebar_list", &json!({})).unwrap();
+        assert_eq!(result["messages"], json!(["alpha", "beta"]));
+    }
+
+    #[test]
+    fn test_sidebar_list_after_clear() {
+        let mut handler = make_sidebar_handler();
+        handler.handle_tool_call("tttt_sidebar_message", &json!({"message": "hello"})).unwrap();
+        handler.handle_tool_call("tttt_sidebar_message", &json!({"clear": true})).unwrap();
+        let result = handler.handle_tool_call("tttt_sidebar_list", &json!({})).unwrap();
+        assert_eq!(result["messages"], json!([]));
     }
 
 }
