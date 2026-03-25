@@ -140,6 +140,8 @@ pub struct App {
     last_injection_time: Option<Instant>,
     /// Set to true when a live reload has been requested (prefix+R or SIGUSR1).
     pub reload_requested: bool,
+    /// When the server started (for uptime display).
+    server_start_time: Instant,
 }
 
 impl App {
@@ -172,6 +174,7 @@ impl App {
             last_injection_time: None,
             last_pty_data_time: None,
             reload_requested: false,
+            server_start_time: Instant::now(),
             config,
         }
     }
@@ -865,11 +868,12 @@ impl App {
         let sessions = mgr.list();
         drop(mgr);
         let reminders: Vec<String> = Vec::new();
-        let build_info = concat!("built ", env!("BUILD_TIMESTAMP"));
+        let uptime_secs = self.server_start_time.elapsed().as_secs();
+        let uptime = format!("Uptime: {}s", uptime_secs);
         let lines = self.sidebar.render_with_build_info(
             &sessions, self.active_session.as_deref(),
             self.screen_cols, self.screen_rows, &reminders,
-            Some(build_info),
+            Some(&uptime),
         );
         for line in &lines {
             write_all(stdout_fd, line.content.as_bytes())?;

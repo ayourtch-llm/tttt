@@ -46,15 +46,16 @@ impl SidebarRenderer {
         let sidebar_col = screen_cols.saturating_sub(self.width) + 1;
         let usable_width = (self.width as usize).saturating_sub(3); // "| " prefix + padding
 
-        // Header
-        lines.push(self.make_line(1, sidebar_col, &self.pad("TERMINALS", usable_width), false));
-
-        // Build info or separator on row 2
-        let row2_content = if let Some(info) = build_info {
-            truncate(info, usable_width)
+        // Header with uptime info
+        let header_text = if let Some(info) = build_info {
+            format!("TERMINALS ({}).", info)
         } else {
-            "-".repeat(usable_width)
+            "TERMINALS.".to_string()
         };
+        lines.push(self.make_line(1, sidebar_col, &self.pad(&header_text, usable_width), false));
+
+        // Separator line
+        let row2_content = "=====".to_string();
         lines.push(self.make_line(2, sidebar_col, &self.pad(&row2_content, usable_width), false));
 
         // Session list
