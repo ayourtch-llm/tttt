@@ -104,6 +104,12 @@ impl ViewerClient {
         self.connected = false;
     }
 
+    /// Send window size update to the client.
+    pub fn send_window_size(&mut self, cols: u16, rows: u16) -> bool {
+        let msg = ServerMsg::WindowSize { cols, rows };
+        self.send_msg(&msg)
+    }
+
     /// Get the raw fd for poll().
     pub fn raw_fd(&self) -> i32 {
         use std::os::fd::AsRawFd;

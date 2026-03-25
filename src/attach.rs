@@ -594,7 +594,10 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     if !screen_data.is_empty() {
                         // Apply to virtual screen (fresh parser for clean state)
                         // Use current terminal dimensions, not initial ones
-                        virtual_screen = vt100::Parser::new(cur_rows, cur_cols, 0);
+                        let (vrows, vcols) = virtual_screen.screen().size();
+                        let virt_cols = cur_cols.min(vcols);
+                        let virt_rows = cur_rows.min(vrows);
+                        virtual_screen = vt100::Parser::new(virt_rows, virt_cols, 0);
                         virtual_screen.process(&screen_data);
                         virtual_dirty = true;
                     }
@@ -602,6 +605,14 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 ServerMsg::SessionList { .. } => {
                     tracing::trace!("[CLIENT] SessionList received");
+                }
+                ServerMsg::WindowSize { cols, rows } => {
+                    tracing::trace!("[CLIENT] WindowSize: cols={}, rows={}", cols, rows);
+                    // Resize virtual screen to match the server's PTY dimensions
+                    virtual_screen = vt100::Parser::new(rows, cols, 0);
+                    renderer = PaneRenderer::new(cols, rows, 1, 1);
+                    renderer.invalidate();
+                    virtual_dirty = true;
                 }
                 ServerMsg::Goodbye => return Ok(()),
             }

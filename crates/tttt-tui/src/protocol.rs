@@ -26,6 +26,14 @@ pub enum ServerMsg {
 
     /// Server is shutting down.
     Goodbye,
+
+    /// Virtual window size update (PTY dimensions).
+    WindowSize {
+        /// PTY columns.
+        cols: u16,
+        /// PTY rows.
+        rows: u16,
+    },
 }
 
 /// Compact session info sent to viewers.
@@ -192,6 +200,20 @@ mod tests {
             ClientMsg::Resize { cols, rows } => {
                 assert_eq!(cols, 120);
                 assert_eq!(rows, 40);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_window_size_roundtrip() {
+        let msg = ServerMsg::WindowSize { cols: 80, rows: 24 };
+        let encoded = encode_message(&msg);
+        let (decoded, _): (ServerMsg, usize) = decode_message(&encoded).unwrap();
+        match decoded {
+            ServerMsg::WindowSize { cols, rows } => {
+                assert_eq!(cols, 80);
+                assert_eq!(rows, 24);
             }
             _ => panic!("wrong variant"),
         }

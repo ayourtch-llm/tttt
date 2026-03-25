@@ -912,9 +912,13 @@ impl App {
     /// Clears the main terminal and forces a full redraw to remove stale content.
     fn resize_pty_to_min_and_redraw(&mut self, stdout_fd: i32) {
         let sidebar = self.config.sidebar_width;
-        // Start with main terminal size
-        let mut min_cols = self.screen_cols.saturating_sub(sidebar);
-        let mut min_rows = self.screen_rows.saturating_sub(1);
+        // The PTY can never be larger than the main terminal's usable area
+        let max_pty_cols = self.screen_cols.saturating_sub(sidebar);
+        let max_pty_rows = self.screen_rows.saturating_sub(1);
+        
+        // Start with main terminal size as the baseline
+        let mut min_cols = max_pty_cols;
+        let mut min_rows = max_pty_rows;
 
         // Find minimum across all connected viewers.
         // Attach clients don't have a sidebar, so use their cols directly
@@ -928,6 +932,11 @@ impl App {
             min_cols = min_cols.min(c);
             min_rows = min_rows.min(r);
         }
+
+        // Clamp to maximum PTY size (main terminal's usable area)
+        // This ensures the PTY never grows larger than what the main window can display
+        min_cols = min_cols.min(max_pty_cols);
+        min_rows = min_rows.min(max_pty_rows);
 
         // Check if dimensions actually changed
         let (old_cols, old_rows) = self.pane_renderer.dimensions();
@@ -986,9 +995,12 @@ impl App {
         }
 
         // Always resize and invalidate viewer renderers so they get a fresh update
+        // Also notify clients of the new virtual window size
         for client in &mut self.viewer_clients {
             client.renderer.resize(min_cols, min_rows);
             client.invalidate();
+            // Send window size update to client
+            client.send_window_size(min_cols, min_rows);
         }
     }
 
