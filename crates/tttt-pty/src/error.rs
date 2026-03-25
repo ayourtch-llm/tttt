@@ -22,6 +22,12 @@ pub enum PtyError {
 
     #[error("resize error: {0}")]
     Resize(String),
+
+    #[error("capture already active")]
+    CaptureAlreadyActive,
+
+    #[error("no capture active")]
+    NoCaptureActive,
 }
 
 pub type Result<T> = std::result::Result<T, PtyError>;

@@ -3,7 +3,8 @@ use crate::error::{PtyError, Result};
 use crate::keys::process_special_keys;
 use crate::screen::ScreenBuffer;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use std::io::Write;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Unique identifier for a terminal session.
 pub type SessionId = String;
@@ -41,6 +42,9 @@ pub struct PtySession<B: PtyBackend> {
     status: SessionStatus,
     command: String,
     created_at: Instant,
+    capture_file: Option<std::fs::File>,
+    capture_path: Option<String>,
+    capture_bytes: u64,
 }
 
 impl<B: PtyBackend> PtySession<B> {
@@ -54,6 +58,9 @@ impl<B: PtyBackend> PtySession<B> {
             status: SessionStatus::Running,
             command,
             created_at: Instant::now(),
+            capture_file: None,
+            capture_path: None,
+            capture_bytes: 0,
         }
     }
 
@@ -79,9 +86,45 @@ impl<B: PtyBackend> PtySession<B> {
         let n = self.backend.read(&mut buf)?;
         if n > 0 {
             self.screen.process(&buf[..n]);
+            if let Some(ref mut file) = self.capture_file {
+                file.write_all(&buf[..n])?;
+                self.capture_bytes += n as u64;
+            }
         }
         self.update_status()?;
         Ok((n, buf[..n].to_vec()))
+    }
+
+    /// Begin capturing raw PTY output to a temp file.
+    /// Returns (capture_id, file_path). Only one capture per session is allowed at a time.
+    pub fn start_capture(&mut self) -> Result<(String, String)> {
+        if self.capture_file.is_some() {
+            return Err(PtyError::CaptureAlreadyActive);
+        }
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let capture_id = format!("{}-{}", self.id, ts);
+        let file_path = format!("/tmp/tttt-capture-{}.raw", capture_id);
+        let file = std::fs::File::create(&file_path)?;
+        self.capture_file = Some(file);
+        self.capture_path = Some(file_path.clone());
+        self.capture_bytes = 0;
+        Ok((capture_id, file_path))
+    }
+
+    /// Stop capturing raw PTY output.
+    /// Returns (file_path, bytes_written).
+    pub fn stop_capture(&mut self) -> Result<(String, u64)> {
+        if self.capture_file.is_none() {
+            return Err(PtyError::NoCaptureActive);
+        }
+        let file_path = self.capture_path.take().unwrap_or_default();
+        let bytes = self.capture_bytes;
+        self.capture_file = None;
+        self.capture_bytes = 0;
+        Ok((file_path, bytes))
     }
 
     /// Send keys to the PTY, processing special key sequences.
@@ -167,6 +210,11 @@ impl<B: PtyBackend> PtySession<B> {
     /// Access the PTY backend (for getting raw fd, etc.).
     pub fn backend(&self) -> &B {
         &self.backend
+    }
+
+    /// Access the PTY backend mutably (for testing and live-reload state injection).
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
     }
 
     /// Get scrollback buffer contents (text that scrolled off the visible screen).
@@ -395,6 +443,77 @@ mod tests {
         let screen = session.get_screen();
         assert!(screen.contains("BOLD"));
         assert!(screen.contains("normal"));
+    }
+
+    #[test]
+    fn test_start_capture_returns_capture_id_and_path() {
+        let mut session = make_session();
+        let (capture_id, file_path) = session.start_capture().unwrap();
+        assert!(!capture_id.is_empty());
+        assert!(file_path.starts_with("/tmp/tttt-capture-"));
+        assert!(file_path.ends_with(".raw"));
+        // cleanup
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_start_capture_twice_returns_error() {
+        let mut session = make_session();
+        let (_, file_path) = session.start_capture().unwrap();
+        let result = session.start_capture();
+        assert!(matches!(result, Err(PtyError::CaptureAlreadyActive)));
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_stop_capture_without_start_returns_error() {
+        let mut session = make_session();
+        let result = session.stop_capture();
+        assert!(matches!(result, Err(PtyError::NoCaptureActive)));
+    }
+
+    #[test]
+    fn test_capture_writes_pty_output() {
+        let mut mock = MockPty::new(80, 24);
+        mock.queue_output(b"captured data");
+        let mut session = PtySession::new("cap1".to_string(), mock, "bash".to_string(), 80, 24);
+        let (_, file_path) = session.start_capture().unwrap();
+        session.pump().unwrap();
+        let (returned_path, bytes) = session.stop_capture().unwrap();
+        assert_eq!(returned_path, file_path);
+        assert_eq!(bytes, 13);
+        let contents = std::fs::read(&file_path).unwrap();
+        assert_eq!(contents, b"captured data");
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_capture_stops_writing_after_stop() {
+        // Pump while capturing, stop, then pump again — only first bytes in file.
+        let mut mock = MockPty::new(80, 24);
+        mock.queue_output(b"before");
+        let mut session = PtySession::new("cap2".to_string(), mock, "bash".to_string(), 80, 24);
+        let (_, file_path) = session.start_capture().unwrap();
+        // Pump once — captures "before"
+        session.pump().unwrap();
+        let (_, bytes) = session.stop_capture().unwrap();
+        assert_eq!(bytes, 6);
+        // Queue more output and pump after stop — should NOT be written to file
+        session.backend_mut().queue_output(b"after");
+        session.pump().unwrap();
+        let contents = std::fs::read(&file_path).unwrap();
+        assert_eq!(contents, b"before");
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_capture_empty_session_zero_bytes() {
+        let mut session = make_session();
+        let (_, file_path) = session.start_capture().unwrap();
+        session.pump().unwrap();
+        let (_, bytes) = session.stop_capture().unwrap();
+        assert_eq!(bytes, 0);
+        let _ = std::fs::remove_file(&file_path);
     }
 
     #[test]

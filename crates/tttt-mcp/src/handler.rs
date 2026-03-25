@@ -187,6 +187,26 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         session.set_scrollback(lines);
         Ok(json!({"status": "ok"}))
     }
+
+    fn handle_pty_start_capture(&self, args: &Value) -> Result<Value> {
+        let session_id = args["session_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
+        let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let session = mgr.get_mut(session_id)?;
+        let (capture_id, file_path) = session.start_capture()?;
+        Ok(json!({"capture_id": capture_id, "file_path": file_path}))
+    }
+
+    fn handle_pty_stop_capture(&self, args: &Value) -> Result<Value> {
+        let session_id = args["session_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
+        let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let session = mgr.get_mut(session_id)?;
+        let (file_path, bytes_written) = session.stop_capture()?;
+        Ok(json!({"file_path": file_path, "bytes_written": bytes_written}))
+    }
 }
 
 impl PtyToolHandler<MockPty> {
@@ -269,6 +289,8 @@ impl ToolHandler for PtyToolHandler<tttt_pty::RealPty> {
             "tttt_pty_get_scrollback" => self.handle_pty_get_scrollback(args),
             "tttt_pty_set_scrollback" => self.handle_pty_set_scrollback(args),
             "tttt_pty_wait_for" => self.handle_pty_wait_for(args),
+            "tttt_pty_start_capture" => self.handle_pty_start_capture(args),
+            "tttt_pty_stop_capture" => self.handle_pty_stop_capture(args),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
     }
@@ -334,6 +356,8 @@ impl ToolHandler for PtyToolHandler<tttt_pty::AnyPty> {
             "tttt_pty_get_scrollback" => self.handle_pty_get_scrollback(args),
             "tttt_pty_set_scrollback" => self.handle_pty_set_scrollback(args),
             "tttt_pty_wait_for" => self.handle_pty_wait_for(args),
+            "tttt_pty_start_capture" => self.handle_pty_start_capture(args),
+            "tttt_pty_stop_capture" => self.handle_pty_stop_capture(args),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
     }
@@ -356,6 +380,8 @@ impl ToolHandler for PtyToolHandler<MockPty> {
             "tttt_pty_get_scrollback" => self.handle_pty_get_scrollback(args),
             "tttt_pty_set_scrollback" => self.handle_pty_set_scrollback(args),
             "tttt_pty_wait_for" => self.handle_pty_wait_for(args),
+            "tttt_pty_start_capture" => self.handle_pty_start_capture(args),
+            "tttt_pty_stop_capture" => self.handle_pty_stop_capture(args),
             _ => Err(McpError::ToolNotFound(name.to_string())),
         }
     }
@@ -883,12 +909,82 @@ mod tests {
     }
 
     #[test]
+    fn test_pty_start_capture_returns_capture_id_and_file_path() {
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
+        let result = handler
+            .handle_tool_call("tttt_pty_start_capture", &json!({"session_id": id}))
+            .unwrap();
+        assert!(result["capture_id"].is_string());
+        let file_path = result["file_path"].as_str().unwrap();
+        assert!(file_path.starts_with("/tmp/tttt-capture-"));
+        assert!(file_path.ends_with(".raw"));
+        // cleanup
+        let _ = std::fs::remove_file(file_path);
+    }
+
+    #[test]
+    fn test_pty_stop_capture_returns_file_path_and_bytes() {
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
+        let start_result = handler
+            .handle_tool_call("tttt_pty_start_capture", &json!({"session_id": id}))
+            .unwrap();
+        let file_path = start_result["file_path"].as_str().unwrap().to_string();
+        let stop_result = handler
+            .handle_tool_call("tttt_pty_stop_capture", &json!({"session_id": id}))
+            .unwrap();
+        assert_eq!(stop_result["file_path"].as_str().unwrap(), file_path);
+        assert!(stop_result["bytes_written"].is_number());
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_pty_start_capture_twice_returns_error() {
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
+        let result1 = handler
+            .handle_tool_call("tttt_pty_start_capture", &json!({"session_id": id}))
+            .unwrap();
+        let file_path = result1["file_path"].as_str().unwrap().to_string();
+        let result2 = handler.handle_tool_call("tttt_pty_start_capture", &json!({"session_id": id}));
+        assert!(result2.is_err());
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_pty_stop_capture_without_start_returns_error() {
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
+        let result = handler.handle_tool_call("tttt_pty_stop_capture", &json!({"session_id": id}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pty_start_capture_missing_session_id() {
+        let mut handler = make_handler();
+        let result = handler.handle_tool_call("tttt_pty_start_capture", &json!({}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pty_stop_capture_missing_session_id() {
+        let mut handler = make_handler();
+        let result = handler.handle_tool_call("tttt_pty_stop_capture", &json!({}));
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_composite_merges_definitions() {
         let mut composite = CompositeToolHandler::new();
         let handler = make_handler();
         composite.add_handler(Box::new(handler));
         let defs = composite.tool_definitions();
-        assert_eq!(defs.len(), 10);
+        assert_eq!(defs.len(), 12);
     }
 
     #[test]

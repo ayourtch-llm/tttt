@@ -129,6 +129,28 @@ pub fn pty_tool_definitions() -> Vec<Value> {
                 "required": ["session_id", "pattern"]
             }
         }),
+        json!({
+            "name": "tttt_pty_start_capture",
+            "description": "Begin capturing raw PTY output (including ANSI sequences) to a temp file. Only one capture per session at a time.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Target session ID" }
+                },
+                "required": ["session_id"]
+            }
+        }),
+        json!({
+            "name": "tttt_pty_stop_capture",
+            "description": "Stop capturing raw PTY output. Returns the file path and number of bytes written.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Target session ID" }
+                },
+                "required": ["session_id"]
+            }
+        }),
     ]
 }
 
@@ -283,7 +305,7 @@ mod tests {
 
     #[test]
     fn test_pty_tool_count() {
-        assert_eq!(pty_tool_definitions().len(), 10);
+        assert_eq!(pty_tool_definitions().len(), 12);
     }
 
     #[test]
