@@ -131,13 +131,14 @@ pub fn pty_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "tttt_pty_wait_for_idle",
-            "description": "Block until a session has produced no output for idle_seconds, or timeout expires. Returns status 'idle' or 'timeout'.",
+            "description": "Block until a session has produced no output for idle_seconds, or timeout expires. Returns status 'idle' or 'timeout'. If ignore_pattern is provided, idle is detected by screen content hash (excluding text matching the pattern) rather than raw output silence — useful when timestamps or other noise keep updating.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string", "description": "Target session ID" },
                     "idle_seconds": { "type": "number", "description": "Seconds of silence to consider idle (default: 10)" },
-                    "timeout": { "type": "number", "description": "Max seconds to wait before returning timeout (default: 300)" }
+                    "timeout": { "type": "number", "description": "Max seconds to wait before returning timeout (default: 300)" },
+                    "ignore_pattern": { "type": "string", "description": "Optional regex: text matching this pattern is stripped before idle detection (e.g. '\\\\d{2}:\\\\d{2}:\\\\d{2}' to ignore HH:MM:SS timestamps)" }
                 },
                 "required": ["session_id"]
             }

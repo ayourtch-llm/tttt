@@ -1,6 +1,8 @@
 use crate::error::{McpError, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tttt_pty::{MockPty, PtyBackend, PtySession, SessionManager, SessionStatus};
@@ -254,31 +256,80 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         let idle_threshold = args["idle_seconds"].as_f64().unwrap_or(10.0);
         let timeout_secs = args["timeout"].as_f64().unwrap_or(300.0);
 
+        let ignore_re = if let Some(pat) = args["ignore_pattern"].as_str() {
+            Some(regex::Regex::new(pat).map_err(|e| {
+                McpError::InvalidParams(format!("invalid ignore_pattern: {}", e))
+            })?)
+        } else {
+            None
+        };
+
         let start = Instant::now();
         let deadline = start + Duration::from_secs_f64(timeout_secs);
 
-        loop {
-            let (current_idle, last_line) = {
-                let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
-                let session = mgr.get_mut(session_id)?;
-                session.pump()?;
-                (session.idle_seconds(), session.last_non_empty_line())
-            };
-            if current_idle >= idle_threshold {
-                return Ok(json!({
-                    "status": "idle",
-                    "idle_seconds": current_idle,
-                    "last_output_line": last_line,
-                }));
+        if let Some(re) = ignore_re {
+            // Hash-based idle detection: strip ignore_pattern matches before hashing.
+            let mut last_hash: Option<u64> = None;
+            let mut hash_stable_since = Instant::now();
+
+            loop {
+                let (screen, last_line) = {
+                    let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+                    let session = mgr.get_mut(session_id)?;
+                    session.pump()?;
+                    (session.get_screen(), session.last_non_empty_line())
+                };
+                let filtered = re.replace_all(&screen, "");
+                let mut hasher = DefaultHasher::new();
+                filtered.hash(&mut hasher);
+                let hash = hasher.finish();
+
+                if Some(hash) != last_hash {
+                    last_hash = Some(hash);
+                    hash_stable_since = Instant::now();
+                }
+
+                let stable_secs = hash_stable_since.elapsed().as_secs_f64();
+                if stable_secs >= idle_threshold {
+                    return Ok(json!({
+                        "status": "idle",
+                        "idle_seconds": stable_secs,
+                        "last_output_line": last_line,
+                    }));
+                }
+                if Instant::now() >= deadline {
+                    return Ok(json!({
+                        "status": "timeout",
+                        "idle_seconds": stable_secs,
+                        "last_output_line": last_line,
+                    }));
+                }
+                std::thread::sleep(Duration::from_secs(1));
             }
-            if Instant::now() >= deadline {
-                return Ok(json!({
-                    "status": "timeout",
-                    "idle_seconds": current_idle,
-                    "last_output_line": last_line,
-                }));
+        } else {
+            loop {
+                let (current_idle, last_line) = {
+                    let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+                    let session = mgr.get_mut(session_id)?;
+                    session.pump()?;
+                    (session.idle_seconds(), session.last_non_empty_line())
+                };
+                if current_idle >= idle_threshold {
+                    return Ok(json!({
+                        "status": "idle",
+                        "idle_seconds": current_idle,
+                        "last_output_line": last_line,
+                    }));
+                }
+                if Instant::now() >= deadline {
+                    return Ok(json!({
+                        "status": "timeout",
+                        "idle_seconds": current_idle,
+                        "last_output_line": last_line,
+                    }));
+                }
+                std::thread::sleep(Duration::from_secs(1));
             }
-            std::thread::sleep(Duration::from_secs(1));
         }
     }
 
@@ -1964,6 +2015,88 @@ mod tests {
         assert!(required.contains(&Value::from("session_id")));
         assert!(!required.contains(&Value::from("idle_seconds")));
         assert!(!required.contains(&Value::from("timeout")));
+        assert!(!required.contains(&Value::from("ignore_pattern")));
+    }
+
+    #[test]
+    fn test_pty_wait_for_idle_ignore_pattern_in_tool_definition() {
+        let defs = crate::tools::pty_tool_definitions();
+        let tool = defs
+            .iter()
+            .find(|t| t["name"] == "tttt_pty_wait_for_idle")
+            .unwrap();
+        assert!(
+            tool["inputSchema"]["properties"]["ignore_pattern"].is_object(),
+            "ignore_pattern should be a property"
+        );
+    }
+
+    #[test]
+    fn test_pty_wait_for_idle_ignore_pattern_invalid_regex() {
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
+        let result = handler.handle_tool_call(
+            "tttt_pty_wait_for_idle",
+            &json!({"session_id": id, "idle_seconds": 0.0, "timeout": 5.0, "ignore_pattern": "[invalid"}),
+        );
+        assert!(result.is_err(), "invalid ignore_pattern should return error");
+    }
+
+    #[test]
+    fn test_pty_wait_for_idle_ignore_pattern_detects_idle_when_hash_stable() {
+        // Static output: hash never changes, so idle is detected immediately
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
+        let result = handler
+            .handle_tool_call(
+                "tttt_pty_wait_for_idle",
+                &json!({"session_id": id, "idle_seconds": 0.0, "timeout": 10.0, "ignore_pattern": "\\d{2}:\\d{2}:\\d{2}"}),
+            )
+            .unwrap();
+        assert_eq!(result["status"].as_str().unwrap(), "idle");
+        assert!(result["idle_seconds"].as_f64().unwrap() >= 0.0);
+    }
+
+    #[test]
+    fn test_pty_wait_for_idle_ignore_pattern_timeout() {
+        // Require 99999 stable seconds — must time out
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        let mut handler = handler;
+        let result = handler
+            .handle_tool_call(
+                "tttt_pty_wait_for_idle",
+                &json!({"session_id": id, "idle_seconds": 99999.0, "timeout": 0.5, "ignore_pattern": "\\d{2}:\\d{2}:\\d{2}"}),
+            )
+            .unwrap();
+        assert_eq!(result["status"].as_str().unwrap(), "timeout");
+    }
+
+    #[test]
+    fn test_pty_wait_for_idle_ignore_pattern_strips_changing_parts() {
+        // The session screen is static; the pattern matches part of it, but stripped hash
+        // is also stable → should detect idle with ignore_pattern present.
+        let handler = make_handler();
+        let id = {
+            let mut mgr = handler.manager().lock().unwrap();
+            let id = mgr.generate_id();
+            let mut mock = MockPty::new(80, 24);
+            mock.queue_output(b"status: 12:34:56 ready");
+            let mut session = PtySession::new(id.clone(), mock, "bash".to_string(), 80, 24);
+            session.pump().unwrap();
+            mgr.add_session(session).unwrap();
+            id
+        };
+        let mut handler = handler;
+        let result = handler
+            .handle_tool_call(
+                "tttt_pty_wait_for_idle",
+                &json!({"session_id": id, "idle_seconds": 0.0, "timeout": 10.0, "ignore_pattern": "\\d{2}:\\d{2}:\\d{2}"}),
+            )
+            .unwrap();
+        assert_eq!(result["status"].as_str().unwrap(), "idle");
     }
 
     #[test]
