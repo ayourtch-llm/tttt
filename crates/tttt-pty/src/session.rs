@@ -43,6 +43,7 @@ pub struct PtySession<B: PtyBackend> {
     command: String,
     created_at: Instant,
     last_output_time: Instant,
+    last_input_time: Instant,
     capture_file: Option<std::fs::File>,
     capture_path: Option<String>,
     capture_bytes: u64,
@@ -60,6 +61,7 @@ impl<B: PtyBackend> PtySession<B> {
             command,
             created_at: Instant::now(),
             last_output_time: Instant::now(),
+            last_input_time: Instant::now(),
             capture_file: None,
             capture_path: None,
             capture_bytes: 0,
@@ -135,6 +137,7 @@ impl<B: PtyBackend> PtySession<B> {
         if self.status != SessionStatus::Running {
             return Err(PtyError::SessionExited);
         }
+        self.last_input_time = Instant::now();
         let data = process_special_keys(keys);
         self.backend.write(&data)
     }
@@ -144,6 +147,7 @@ impl<B: PtyBackend> PtySession<B> {
         if self.status != SessionStatus::Running {
             return Err(PtyError::SessionExited);
         }
+        self.last_input_time = Instant::now();
         self.backend.write(data)
     }
 
@@ -233,6 +237,11 @@ impl<B: PtyBackend> PtySession<B> {
     /// Seconds since the session last produced any output.
     pub fn idle_seconds(&self) -> f64 {
         self.last_output_time.elapsed().as_secs_f64()
+    }
+
+    /// Seconds since the session last received any keyboard input.
+    pub fn input_idle_seconds(&self) -> f64 {
+        self.last_input_time.elapsed().as_secs_f64()
     }
 
     /// The last non-empty line of visible screen content, trimmed.

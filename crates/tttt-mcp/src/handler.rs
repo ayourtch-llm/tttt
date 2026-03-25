@@ -206,6 +206,7 @@ impl<B: PtyBackend> PtyToolHandler<B> {
                         "command": meta.command,
                         "last_output_line": session.last_non_empty_line(),
                         "idle_seconds": session.idle_seconds(),
+                        "input_idle_seconds": session.input_idle_seconds(),
                     })
                 })
             })
