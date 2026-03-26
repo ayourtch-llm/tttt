@@ -191,17 +191,39 @@ Pure mapping from `InputEvent` variant to `InputAction` variant.
 
 ## Status
 
-| Chunk | Status  | Commit |
-|-------|---------|--------|
-| Plan  | ✅ done  | —      |
-| 1     | pending | —      |
-| 2     | pending | —      |
-| 3     | pending | —      |
-| 4     | pending | —      |
-| 5     | pending | —      |
-| 6     | pending | —      |
-| 7     | pending | —      |
+| Chunk | Status  | Tests | Commit    |
+|-------|---------|-------|-----------|
+| Plan  | ✅ done  | —     | 2c59009   |
+| 1     | ✅ done  | 7     | 6c3bb59   |
+| 2     | ✅ done  | 7     | f56b7b3   |
+| 3     | ✅ done  | 6     | cc2c030   |
+| 4     | ✅ done  | 6     | bd90087   |
+| 5     | ✅ done  | 8     | 29188fd   |
+| 6     | ✅ done  | 5     | b9f5551   |
+| 7     | ✅ done  | 9     | 1ca12f7   |
+
+**Total new tests: 48** (`cargo test --bin tttt` passes all 170 tests,
+48 of which are in `app::tests`).
+
+## Results
+
+All 7 chunks completed. Each extracted function:
+
+- Has zero side-effects (no PTY I/O, no mutex locks, no fd writes).
+- Is covered by ≥5 unit tests.
+- Replaced inline duplicated computations in `App` methods.
+
+Functions extracted:
+1. `prefix_key_name(u8) -> String`
+2. `format_help_screen(&str) -> String`
+3. `compute_relative_index(Option<usize>, i32, usize) -> Option<usize>`
+4. `reconcile_session_order(&[String], &[String]) -> Vec<String>`
+5. `should_render_now(bool, Option<Instant>, Option<Instant>, Instant, u64) -> bool`
+6. `calculate_pane_dimensions(u16, u16, u16) -> (u16, u16)`
+7. `calculate_min_dimensions(&[(u16,u16)], u16, u16) -> (u16, u16)`
+8. `compute_exit_action(Option<&str>, &[String], Fn) -> SessionExitAction`
+9. `decide_input_action(InputEvent) -> InputAction`
 
 ---
 
-*Created 2026-03-26.*
+*Created 2026-03-26. Completed 2026-03-26.*
