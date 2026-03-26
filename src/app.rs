@@ -102,6 +102,39 @@ fn write_all(fd: i32, data: &[u8]) -> nix::Result<()> {
     Ok(())
 }
 
+/// Pure mapping of a parsed `InputEvent` to the action that should be taken.
+///
+/// This function contains no I/O; it is a pure data transformation.
+#[derive(Debug, PartialEq)]
+enum InputAction {
+    /// Forward raw bytes to the active session.
+    SendToSession(Vec<u8>),
+    /// Switch to the session at position `n` in the session order.
+    SwitchSession(usize),
+    NextSession,
+    PrevSession,
+    ShowHelp,
+    CreateSession,
+    Reload,
+    Detach,
+    /// Send the raw prefix key byte to the active session.
+    PrefixEscape,
+}
+
+fn decide_input_action(event: tttt_tui::InputEvent) -> InputAction {
+    match event {
+        tttt_tui::InputEvent::PassThrough(data) => InputAction::SendToSession(data),
+        tttt_tui::InputEvent::SwitchTerminal(n)  => InputAction::SwitchSession(n),
+        tttt_tui::InputEvent::NextTerminal        => InputAction::NextSession,
+        tttt_tui::InputEvent::PrevTerminal        => InputAction::PrevSession,
+        tttt_tui::InputEvent::ShowHelp            => InputAction::ShowHelp,
+        tttt_tui::InputEvent::CreateTerminal      => InputAction::CreateSession,
+        tttt_tui::InputEvent::Reload              => InputAction::Reload,
+        tttt_tui::InputEvent::Detach              => InputAction::Detach,
+        tttt_tui::InputEvent::PrefixEscape        => InputAction::PrefixEscape,
+    }
+}
+
 /// What to do when the active session exits.
 #[derive(Debug, PartialEq)]
 enum SessionExitAction {
@@ -981,8 +1014,8 @@ impl App {
     }
 
     fn handle_input_event(&mut self, event: InputEvent, stdout_fd: i32) -> Result<bool, Box<dyn std::error::Error>> {
-        match event {
-            InputEvent::PassThrough(data) => {
+        match decide_input_action(event) {
+            InputAction::SendToSession(data) => {
                 if let Some(ref id) = self.active_session {
                     if self.config.log_input {
                         let _ = self.logger.log_event(&LogEvent::new(id.clone(), Direction::Input, data.clone()));
@@ -993,15 +1026,15 @@ impl App {
                     }
                 }
             }
-            InputEvent::SwitchTerminal(n) => {
+            InputAction::SwitchSession(n) => {
                 if let Some(id) = self.session_order.get(n).cloned() {
                     self.switch_to_session(&id, stdout_fd)?;
                 }
             }
-            InputEvent::NextTerminal => self.switch_relative(1, stdout_fd)?,
-            InputEvent::PrevTerminal => self.switch_relative(-1, stdout_fd)?,
-            InputEvent::ShowHelp => self.show_help(stdout_fd)?,
-            InputEvent::PrefixEscape => {
+            InputAction::NextSession => self.switch_relative(1, stdout_fd)?,
+            InputAction::PrevSession => self.switch_relative(-1, stdout_fd)?,
+            InputAction::ShowHelp => self.show_help(stdout_fd)?,
+            InputAction::PrefixEscape => {
                 if let Some(ref id) = self.active_session {
                     let prefix = vec![self.config.prefix_key];
                     let mut mgr = self.sessions.lock().unwrap();
@@ -1010,11 +1043,11 @@ impl App {
                     }
                 }
             }
-            InputEvent::Detach => return Ok(false),
-            InputEvent::CreateTerminal => {
+            InputAction::Detach => return Ok(false),
+            InputAction::CreateSession => {
                 self.create_session(stdout_fd)?;
             }
-            InputEvent::Reload => {
+            InputAction::Reload => {
                 self.reload_requested = true;
                 return Ok(false);
             }
@@ -1530,6 +1563,60 @@ mod tests {
         assert!(help.contains("Live reload"), "should mention reload");
         assert!(help.contains("This help"), "should mention help");
         assert!(help.contains("Press any key"), "should mention dismiss");
+    }
+
+    // ── Chunk 7: decide_input_action ─────────────────────────────────────────
+
+    #[test]
+    fn test_decide_input_action_pass_through() {
+        let data = vec![b'h', b'i'];
+        assert_eq!(
+            decide_input_action(InputEvent::PassThrough(data.clone())),
+            InputAction::SendToSession(data),
+        );
+    }
+
+    #[test]
+    fn test_decide_input_action_switch_terminal() {
+        assert_eq!(
+            decide_input_action(InputEvent::SwitchTerminal(3)),
+            InputAction::SwitchSession(3),
+        );
+    }
+
+    #[test]
+    fn test_decide_input_action_next_terminal() {
+        assert_eq!(decide_input_action(InputEvent::NextTerminal), InputAction::NextSession);
+    }
+
+    #[test]
+    fn test_decide_input_action_prev_terminal() {
+        assert_eq!(decide_input_action(InputEvent::PrevTerminal), InputAction::PrevSession);
+    }
+
+    #[test]
+    fn test_decide_input_action_show_help() {
+        assert_eq!(decide_input_action(InputEvent::ShowHelp), InputAction::ShowHelp);
+    }
+
+    #[test]
+    fn test_decide_input_action_create_terminal() {
+        assert_eq!(decide_input_action(InputEvent::CreateTerminal), InputAction::CreateSession);
+    }
+
+    #[test]
+    fn test_decide_input_action_reload() {
+        assert_eq!(decide_input_action(InputEvent::Reload), InputAction::Reload);
+    }
+
+    #[test]
+    fn test_decide_input_action_detach() {
+        assert_eq!(decide_input_action(InputEvent::Detach), InputAction::Detach);
+    }
+
+    #[test]
+    fn test_decide_input_action_prefix_escape() {
+        assert_eq!(decide_input_action(InputEvent::PrefixEscape), InputAction::PrefixEscape);
     }
 
     // ── Chunk 6: compute_exit_action ─────────────────────────────────────────
