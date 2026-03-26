@@ -360,8 +360,8 @@ impl SqliteLogger {
         }
     }
 
-    /// Time gap threshold used to split NULL-pid orphan sessions: 5 minutes.
-    const GAP_THRESHOLD_MS: u64 = 5 * 60 * 1000;
+    /// Time gap threshold used to split NULL-pid orphan sessions: 1 hour.
+    const GAP_THRESHOLD_MS: u64 = 60 * 60 * 1000;
 
     /// Expose the gap threshold for tests in other crates.
     pub fn gap_threshold_ms() -> u64 {

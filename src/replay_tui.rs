@@ -127,8 +127,8 @@ struct SessionListEntry {
     load_strategy: LoadStrategy,
 }
 
-/// Gap threshold for visual grouping separators: 5 minutes.
-const VISUAL_GAP_THRESHOLD_MS: u64 = 5 * 60 * 1_000;
+/// Gap threshold for visual grouping separators: 1 hour.
+const VISUAL_GAP_THRESHOLD_MS: u64 = 60 * 60 * 1_000;
 
 /// Returns the session indices before which a separator row should appear.
 /// A separator is inserted when the gap between the previous session's end
