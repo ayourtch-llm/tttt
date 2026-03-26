@@ -48,6 +48,15 @@ All of this happened in a single 3-hour session where 16 features were implement
 - **`tttt_self_inject`** — Agent injects text into its own session
 - **`tttt_pty_handle_rate_limit`** — Detects Claude Code rate limit dialogs, parses the reset time (timezone-aware), waits, and auto-continues
 
+### Session Replay
+- **`tttt replay`** — Interactive ratatui-based TUI for browsing and replaying recorded terminal sessions
+- **Differential logging** — All PTY output is automatically logged to SQLite with timestamps (only new bytes per update)
+- **Full-color playback** — Replays terminal output with accurate colors, bold, italic, underline, and cursor positioning
+- **Playback controls** — Play/pause, speed control (0.125x–16x), frame stepping, seeking via keyboard
+- **MCP replay tools** — `tttt_replay_list_sessions`, `tttt_replay_get_screen`, `tttt_replay_get_timeline` for programmatic access
+- **Legacy database support** — Works with databases created before session tracking was added
+- **`--danger-log-user-input-including-passwords`** — Opt-in flag to also record keystrokes (disabled by default for security)
+
 ### Persistence & Communication
 - **`tttt_scratchpad_write`** / **`tttt_scratchpad_read`** — Key-value store that persists across reloads
 - **`tttt_sidebar_message`** / **`tttt_sidebar_list`** — Display messages in the TUI sidebar (persists across reloads)
@@ -109,7 +118,7 @@ tttt (TUI process)
 | `tttt-pty` | PTY session management, MockPty for testing, RestoredPty for live reload |
 | `tttt-mcp` | MCP server implementation, 15 tool handlers, proxy with auto-reconnect |
 | `tttt-tui` | Terminal UI: sidebar, pane rendering, input parsing, viewer protocol |
-| `tttt-log` | Logging to text files + SQLite (every PTY byte in/out) |
+| `tttt-log` | Logging to text files + SQLite, session replay engine |
 | `tttt-scheduler` | Cron job parsing and reminder system |
 | `tttt-sandbox` | Session sandboxing profiles (placeholder for future isolation) |
 | `vt100` | Vendored vt100 terminal emulator (modified for scrollback + formatting) |
@@ -125,6 +134,9 @@ cargo build
 
 # Attach from another terminal to watch
 ./target/debug/tttt attach
+
+# Replay recorded sessions
+./target/debug/tttt replay
 
 # Live reload after code changes
 kill -USR1 $(pgrep -f "target/debug/tttt -e")
@@ -172,7 +184,7 @@ With tttt, the root agent can operate fully autonomously:
 ## Testing
 
 ```bash
-# Run all tests (~100 tests across all crates)
+# Run all tests (~140 tests across all crates)
 cargo test
 
 # Run specific crate tests
@@ -186,7 +198,6 @@ This project is under active development. The core infrastructure is solid and b
 
 - **TextFSMPlus integration** — Automated permission approval via state machine templates
 - **Git worktree isolation** — Per-worker sandboxed repositories
-- **Session replay** — Full replay from logged PTY streams
 - **Heterogeneous agent teams** — Mixing different AI models with role-based routing
 
 ## Background: An AI-Designed Tool for AI Agents

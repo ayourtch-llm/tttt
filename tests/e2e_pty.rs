@@ -59,7 +59,7 @@ fn test_e2e_help() {
     let mut session = PtySession::new("help".into(), backend, "tttt".into(), 80, 24);
 
     assert!(
-        wait_for_screen(&mut session, "terminal harness", 5000),
+        wait_for_screen(&mut session, "Print help", 5000),
         "should show help: {:?}",
         session.get_screen()
     );
