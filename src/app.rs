@@ -5,7 +5,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tttt_log::{Direction, LogEvent, LogSink, MultiLogger, SqliteLogger, TextLogger};
+use tttt_log::{Direction, LogEvent, LogSink, MultiLogger, SharedSqliteLogSink, SqliteLogger, TextLogger};
 use tttt_mcp::notification::NotificationRegistry;
 use tttt_mcp::{SharedNotificationRegistry, SharedScheduler, SharedScratchpad, SharedSidebarMessages};
 use tttt_pty::{AnyPty, PtySession, RealPty, SessionManager, SessionStatus};
@@ -110,6 +110,7 @@ pub struct App {
     sidebar: SidebarRenderer,
     pane_renderer: PaneRenderer,
     logger: MultiLogger,
+    sqlite_logger: Option<Arc<Mutex<SqliteLogger>>>,
     scheduler: SharedScheduler,
     notifications: SharedNotificationRegistry,
     scratchpad: SharedScratchpad,
@@ -160,6 +161,7 @@ impl App {
             sidebar: SidebarRenderer::new(config.sidebar_width),
             pane_renderer: PaneRenderer::new(pty_cols, pty_rows, 1, 1),
             logger: MultiLogger::new(),
+            sqlite_logger: None,
             scheduler: Arc::new(Mutex::new(Scheduler::new())),
             notifications: Arc::new(Mutex::new(NotificationRegistry::new())),
             scratchpad: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -371,8 +373,9 @@ impl App {
         }
         let text_logger = TextLogger::new(&self.config.log_dir)?;
         self.logger.add_sink(Box::new(text_logger));
-        let sqlite_logger = SqliteLogger::new(&self.config.db_path)?;
-        self.logger.add_sink(Box::new(sqlite_logger));
+        let sqlite_logger = Arc::new(Mutex::new(SqliteLogger::new(&self.config.db_path)?));
+        self.logger.add_sink(Box::new(SharedSqliteLogSink(Arc::clone(&sqlite_logger))));
+        self.sqlite_logger = Some(sqlite_logger);
         Ok(())
     }
 
@@ -440,6 +443,11 @@ impl App {
         drop(mgr);
         self.session_order.push(id.clone());
         self.active_session = Some(id.clone());
+        if let Some(ref logger) = self.sqlite_logger {
+            let _ = logger.lock().unwrap().log_session_start(
+                &id, &self.config.root_command, pty_cols, pty_rows, None,
+            );
+        }
         Ok(id)
     }
 
@@ -831,7 +839,9 @@ impl App {
         match event {
             InputEvent::PassThrough(data) => {
                 if let Some(ref id) = self.active_session {
-                    let _ = self.logger.log_event(&LogEvent::new(id.clone(), Direction::Input, data.clone()));
+                    if self.config.log_input {
+                        let _ = self.logger.log_event(&LogEvent::new(id.clone(), Direction::Input, data.clone()));
+                    }
                     let mut mgr = self.sessions.lock().unwrap();
                     if let Ok(session) = mgr.get_mut(id) {
                         session.send_raw(&data)?;
@@ -964,14 +974,24 @@ impl App {
         let pty_cols = cols.saturating_sub(self.config.sidebar_width);
         let pty_rows = rows.saturating_sub(1);
         self.pane_renderer.resize(pty_cols, pty_rows);
-        {
+        let resized_ids: Vec<String> = {
             let mut mgr = self.sessions.lock().unwrap();
             let ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
-            for id in ids {
-                if let Ok(session) = mgr.get_mut(&id) {
+            for id in &ids {
+                if let Ok(session) = mgr.get_mut(id) {
                     let _ = session.resize(pty_cols, pty_rows);
                 }
             }
+            ids
+        };
+        let resize_data = format!(
+            r#"{{"type":"resize","cols":{},"rows":{}}}"#,
+            pty_cols, pty_rows
+        ).into_bytes();
+        for id in &resized_ids {
+            let _ = self.logger.log_event(&LogEvent::new(
+                id.clone(), Direction::Meta, resize_data.clone(),
+            ));
         }
         write_all(stdout_fd, clear_screen().as_bytes())?;
         if let Some(ref id) = self.active_session.clone() {
@@ -1002,10 +1022,14 @@ impl App {
             let mgr = self.sessions.lock().unwrap();
             let exited = mgr.get(id).map_or(false, |s| matches!(s.status(), SessionStatus::Exited(_)));
             if exited {
+                let id_owned = id.clone();
                 let next = self.session_order.iter()
                     .find(|s| *s != id && mgr.get(s).map_or(false, |sess| matches!(sess.status(), SessionStatus::Running)))
                     .cloned();
                 drop(mgr);
+                if let Some(ref logger) = self.sqlite_logger {
+                    let _ = logger.lock().unwrap().log_session_end(&id_owned);
+                }
                 if let Some(next_id) = next {
                     self.active_session = Some(next_id);
                 } else {
@@ -1061,24 +1085,29 @@ impl App {
                         let scratchpad = self.scratchpad.clone();
                         let sidebar_messages = self.sidebar_messages.clone();
                         let work_dir = self.config.work_dir.clone();
+                        let db_path = self.config.db_path.clone();
+                        let sqlite_logger = self.sqlite_logger.clone();
                         std::thread::spawn(move || {
                             use tttt_mcp::proxy::handle_proxy_client;
-                            use tttt_mcp::{PtyToolHandler, SchedulerToolHandler, NotificationToolHandler, ScratchpadToolHandler, SidebarMessageToolHandler, CompositeToolHandler};
+                            use tttt_mcp::{PtyToolHandler, ReplayToolHandler, SchedulerToolHandler, NotificationToolHandler, ScratchpadToolHandler, SidebarMessageToolHandler, CompositeToolHandler};
 
                             // Set the stream to blocking mode for the handler
                             let _ = stream.set_nonblocking(false);
 
-                            let pty_handler = PtyToolHandler::new(sessions.clone(), work_dir);
+                            let pty_handler = PtyToolHandler::new(sessions.clone(), work_dir)
+                                .with_sqlite_logger(sqlite_logger);
                             let scheduler_handler = SchedulerToolHandler::new(scheduler);
                             let notif_handler = NotificationToolHandler::new(notifications, sessions);
                             let scratchpad_handler = ScratchpadToolHandler::new_shared(scratchpad);
                             let sidebar_handler = SidebarMessageToolHandler::new(sidebar_messages);
+                            let replay_handler = ReplayToolHandler::new(db_path);
                             let mut composite = CompositeToolHandler::new();
                             composite.add_handler(Box::new(pty_handler));
                             composite.add_handler(Box::new(scheduler_handler));
                             composite.add_handler(Box::new(notif_handler));
                             composite.add_handler(Box::new(scratchpad_handler));
                             composite.add_handler(Box::new(sidebar_handler));
+                            composite.add_handler(Box::new(replay_handler));
 
                             if let Err(e) = handle_proxy_client(stream, &mut composite, "tttt") {
                                 // Client disconnected or error — normal

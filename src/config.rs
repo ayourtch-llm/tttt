@@ -35,6 +35,11 @@ pub struct Config {
 
     /// Default terminal height.
     pub default_rows: u16,
+
+    /// Log user keystrokes (input events) to SQLite. DISABLED by default because
+    /// input may contain passwords and other sensitive data.
+    #[serde(default)]
+    pub log_input: bool,
 }
 
 impl Default for Config {
@@ -53,6 +58,7 @@ impl Default for Config {
             max_sessions: 15,
             default_cols: 80,
             default_rows: 24,
+            log_input: false,
         }
     }
 }
@@ -167,6 +173,20 @@ mod tests {
         assert_eq!(config.max_sessions, 15);
         assert_eq!(config.default_cols, 80);
         assert_eq!(config.default_rows, 24);
+        assert!(!config.log_input, "input logging must be disabled by default");
+    }
+
+    #[test]
+    fn test_config_log_input_default_false() {
+        // log_input must be false when not set in TOML
+        let config: Config = toml::from_str("").unwrap();
+        assert!(!config.log_input);
+    }
+
+    #[test]
+    fn test_config_log_input_can_be_enabled() {
+        let config: Config = toml::from_str("log_input = true").unwrap();
+        assert!(config.log_input);
     }
 
     #[test]

@@ -1,8 +1,10 @@
 use crate::error::Result;
-use crate::event::LogEvent;
+use crate::event::{LogEvent, SessionInfo};
 use crate::LogSink;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Logs events to a SQLite database with timestamped chunks.
 pub struct SqliteLogger {
@@ -22,7 +24,16 @@ impl SqliteLogger {
                 data BLOB NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_events_session
-                ON events(session_id, timestamp_ms);",
+                ON events(session_id, timestamp_ms);
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                command TEXT NOT NULL,
+                cols INTEGER NOT NULL,
+                rows INTEGER NOT NULL,
+                started_at_ms INTEGER NOT NULL,
+                ended_at_ms INTEGER,
+                name TEXT
+            );",
         )?;
         Ok(Self { conn })
     }
@@ -39,7 +50,25 @@ impl SqliteLogger {
                 data BLOB NOT NULL
             );
             CREATE INDEX idx_events_session
-                ON events(session_id, timestamp_ms);",
+                ON events(session_id, timestamp_ms);
+            CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY,
+                command TEXT NOT NULL,
+                cols INTEGER NOT NULL,
+                rows INTEGER NOT NULL,
+                started_at_ms INTEGER NOT NULL,
+                ended_at_ms INTEGER,
+                name TEXT
+            );",
+        )?;
+        Ok(Self { conn })
+    }
+
+    /// Open a read-only connection to an existing SQLite database (for replay).
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         Ok(Self { conn })
     }
@@ -79,6 +108,86 @@ impl SqliteLogger {
                 .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
         Ok(count)
     }
+
+    /// Record the start of a session.
+    pub fn log_session_start(
+        &mut self,
+        session_id: &str,
+        command: &str,
+        cols: u16,
+        rows: u16,
+        name: Option<&str>,
+    ) -> Result<()> {
+        let started_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sessions (session_id, command, cols, rows, started_at_ms, ended_at_ms, name)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+            rusqlite::params![session_id, command, cols, rows, started_at_ms, name],
+        )?;
+        Ok(())
+    }
+
+    /// Record the end of a session, setting ended_at_ms to the current time.
+    pub fn log_session_end(&mut self, session_id: &str) -> Result<()> {
+        let ended_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.conn.execute(
+            "UPDATE sessions SET ended_at_ms = ?1 WHERE session_id = ?2",
+            rusqlite::params![ended_at_ms, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// List all sessions ordered by start time.
+    pub fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name
+             FROM sessions ORDER BY started_at_ms",
+        )?;
+        let sessions = stmt
+            .query_map([], |row| {
+                Ok(SessionInfo {
+                    session_id: row.get(0)?,
+                    command: row.get(1)?,
+                    cols: row.get::<_, u16>(2)?,
+                    rows: row.get::<_, u16>(3)?,
+                    started_at_ms: row.get(4)?,
+                    ended_at_ms: row.get(5)?,
+                    name: row.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(sessions)
+    }
+
+    /// Get info for a specific session by ID.
+    pub fn get_session_info(&self, session_id: &str) -> Result<Option<SessionInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name
+             FROM sessions WHERE session_id = ?1",
+        )?;
+        let mut rows = stmt.query_map([session_id], |row| {
+            Ok(SessionInfo {
+                session_id: row.get(0)?,
+                command: row.get(1)?,
+                cols: row.get::<_, u16>(2)?,
+                rows: row.get::<_, u16>(3)?,
+                started_at_ms: row.get(4)?,
+                ended_at_ms: row.get(5)?,
+                name: row.get(6)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(info)) => Ok(Some(info)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
 }
 
 impl LogSink for SqliteLogger {
@@ -99,6 +208,19 @@ impl LogSink for SqliteLogger {
     fn flush(&mut self) -> Result<()> {
         // SQLite writes are immediate (no buffering needed)
         Ok(())
+    }
+}
+
+/// A thread-safe wrapper around `SqliteLogger` that implements `LogSink`.
+pub struct SharedSqliteLogSink(pub Arc<Mutex<SqliteLogger>>);
+
+impl LogSink for SharedSqliteLogSink {
+    fn log_event(&mut self, event: &LogEvent) -> Result<()> {
+        self.0.lock().unwrap().log_event(event)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.0.lock().unwrap().flush()
     }
 }
 
@@ -205,5 +327,131 @@ mod tests {
         // Re-open same DB — should not fail
         let logger = SqliteLogger::new(&path).unwrap();
         assert_eq!(logger.event_count().unwrap(), 1);
+    }
+
+    // --- Session metadata tests ---
+
+    #[test]
+    fn test_session_start_and_query() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        logger.log_session_start("s1", "bash", 80, 24, None).unwrap();
+
+        let info = logger.get_session_info("s1").unwrap().unwrap();
+        assert_eq!(info.session_id, "s1");
+        assert_eq!(info.command, "bash");
+        assert_eq!(info.cols, 80);
+        assert_eq!(info.rows, 24);
+        assert!(info.started_at_ms > 0);
+        assert!(info.ended_at_ms.is_none());
+        assert!(info.name.is_none());
+    }
+
+    #[test]
+    fn test_session_end_sets_timestamp() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        logger.log_session_start("s1", "zsh", 100, 30, None).unwrap();
+        let info_before = logger.get_session_info("s1").unwrap().unwrap();
+        assert!(info_before.ended_at_ms.is_none());
+
+        logger.log_session_end("s1").unwrap();
+        let info_after = logger.get_session_info("s1").unwrap().unwrap();
+        assert!(info_after.ended_at_ms.is_some());
+        assert!(info_after.ended_at_ms.unwrap() >= info_after.started_at_ms);
+    }
+
+    #[test]
+    fn test_list_sessions_empty() {
+        let logger = SqliteLogger::in_memory().unwrap();
+        let sessions = logger.list_sessions().unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn test_list_sessions_multiple() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        logger.log_session_start("s1", "bash", 80, 24, None).unwrap();
+        logger.log_session_start("s2", "zsh", 120, 40, Some("my shell")).unwrap();
+        logger.log_session_start("s3", "fish", 60, 20, None).unwrap();
+
+        let sessions = logger.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 3);
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert!(ids.contains(&"s1"));
+        assert!(ids.contains(&"s2"));
+        assert!(ids.contains(&"s3"));
+    }
+
+    #[test]
+    fn test_session_name_field() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        logger.log_session_start("s1", "bash", 80, 24, Some("dev session")).unwrap();
+
+        let info = logger.get_session_info("s1").unwrap().unwrap();
+        assert_eq!(info.name, Some("dev session".to_string()));
+    }
+
+    #[test]
+    fn test_get_session_info_nonexistent() {
+        let logger = SqliteLogger::in_memory().unwrap();
+        let info = logger.get_session_info("nope").unwrap();
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn test_sessions_schema_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let mut logger = SqliteLogger::new(&path).unwrap();
+            logger.log_session_start("s1", "bash", 80, 24, None).unwrap();
+        }
+        // Re-open — should not fail, sessions table still exists
+        let logger = SqliteLogger::new(&path).unwrap();
+        let sessions = logger.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "s1");
+    }
+
+    #[test]
+    fn test_open_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro.db");
+        {
+            let mut logger = SqliteLogger::new(&path).unwrap();
+            logger.log_session_start("s1", "bash", 80, 24, Some("test")).unwrap();
+            logger.log_event(&LogEvent::with_timestamp(
+                1, "s1".to_string(), Direction::Output, b"hi".to_vec(),
+            )).unwrap();
+        }
+        let ro = SqliteLogger::open_read_only(&path).unwrap();
+        let sessions = ro.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        let events = ro.query_events("s1").unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_shared_sink_log_event() {
+        let logger = Arc::new(Mutex::new(SqliteLogger::in_memory().unwrap()));
+        let mut sink = SharedSqliteLogSink(Arc::clone(&logger));
+        let event = LogEvent::with_timestamp(42, "s1".to_string(), Direction::Output, b"data".to_vec());
+        sink.log_event(&event).unwrap();
+        sink.flush().unwrap();
+
+        let count = logger.lock().unwrap().event_count().unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_shared_sink_multiple_events() {
+        let logger = Arc::new(Mutex::new(SqliteLogger::in_memory().unwrap()));
+        let mut sink = SharedSqliteLogSink(Arc::clone(&logger));
+        for i in 0..5u64 {
+            sink.log_event(&LogEvent::with_timestamp(
+                i * 10, "s1".to_string(), Direction::Output, vec![i as u8],
+            )).unwrap();
+        }
+        let count = logger.lock().unwrap().event_count().unwrap();
+        assert_eq!(count, 5);
     }
 }

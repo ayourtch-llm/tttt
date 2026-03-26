@@ -329,6 +329,44 @@ pub fn notification_tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// Returns tool definitions for session replay tools.
+pub fn replay_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "tttt_replay_list_sessions",
+            "description": "List all recorded terminal sessions available for replay",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "tttt_replay_get_screen",
+            "description": "Replay a recorded session and return the terminal screen at a given point",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session ID to replay" },
+                    "event_index": { "type": "integer", "description": "Replay up to this event index (exclusive)" },
+                    "timestamp_ms": { "type": "integer", "description": "Replay up to this timestamp in milliseconds" }
+                },
+                "required": ["session_id"]
+            }
+        }),
+        json!({
+            "name": "tttt_replay_get_timeline",
+            "description": "Get the event timeline for a recorded session (index, timestamp, direction for each event)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session ID" }
+                },
+                "required": ["session_id"]
+            }
+        }),
+    ]
+}
+
 /// Returns tool definitions for scratchpad tools.
 pub fn scratchpad_tool_definitions() -> Vec<Value> {
     vec![
@@ -421,6 +459,26 @@ mod tests {
     }
 
     #[test]
+    fn test_replay_tool_count() {
+        assert_eq!(replay_tool_definitions().len(), 3);
+    }
+
+    #[test]
+    fn test_replay_get_screen_required_params() {
+        let tools = replay_tool_definitions();
+        let tool = tools.iter().find(|t| t["name"] == "tttt_replay_get_screen").unwrap();
+        let required = tool["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.contains(&Value::from("session_id")));
+    }
+
+    #[test]
+    fn test_replay_list_sessions_no_required() {
+        let tools = replay_tool_definitions();
+        let tool = tools.iter().find(|t| t["name"] == "tttt_replay_list_sessions").unwrap();
+        assert!(tool["inputSchema"]["required"].is_null());
+    }
+
+    #[test]
     fn test_tool_names_unique() {
         let all: Vec<Value> = pty_tool_definitions()
             .into_iter()
@@ -428,6 +486,7 @@ mod tests {
             .chain(notification_tool_definitions())
             .chain(scratchpad_tool_definitions())
             .chain(sidebar_tool_definitions())
+            .chain(replay_tool_definitions())
             .collect();
         let names: Vec<&str> = all.iter().map(|t| t["name"].as_str().unwrap()).collect();
         let mut unique = names.clone();

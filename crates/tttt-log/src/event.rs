@@ -1,6 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Metadata about a terminal session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub session_id: String,
+    pub command: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub started_at_ms: u64,
+    pub ended_at_ms: Option<u64>,
+    pub name: Option<String>,
+}
+
 /// Direction of terminal I/O.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -202,5 +214,58 @@ mod tests {
         assert_eq!(json, "\"input\"");
         let parsed: Direction = serde_json::from_str("\"output\"").unwrap();
         assert_eq!(parsed, Direction::Output);
+    }
+
+    #[test]
+    fn test_session_info_fields() {
+        let info = SessionInfo {
+            session_id: "abc".to_string(),
+            command: "bash".to_string(),
+            cols: 80,
+            rows: 24,
+            started_at_ms: 1000,
+            ended_at_ms: Some(2000),
+            name: Some("my session".to_string()),
+        };
+        assert_eq!(info.session_id, "abc");
+        assert_eq!(info.cols, 80);
+        assert_eq!(info.rows, 24);
+        assert_eq!(info.ended_at_ms, Some(2000));
+        assert_eq!(info.name, Some("my session".to_string()));
+    }
+
+    #[test]
+    fn test_session_info_optional_fields() {
+        let info = SessionInfo {
+            session_id: "x".to_string(),
+            command: "sh".to_string(),
+            cols: 100,
+            rows: 30,
+            started_at_ms: 500,
+            ended_at_ms: None,
+            name: None,
+        };
+        assert!(info.ended_at_ms.is_none());
+        assert!(info.name.is_none());
+    }
+
+    #[test]
+    fn test_session_info_json_roundtrip() {
+        let info = SessionInfo {
+            session_id: "s1".to_string(),
+            command: "zsh".to_string(),
+            cols: 120,
+            rows: 40,
+            started_at_ms: 9999,
+            ended_at_ms: None,
+            name: Some("test".to_string()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: SessionInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.session_id, info.session_id);
+        assert_eq!(parsed.cols, info.cols);
+        assert_eq!(parsed.rows, info.rows);
+        assert_eq!(parsed.started_at_ms, info.started_at_ms);
+        assert_eq!(parsed.name, info.name);
     }
 }

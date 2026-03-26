@@ -3,8 +3,10 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tttt_log::{SessionReplay, SqliteLogger};
 use tttt_pty::{MockPty, PtyBackend, PtySession, SessionManager, SessionStatus};
 use tttt_scheduler::Scheduler;
 
@@ -98,6 +100,7 @@ pub struct PtyToolHandler<B: PtyBackend> {
     work_dir: std::path::PathBuf,
     default_cols: u16,
     default_rows: u16,
+    sqlite_logger: Option<Arc<Mutex<SqliteLogger>>>,
 }
 
 impl<B: PtyBackend> PtyToolHandler<B> {
@@ -108,7 +111,14 @@ impl<B: PtyBackend> PtyToolHandler<B> {
             work_dir,
             default_cols: 80,
             default_rows: 24,
+            sqlite_logger: None,
         }
+    }
+
+    /// Attach a shared SqliteLogger for session metadata recording.
+    pub fn with_sqlite_logger(mut self, logger: Option<Arc<Mutex<SqliteLogger>>>) -> Self {
+        self.sqlite_logger = logger;
+        self
     }
 
     /// Create a handler that owns its own session manager (convenience for standalone use).
@@ -472,11 +482,15 @@ impl PtyToolHandler<MockPty> {
         let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
         let id = mgr.generate_id();
         let mock = MockPty::new(cols, rows);
-        let session = PtySession::new(id.clone(), mock, command, cols, rows);
+        let session = PtySession::new(id.clone(), mock, command.clone(), cols, rows);
         if let Some(n) = name.clone() {
             mgr.add_session_with_name(session, n)?;
         } else {
             mgr.add_session(session)?;
+        }
+        drop(mgr);
+        if let Some(ref logger) = self.sqlite_logger {
+            let _ = logger.lock().unwrap().log_session_start(&id, &command, cols, rows, name.as_deref());
         }
         let mut resp = json!({"session_id": id});
         if let Some(n) = name {
@@ -519,6 +533,10 @@ impl PtyToolHandler<tttt_pty::RealPty> {
             mgr.add_session_with_name(session, n)?;
         } else {
             mgr.add_session(session)?;
+        }
+        drop(mgr);
+        if let Some(ref logger) = self.sqlite_logger {
+            let _ = logger.lock().unwrap().log_session_start(&id, command, cols, rows, name.as_deref());
         }
         let mut resp = json!({"session_id": id});
         if let Some(n) = name {
@@ -589,6 +607,10 @@ impl PtyToolHandler<tttt_pty::AnyPty> {
             mgr.add_session_with_name(session, n)?;
         } else {
             mgr.add_session(session)?;
+        }
+        drop(mgr);
+        if let Some(ref logger) = self.sqlite_logger {
+            let _ = logger.lock().unwrap().log_session_start(&id, command, cols, rows, name.as_deref());
         }
         let mut resp = json!({"session_id": id});
         if let Some(n) = name {
@@ -1081,10 +1103,101 @@ impl ToolHandler for ScratchpadToolHandler {
     }
 }
 
+// === Session replay tool handler ===
+
+/// Handles MCP tool calls for session replay by reading from a SQLite log database.
+pub struct ReplayToolHandler {
+    db_path: PathBuf,
+}
+
+impl ReplayToolHandler {
+    pub fn new(db_path: PathBuf) -> Self {
+        Self { db_path }
+    }
+
+    fn open_db(&self) -> Result<SqliteLogger> {
+        SqliteLogger::open_read_only(&self.db_path)
+            .map_err(|e| McpError::Protocol(e.to_string()))
+    }
+}
+
+impl ToolHandler for ReplayToolHandler {
+    fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
+        match name {
+            "tttt_replay_list_sessions" => {
+                let db = self.open_db()?;
+                let sessions = db
+                    .list_sessions()
+                    .map_err(|e| McpError::Protocol(e.to_string()))?;
+                Ok(json!({ "sessions": sessions }))
+            }
+            "tttt_replay_get_screen" => {
+                let session_id = args["session_id"]
+                    .as_str()
+                    .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
+                let db = self.open_db()?;
+                let info = db
+                    .get_session_info(session_id)
+                    .map_err(|e| McpError::Protocol(e.to_string()))?
+                    .ok_or_else(|| {
+                        McpError::Protocol(format!("session '{}' not found", session_id))
+                    })?;
+                let events = db
+                    .query_events(session_id)
+                    .map_err(|e| McpError::Protocol(e.to_string()))?;
+                let mut replay = SessionReplay::new(events, info.cols, info.rows);
+                if let Some(idx) = args["event_index"].as_u64() {
+                    replay.seek_to_index(idx as usize);
+                } else if let Some(ts) = args["timestamp_ms"].as_u64() {
+                    replay.seek_to_timestamp(ts);
+                } else {
+                    replay.seek_to_index(replay.event_count());
+                }
+                let screen = replay.screen_contents();
+                let cursor = replay.cursor_position();
+                Ok(json!({
+                    "screen": screen,
+                    "cursor": [cursor.0, cursor.1],
+                    "event_index": replay.current_index(),
+                    "timestamp_ms": replay.current_timestamp(),
+                }))
+            }
+            "tttt_replay_get_timeline" => {
+                let session_id = args["session_id"]
+                    .as_str()
+                    .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
+                let db = self.open_db()?;
+                let events = db
+                    .query_events(session_id)
+                    .map_err(|e| McpError::Protocol(e.to_string()))?;
+                let replay = SessionReplay::new(events, 80, 24);
+                let timeline: Vec<Value> = replay
+                    .timeline()
+                    .into_iter()
+                    .map(|(idx, ts, dir)| {
+                        json!({
+                            "index": idx,
+                            "timestamp_ms": ts,
+                            "direction": dir.as_str()
+                        })
+                    })
+                    .collect();
+                Ok(json!({ "timeline": timeline }))
+            }
+            _ => Err(McpError::ToolNotFound(name.to_string())),
+        }
+    }
+
+    fn tool_definitions(&self) -> Vec<Value> {
+        crate::tools::replay_tool_definitions()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use tttt_log::LogSink as _;
 
     fn make_handler() -> PtyToolHandler<MockPty> {
         PtyToolHandler::new_owned(SessionManager::new(), std::path::PathBuf::from("/tmp"))
@@ -2318,6 +2431,184 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result["status"], "no_rate_limit");
+    }
+
+    // --- ReplayToolHandler tests ---
+
+    fn make_replay_db() -> (ReplayToolHandler, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let mut logger = tttt_log::SqliteLogger::new(&db_path).unwrap();
+        logger.log_session_start("s1", "bash", 80, 24, Some("test session")).unwrap();
+        logger.log_event(&tttt_log::LogEvent::with_timestamp(
+            100, "s1".to_string(), tttt_log::Direction::Output, b"hello".to_vec(),
+        )).unwrap();
+        logger.log_event(&tttt_log::LogEvent::with_timestamp(
+            200, "s1".to_string(), tttt_log::Direction::Output, b" world".to_vec(),
+        )).unwrap();
+        logger.log_event(&tttt_log::LogEvent::with_timestamp(
+            300, "s1".to_string(), tttt_log::Direction::Input, b"typed".to_vec(),
+        )).unwrap();
+        logger.log_session_end("s1").unwrap();
+        (ReplayToolHandler::new(db_path), dir)
+    }
+
+    #[test]
+    fn test_replay_list_sessions_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("empty.db");
+        tttt_log::SqliteLogger::new(&db_path).unwrap();
+        let mut handler = ReplayToolHandler::new(db_path);
+        let result = handler.handle_tool_call("tttt_replay_list_sessions", &json!({})).unwrap();
+        assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_replay_list_sessions_with_data() {
+        let (mut handler, _dir) = make_replay_db();
+        let result = handler.handle_tool_call("tttt_replay_list_sessions", &json!({})).unwrap();
+        let sessions = result["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["session_id"], "s1");
+        assert_eq!(sessions[0]["command"], "bash");
+        assert_eq!(sessions[0]["name"], "test session");
+    }
+
+    #[test]
+    fn test_replay_get_screen_end() {
+        let (mut handler, _dir) = make_replay_db();
+        let result = handler
+            .handle_tool_call("tttt_replay_get_screen", &json!({"session_id": "s1"}))
+            .unwrap();
+        let screen = result["screen"].as_str().unwrap();
+        assert!(screen.contains("hello world"), "screen: {:?}", screen);
+        assert_eq!(result["event_index"], 3); // all 3 events processed
+    }
+
+    #[test]
+    fn test_replay_get_screen_at_event_index() {
+        let (mut handler, _dir) = make_replay_db();
+        let result = handler
+            .handle_tool_call("tttt_replay_get_screen", &json!({"session_id": "s1", "event_index": 1}))
+            .unwrap();
+        let screen = result["screen"].as_str().unwrap();
+        assert!(screen.contains("hello"), "screen: {:?}", screen);
+        assert!(!screen.contains("world"), "screen should not have world yet");
+        assert_eq!(result["event_index"], 1);
+    }
+
+    #[test]
+    fn test_replay_get_screen_at_timestamp() {
+        let (mut handler, _dir) = make_replay_db();
+        let result = handler
+            .handle_tool_call("tttt_replay_get_screen", &json!({"session_id": "s1", "timestamp_ms": 100}))
+            .unwrap();
+        let screen = result["screen"].as_str().unwrap();
+        assert!(screen.contains("hello"));
+        assert!(!screen.contains("world"));
+        assert_eq!(result["timestamp_ms"], 100u64);
+    }
+
+    #[test]
+    fn test_replay_get_screen_returns_cursor() {
+        let (mut handler, _dir) = make_replay_db();
+        let result = handler
+            .handle_tool_call("tttt_replay_get_screen", &json!({"session_id": "s1"}))
+            .unwrap();
+        assert!(result["cursor"].is_array());
+        let cursor = result["cursor"].as_array().unwrap();
+        assert_eq!(cursor.len(), 2);
+    }
+
+    #[test]
+    fn test_replay_get_screen_missing_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        tttt_log::SqliteLogger::new(&db_path).unwrap();
+        let mut handler = ReplayToolHandler::new(db_path);
+        let result = handler.handle_tool_call("tttt_replay_get_screen", &json!({}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_replay_get_screen_unknown_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        tttt_log::SqliteLogger::new(&db_path).unwrap();
+        let mut handler = ReplayToolHandler::new(db_path);
+        let result = handler.handle_tool_call("tttt_replay_get_screen", &json!({"session_id": "nope"}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_replay_get_timeline() {
+        let (mut handler, _dir) = make_replay_db();
+        let result = handler
+            .handle_tool_call("tttt_replay_get_timeline", &json!({"session_id": "s1"}))
+            .unwrap();
+        let timeline = result["timeline"].as_array().unwrap();
+        assert_eq!(timeline.len(), 3);
+        assert_eq!(timeline[0]["index"], 0);
+        assert_eq!(timeline[0]["timestamp_ms"], 100u64);
+        assert_eq!(timeline[0]["direction"], "output");
+        assert_eq!(timeline[2]["direction"], "input");
+    }
+
+    #[test]
+    fn test_replay_get_timeline_missing_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        tttt_log::SqliteLogger::new(&db_path).unwrap();
+        let mut handler = ReplayToolHandler::new(db_path);
+        let result = handler.handle_tool_call("tttt_replay_get_timeline", &json!({}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_replay_tool_definitions_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = ReplayToolHandler::new(dir.path().join("x.db"));
+        let defs = handler.tool_definitions();
+        assert_eq!(defs.len(), 3);
+    }
+
+    #[test]
+    fn test_replay_tool_definitions_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = ReplayToolHandler::new(dir.path().join("x.db"));
+        let defs = handler.tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"tttt_replay_list_sessions"));
+        assert!(names.contains(&"tttt_replay_get_screen"));
+        assert!(names.contains(&"tttt_replay_get_timeline"));
+    }
+
+    #[test]
+    fn test_replay_unknown_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut handler = ReplayToolHandler::new(dir.path().join("x.db"));
+        let result = handler.handle_tool_call("nonexistent_tool", &json!({}));
+        assert!(matches!(result.unwrap_err(), McpError::ToolNotFound(_)));
+    }
+
+    #[test]
+    fn test_pty_launch_mock_with_sqlite_logger() {
+        let logger = Arc::new(Mutex::new(tttt_log::SqliteLogger::in_memory().unwrap()));
+        let handler = PtyToolHandler::new_owned(SessionManager::new(), std::path::PathBuf::from("/tmp"))
+            .with_sqlite_logger(Some(Arc::clone(&logger)));
+        let result = handler.handle_pty_launch_mock(&json!({"command": "sh"})).unwrap();
+        assert!(result["session_id"].is_string());
+        let sessions = logger.lock().unwrap().list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].command, "sh");
+    }
+
+    #[test]
+    fn test_pty_launch_mock_without_sqlite_logger() {
+        // Without sqlite_logger, launch should still succeed
+        let handler = make_handler();
+        let result = handler.handle_pty_launch_mock(&json!({})).unwrap();
+        assert!(result["session_id"].is_string());
     }
 
 }
