@@ -6,9 +6,28 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Check whether a named column exists in a table.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    let sql = format!("PRAGMA table_info({})", table);
+    conn.prepare(&sql)
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .ok()
+                .map(|iter| iter.filter_map(|r| r.ok()).any(|n| n == column))
+        })
+        .unwrap_or(false)
+}
+
 /// Logs events to a SQLite database with timestamped chunks.
 pub struct SqliteLogger {
     conn: Connection,
+    /// PID of the current process. None for read-only connections.
+    pid: Option<u32>,
+    /// Whether the events table has a pid column (migration applied).
+    events_has_pid: bool,
+    /// Whether the sessions table has a pid column (migration applied).
+    sessions_has_pid: bool,
 }
 
 impl SqliteLogger {
@@ -35,7 +54,19 @@ impl SqliteLogger {
                 name TEXT
             );",
         )?;
-        Ok(Self { conn })
+        // Schema migrations: add pid column if absent.
+        if !column_exists(&conn, "events", "pid") {
+            let _ = conn.execute("ALTER TABLE events ADD COLUMN pid INTEGER", []);
+        }
+        if !column_exists(&conn, "sessions", "pid") {
+            let _ = conn.execute("ALTER TABLE sessions ADD COLUMN pid INTEGER", []);
+        }
+        Ok(Self {
+            conn,
+            pid: Some(std::process::id()),
+            events_has_pid: true,
+            sessions_has_pid: true,
+        })
     }
 
     /// Create an in-memory SQLite logger (for testing).
@@ -47,7 +78,8 @@ impl SqliteLogger {
                 session_id TEXT NOT NULL,
                 timestamp_ms INTEGER NOT NULL,
                 direction TEXT NOT NULL,
-                data BLOB NOT NULL
+                data BLOB NOT NULL,
+                pid INTEGER
             );
             CREATE INDEX idx_events_session
                 ON events(session_id, timestamp_ms);
@@ -58,10 +90,16 @@ impl SqliteLogger {
                 rows INTEGER NOT NULL,
                 started_at_ms INTEGER NOT NULL,
                 ended_at_ms INTEGER,
-                name TEXT
+                name TEXT,
+                pid INTEGER
             );",
         )?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            pid: Some(std::process::id()),
+            events_has_pid: true,
+            sessions_has_pid: true,
+        })
     }
 
     /// Open a read-only connection to an existing SQLite database (for replay).
@@ -70,35 +108,65 @@ impl SqliteLogger {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        Ok(Self { conn })
+        let events_has_pid = column_exists(&conn, "events", "pid");
+        let sessions_has_pid = column_exists(&conn, "sessions", "pid");
+        Ok(Self {
+            conn,
+            pid: None,
+            events_has_pid,
+            sessions_has_pid,
+        })
     }
 
     /// Query events for a session, ordered by timestamp.
     pub fn query_events(&self, session_id: &str) -> Result<Vec<LogEvent>> {
+        self.query_events_with_pid(session_id, None)
+    }
+
+    /// Query events for a session filtered by optional PID, ordered by timestamp.
+    /// If pid is None, returns all events for the session_id (legacy behaviour).
+    pub fn query_events_with_pid(
+        &self,
+        session_id: &str,
+        pid: Option<u32>,
+    ) -> Result<Vec<LogEvent>> {
+        if let Some(p) = pid {
+            if self.events_has_pid {
+                let mut stmt = self.conn.prepare(
+                    "SELECT session_id, timestamp_ms, direction, data FROM events
+                     WHERE session_id = ?1 AND pid = ?2 ORDER BY timestamp_ms",
+                )?;
+                let events = stmt.query_map(rusqlite::params![session_id, p], Self::map_event_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                return Ok(events);
+            }
+            // pid column absent – fall through to unfiltered query
+        }
         let mut stmt = self.conn.prepare(
             "SELECT session_id, timestamp_ms, direction, data FROM events
              WHERE session_id = ?1 ORDER BY timestamp_ms",
         )?;
-        let events = stmt
-            .query_map([session_id], |row| {
-                let session_id: String = row.get(0)?;
-                let timestamp_ms: u64 = row.get(1)?;
-                let direction_str: String = row.get(2)?;
-                let data: Vec<u8> = row.get(3)?;
-                let direction = match direction_str.as_str() {
-                    "input" => crate::event::Direction::Input,
-                    "output" => crate::event::Direction::Output,
-                    _ => crate::event::Direction::Meta,
-                };
-                Ok(LogEvent {
-                    timestamp_ms,
-                    session_id,
-                    direction,
-                    data,
-                })
-            })?
+        let events = stmt.query_map([session_id], Self::map_event_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(events)
+    }
+
+    fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogEvent> {
+        let session_id: String = row.get(0)?;
+        let timestamp_ms: u64 = row.get(1)?;
+        let direction_str: String = row.get(2)?;
+        let data: Vec<u8> = row.get(3)?;
+        let direction = match direction_str.as_str() {
+            "input" => crate::event::Direction::Input,
+            "output" => crate::event::Direction::Output,
+            _ => crate::event::Direction::Meta,
+        };
+        Ok(LogEvent {
+            timestamp_ms,
+            session_id,
+            direction,
+            data,
+        })
     }
 
     /// Count total events in the database.
@@ -123,9 +191,9 @@ impl SqliteLogger {
             .unwrap_or_default()
             .as_millis() as u64;
         self.conn.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, command, cols, rows, started_at_ms, ended_at_ms, name)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
-            rusqlite::params![session_id, command, cols, rows, started_at_ms, name],
+            "INSERT OR REPLACE INTO sessions (session_id, command, cols, rows, started_at_ms, ended_at_ms, name, pid)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
+            rusqlite::params![session_id, command, cols, rows, started_at_ms, name, self.pid],
         )?;
         Ok(())
     }
@@ -160,54 +228,123 @@ impl SqliteLogger {
         if !self.has_sessions_table() {
             return Ok(Vec::new());
         }
-        let mut stmt = self.conn.prepare(
-            "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name
-             FROM sessions ORDER BY started_at_ms",
-        )?;
-        let sessions = stmt
-            .query_map([], |row| {
-                Ok(SessionInfo {
-                    session_id: row.get(0)?,
-                    command: row.get(1)?,
-                    cols: row.get::<_, u16>(2)?,
-                    rows: row.get::<_, u16>(3)?,
-                    started_at_ms: row.get(4)?,
-                    ended_at_ms: row.get(5)?,
-                    name: row.get(6)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(sessions)
+        if self.sessions_has_pid {
+            let mut stmt = self.conn.prepare(
+                "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name, pid
+                 FROM sessions ORDER BY started_at_ms",
+            )?;
+            let sessions = stmt
+                .query_map([], |row| {
+                    Ok(SessionInfo {
+                        session_id: row.get(0)?,
+                        command: row.get(1)?,
+                        cols: row.get::<_, u16>(2)?,
+                        rows: row.get::<_, u16>(3)?,
+                        started_at_ms: row.get(4)?,
+                        ended_at_ms: row.get(5)?,
+                        name: row.get(6)?,
+                        pid: row.get(7)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(sessions)
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name
+                 FROM sessions ORDER BY started_at_ms",
+            )?;
+            let sessions = stmt
+                .query_map([], |row| {
+                    Ok(SessionInfo {
+                        session_id: row.get(0)?,
+                        command: row.get(1)?,
+                        cols: row.get::<_, u16>(2)?,
+                        rows: row.get::<_, u16>(3)?,
+                        started_at_ms: row.get(4)?,
+                        ended_at_ms: row.get(5)?,
+                        name: row.get(6)?,
+                        pid: None,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(sessions)
+        }
     }
 
-    /// List session IDs that have events but no entry in the sessions table.
-    /// If the sessions table does not exist, returns ALL distinct session IDs from events.
-    pub fn list_orphan_session_ids(&self) -> Result<Vec<String>> {
-        let sql = if self.has_sessions_table() {
-            "SELECT DISTINCT session_id FROM events
-             WHERE session_id NOT IN (SELECT session_id FROM sessions)
-             ORDER BY session_id"
+    /// List (session_id, pid) pairs that have events but no entry in the sessions table.
+    /// If the sessions table does not exist, returns ALL distinct (session_id, pid) pairs from events.
+    /// Different PIDs with the same session_id appear as separate entries.
+    pub fn list_orphan_session_ids(&self) -> Result<Vec<(String, Option<u32>)>> {
+        if self.events_has_pid {
+            let sql = if self.has_sessions_table() {
+                "SELECT session_id, pid FROM events
+                 WHERE session_id NOT IN (SELECT session_id FROM sessions)
+                 GROUP BY session_id, pid
+                 ORDER BY session_id, pid"
+            } else {
+                "SELECT session_id, pid FROM events
+                 GROUP BY session_id, pid
+                 ORDER BY session_id, pid"
+            };
+            let mut stmt = self.conn.prepare(sql)?;
+            let pairs = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<u32>>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(pairs)
         } else {
-            "SELECT DISTINCT session_id FROM events ORDER BY session_id"
-        };
-        let mut stmt = self.conn.prepare(sql)?;
-        let ids = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(ids)
+            // Legacy DB without pid column – return session_id with None pid
+            let sql = if self.has_sessions_table() {
+                "SELECT DISTINCT session_id FROM events
+                 WHERE session_id NOT IN (SELECT session_id FROM sessions)
+                 ORDER BY session_id"
+            } else {
+                "SELECT DISTINCT session_id FROM events ORDER BY session_id"
+            };
+            let mut stmt = self.conn.prepare(sql)?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(ids.into_iter().map(|id| (id, None)).collect())
+        }
     }
 
     /// Build a synthetic SessionInfo for an orphan session from its events.
-    /// Returns None if the session has no events.
-    pub fn infer_session_info(&self, session_id: &str) -> Result<Option<SessionInfo>> {
-        let row: Option<(u64, u64)> = self
-            .conn
-            .query_row(
-                "SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM events WHERE session_id = ?1",
-                [session_id],
-                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
-            )
-            .ok();
+    /// Returns None if the session has no events matching the given pid filter.
+    /// Pass pid=None to match all events (legacy behaviour).
+    pub fn infer_session_info(
+        &self,
+        session_id: &str,
+        pid: Option<u32>,
+    ) -> Result<Option<SessionInfo>> {
+        let row: Option<(u64, u64)> = if let Some(p) = pid {
+            if self.events_has_pid {
+                self.conn
+                    .query_row(
+                        "SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM events WHERE session_id = ?1 AND pid = ?2",
+                        rusqlite::params![session_id, p],
+                        |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+                    )
+                    .ok()
+            } else {
+                self.conn
+                    .query_row(
+                        "SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM events WHERE session_id = ?1",
+                        [session_id],
+                        |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+                    )
+                    .ok()
+            }
+        } else {
+            self.conn
+                .query_row(
+                    "SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM events WHERE session_id = ?1",
+                    [session_id],
+                    |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+                )
+                .ok()
+        };
         match row {
             None => Ok(None),
             Some((min_ts, max_ts)) => Ok(Some(SessionInfo {
@@ -218,6 +355,7 @@ impl SqliteLogger {
                 started_at_ms: min_ts,
                 ended_at_ms: Some(max_ts),
                 name: None,
+                pid,
             })),
         }
     }
@@ -228,41 +366,80 @@ impl SqliteLogger {
         if !self.has_sessions_table() {
             return Ok(None);
         }
-        let mut stmt = self.conn.prepare(
-            "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name
-             FROM sessions WHERE session_id = ?1",
-        )?;
-        let mut rows = stmt.query_map([session_id], |row| {
-            Ok(SessionInfo {
-                session_id: row.get(0)?,
-                command: row.get(1)?,
-                cols: row.get::<_, u16>(2)?,
-                rows: row.get::<_, u16>(3)?,
-                started_at_ms: row.get(4)?,
-                ended_at_ms: row.get(5)?,
-                name: row.get(6)?,
-            })
-        })?;
-        match rows.next() {
-            Some(Ok(info)) => Ok(Some(info)),
-            Some(Err(e)) => Err(e.into()),
-            None => Ok(None),
+        if self.sessions_has_pid {
+            let mut stmt = self.conn.prepare(
+                "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name, pid
+                 FROM sessions WHERE session_id = ?1",
+            )?;
+            let mut rows = stmt.query_map([session_id], |row| {
+                Ok(SessionInfo {
+                    session_id: row.get(0)?,
+                    command: row.get(1)?,
+                    cols: row.get::<_, u16>(2)?,
+                    rows: row.get::<_, u16>(3)?,
+                    started_at_ms: row.get(4)?,
+                    ended_at_ms: row.get(5)?,
+                    name: row.get(6)?,
+                    pid: row.get(7)?,
+                })
+            })?;
+            match rows.next() {
+                Some(Ok(info)) => Ok(Some(info)),
+                Some(Err(e)) => Err(e.into()),
+                None => Ok(None),
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name
+                 FROM sessions WHERE session_id = ?1",
+            )?;
+            let mut rows = stmt.query_map([session_id], |row| {
+                Ok(SessionInfo {
+                    session_id: row.get(0)?,
+                    command: row.get(1)?,
+                    cols: row.get::<_, u16>(2)?,
+                    rows: row.get::<_, u16>(3)?,
+                    started_at_ms: row.get(4)?,
+                    ended_at_ms: row.get(5)?,
+                    name: row.get(6)?,
+                    pid: None,
+                })
+            })?;
+            match rows.next() {
+                Some(Ok(info)) => Ok(Some(info)),
+                Some(Err(e)) => Err(e.into()),
+                None => Ok(None),
+            }
         }
     }
 }
 
 impl LogSink for SqliteLogger {
     fn log_event(&mut self, event: &LogEvent) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO events (session_id, timestamp_ms, direction, data)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                event.session_id,
-                event.timestamp_ms,
-                event.direction.as_str(),
-                event.data,
-            ],
-        )?;
+        if self.events_has_pid {
+            self.conn.execute(
+                "INSERT INTO events (session_id, timestamp_ms, direction, data, pid)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    event.session_id,
+                    event.timestamp_ms,
+                    event.direction.as_str(),
+                    event.data,
+                    self.pid,
+                ],
+            )?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO events (session_id, timestamp_ms, direction, data)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    event.session_id,
+                    event.timestamp_ms,
+                    event.direction.as_str(),
+                    event.data,
+                ],
+            )?;
+        }
         Ok(())
     }
 
@@ -405,6 +582,8 @@ mod tests {
         assert!(info.started_at_ms > 0);
         assert!(info.ended_at_ms.is_none());
         assert!(info.name.is_none());
+        // pid should be Some (current process)
+        assert!(info.pid.is_some());
     }
 
     #[test]
@@ -503,7 +682,7 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    // --- Legacy DB helper (events table only, no sessions table) ---
+    // --- Legacy DB helper (events table only, no sessions table, no pid column) ---
 
     fn legacy_in_memory() -> SqliteLogger {
         let conn = Connection::open_in_memory().unwrap();
@@ -518,7 +697,7 @@ mod tests {
             CREATE INDEX idx_events_session ON events(session_id, timestamp_ms);",
         )
         .unwrap();
-        SqliteLogger { conn }
+        SqliteLogger { conn, pid: None, events_has_pid: false, sessions_has_pid: false }
     }
 
     // --- has_sessions_table tests ---
@@ -558,8 +737,11 @@ mod tests {
         logger.log_event(&LogEvent::with_timestamp(2, "s2".to_string(), Direction::Output, b"b".to_vec())).unwrap();
         let orphans = logger.list_orphan_session_ids().unwrap();
         assert_eq!(orphans.len(), 2);
-        assert!(orphans.contains(&"s1".to_string()));
-        assert!(orphans.contains(&"s2".to_string()));
+        let ids: Vec<&str> = orphans.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"s1"));
+        assert!(ids.contains(&"s2"));
+        // Legacy DB has no pid column, so pids should all be None
+        assert!(orphans.iter().all(|(_, p)| p.is_none()));
     }
 
     #[test]
@@ -573,7 +755,7 @@ mod tests {
     fn test_infer_session_info_legacy_db() {
         let mut logger = legacy_in_memory();
         logger.log_event(&LogEvent::with_timestamp(1000, "orphan".to_string(), Direction::Output, b"hi".to_vec())).unwrap();
-        let info = logger.infer_session_info("orphan").unwrap().unwrap();
+        let info = logger.infer_session_info("orphan", None).unwrap().unwrap();
         assert_eq!(info.session_id, "orphan");
         assert_eq!(info.command, "unknown");
         assert_eq!(info.started_at_ms, 1000);
@@ -607,7 +789,9 @@ mod tests {
         let info = ro.get_session_info("s1").unwrap();
         assert!(info.is_none());
         let orphans = ro.list_orphan_session_ids().unwrap();
-        assert_eq!(orphans, vec!["s1".to_string()]);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].0, "s1");
+        assert_eq!(orphans[0].1, None);
     }
 
     // --- Orphan session tests ---
@@ -629,7 +813,10 @@ mod tests {
         logger.log_event(&LogEvent::with_timestamp(1000, "s1".to_string(), Direction::Output, b"hello".to_vec())).unwrap();
         logger.log_event(&LogEvent::with_timestamp(2000, "s1".to_string(), Direction::Output, b" world".to_vec())).unwrap();
         let orphans = logger.list_orphan_session_ids().unwrap();
-        assert_eq!(orphans, vec!["s1"]);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].0, "s1");
+        // pid should be Some (current process wrote these events)
+        assert!(orphans[0].1.is_some());
     }
 
     #[test]
@@ -643,8 +830,9 @@ mod tests {
         logger.log_event(&LogEvent::with_timestamp(20, "orphan-b".to_string(), Direction::Output, b"b".to_vec())).unwrap();
         let orphans = logger.list_orphan_session_ids().unwrap();
         assert_eq!(orphans.len(), 2);
-        assert!(orphans.contains(&"orphan-a".to_string()));
-        assert!(orphans.contains(&"orphan-b".to_string()));
+        let ids: Vec<&str> = orphans.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"orphan-a"));
+        assert!(ids.contains(&"orphan-b"));
     }
 
     #[test]
@@ -657,7 +845,7 @@ mod tests {
     #[test]
     fn test_infer_session_info_no_events() {
         let logger = SqliteLogger::in_memory().unwrap();
-        let info = logger.infer_session_info("nonexistent").unwrap();
+        let info = logger.infer_session_info("nonexistent", None).unwrap();
         assert!(info.is_none());
     }
 
@@ -667,7 +855,7 @@ mod tests {
         logger.log_event(&LogEvent::with_timestamp(1000, "orphan".to_string(), Direction::Output, b"hello".to_vec())).unwrap();
         logger.log_event(&LogEvent::with_timestamp(3000, "orphan".to_string(), Direction::Output, b"bye".to_vec())).unwrap();
 
-        let info = logger.infer_session_info("orphan").unwrap().unwrap();
+        let info = logger.infer_session_info("orphan", None).unwrap().unwrap();
         assert_eq!(info.session_id, "orphan");
         assert_eq!(info.command, "unknown");
         assert_eq!(info.cols, 80);
@@ -682,7 +870,7 @@ mod tests {
         let mut logger = SqliteLogger::in_memory().unwrap();
         logger.log_event(&LogEvent::with_timestamp(5000, "solo".to_string(), Direction::Input, b"x".to_vec())).unwrap();
 
-        let info = logger.infer_session_info("solo").unwrap().unwrap();
+        let info = logger.infer_session_info("solo", None).unwrap().unwrap();
         assert_eq!(info.started_at_ms, 5000);
         assert_eq!(info.ended_at_ms, Some(5000));
     }
@@ -698,5 +886,136 @@ mod tests {
         }
         let count = logger.lock().unwrap().event_count().unwrap();
         assert_eq!(count, 5);
+    }
+
+    // --- PID deduplication tests ---
+
+    #[test]
+    fn test_pid_stored_in_events() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        let pid = logger.pid.unwrap();
+        logger.log_event(&LogEvent::with_timestamp(1, "s1".to_string(), Direction::Output, b"x".to_vec())).unwrap();
+
+        // Query the raw pid stored in the event
+        let stored_pid: Option<u32> = logger.conn.query_row(
+            "SELECT pid FROM events WHERE session_id = 's1'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(stored_pid, Some(pid));
+    }
+
+    #[test]
+    fn test_pid_stored_in_sessions() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        let pid = logger.pid.unwrap();
+        logger.log_session_start("s1", "bash", 80, 24, None).unwrap();
+
+        let info = logger.get_session_info("s1").unwrap().unwrap();
+        assert_eq!(info.pid, Some(pid));
+    }
+
+    #[test]
+    fn test_query_events_with_pid_filters_by_pid() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        let current_pid = logger.pid.unwrap();
+
+        // Inject events as if from a different pid
+        let other_pid: u32 = current_pid.wrapping_add(1);
+        logger.conn.execute(
+            "INSERT INTO events (session_id, timestamp_ms, direction, data, pid) VALUES ('s1', 100, 'output', X'61', ?1)",
+            [other_pid],
+        ).unwrap();
+        // Write a real event from current pid
+        logger.log_event(&LogEvent::with_timestamp(200, "s1".to_string(), Direction::Output, b"b".to_vec())).unwrap();
+
+        // query_events returns all
+        assert_eq!(logger.query_events("s1").unwrap().len(), 2);
+        // query_events_with_pid(current) returns only 1
+        assert_eq!(logger.query_events_with_pid("s1", Some(current_pid)).unwrap().len(), 1);
+        // query_events_with_pid(other) returns only 1
+        assert_eq!(logger.query_events_with_pid("s1", Some(other_pid)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_orphan_dedup_across_pids() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        let current_pid = logger.pid.unwrap();
+        let other_pid: u32 = current_pid.wrapping_add(999);
+
+        // Two runs both use session_id "pty-1"
+        logger.log_event(&LogEvent::with_timestamp(100, "pty-1".to_string(), Direction::Output, b"run1".to_vec())).unwrap();
+        logger.conn.execute(
+            "INSERT INTO events (session_id, timestamp_ms, direction, data, pid) VALUES ('pty-1', 200, 'output', X'72756e32', ?1)",
+            [other_pid],
+        ).unwrap();
+
+        let orphans = logger.list_orphan_session_ids().unwrap();
+        // Should see two separate entries for the same session_id but different pids
+        assert_eq!(orphans.len(), 2);
+        assert!(orphans.iter().all(|(id, _)| id == "pty-1"));
+        let pids: Vec<Option<u32>> = orphans.iter().map(|(_, p)| *p).collect();
+        assert!(pids.contains(&Some(current_pid)));
+        assert!(pids.contains(&Some(other_pid)));
+    }
+
+    #[test]
+    fn test_infer_session_info_filters_by_pid() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        let current_pid = logger.pid.unwrap();
+        let other_pid: u32 = current_pid.wrapping_add(999);
+
+        logger.log_event(&LogEvent::with_timestamp(1000, "pty-1".to_string(), Direction::Output, b"run1".to_vec())).unwrap();
+        logger.conn.execute(
+            "INSERT INTO events (session_id, timestamp_ms, direction, data, pid) VALUES ('pty-1', 5000, 'output', X'72756e32', ?1)",
+            [other_pid],
+        ).unwrap();
+
+        let info_current = logger.infer_session_info("pty-1", Some(current_pid)).unwrap().unwrap();
+        assert_eq!(info_current.started_at_ms, 1000);
+        assert_eq!(info_current.ended_at_ms, Some(1000));
+
+        let info_other = logger.infer_session_info("pty-1", Some(other_pid)).unwrap().unwrap();
+        assert_eq!(info_other.started_at_ms, 5000);
+        assert_eq!(info_other.ended_at_ms, Some(5000));
+    }
+
+    #[test]
+    fn test_migration_adds_pid_column_to_existing_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre_pid.db");
+        // Create DB without pid column (simulates old schema)
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    direction TEXT NOT NULL,
+                    data BLOB NOT NULL
+                );
+                CREATE TABLE sessions (
+                    session_id TEXT PRIMARY KEY,
+                    command TEXT NOT NULL,
+                    cols INTEGER NOT NULL,
+                    rows INTEGER NOT NULL,
+                    started_at_ms INTEGER NOT NULL,
+                    ended_at_ms INTEGER,
+                    name TEXT
+                );",
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO events (session_id, timestamp_ms, direction, data) VALUES ('s1', 1, 'output', X'61')",
+                [],
+            ).unwrap();
+        }
+        // Open with SqliteLogger::new — should run migration
+        let logger = SqliteLogger::new(&path).unwrap();
+        assert!(logger.events_has_pid);
+        assert!(logger.sessions_has_pid);
+        // Old event should be queryable; its pid column is NULL
+        let events = logger.query_events("s1").unwrap();
+        assert_eq!(events.len(), 1);
     }
 }

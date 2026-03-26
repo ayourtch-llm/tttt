@@ -11,6 +11,8 @@ pub struct SessionInfo {
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
     pub name: Option<String>,
+    /// PID of the process that created this session. None for legacy data.
+    pub pid: Option<u32>,
 }
 
 /// Direction of terminal I/O.
@@ -226,6 +228,7 @@ mod tests {
             started_at_ms: 1000,
             ended_at_ms: Some(2000),
             name: Some("my session".to_string()),
+            pid: None,
         };
         assert_eq!(info.session_id, "abc");
         assert_eq!(info.cols, 80);
@@ -244,6 +247,7 @@ mod tests {
             started_at_ms: 500,
             ended_at_ms: None,
             name: None,
+            pid: None,
         };
         assert!(info.ended_at_ms.is_none());
         assert!(info.name.is_none());
@@ -259,6 +263,7 @@ mod tests {
             started_at_ms: 9999,
             ended_at_ms: None,
             name: Some("test".to_string()),
+            pid: Some(12345),
         };
         let json = serde_json::to_string(&info).unwrap();
         let parsed: SessionInfo = serde_json::from_str(&json).unwrap();
@@ -267,5 +272,6 @@ mod tests {
         assert_eq!(parsed.rows, info.rows);
         assert_eq!(parsed.started_at_ms, info.started_at_ms);
         assert_eq!(parsed.name, info.name);
+        assert_eq!(parsed.pid, info.pid);
     }
 }

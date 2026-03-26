@@ -45,11 +45,12 @@ pub fn run_replay(db_path: &Path, session_id: Option<&str>) -> Result<()> {
 }
 
 /// Get session info from the sessions table, falling back to inferred info for orphans.
-fn resolve_session_info(db: &SqliteLogger, session_id: &str) -> Result<Option<SessionInfo>> {
+/// `pid` is used to filter events when inferring info for orphan sessions.
+fn resolve_session_info(db: &SqliteLogger, session_id: &str, pid: Option<u32>) -> Result<Option<SessionInfo>> {
     if let Some(info) = db.get_session_info(session_id)? {
         return Ok(Some(info));
     }
-    Ok(db.infer_session_info(session_id)?)
+    Ok(db.infer_session_info(session_id, pid)?)
 }
 
 /// Build the full session list: registered sessions + orphan sessions inferred from events.
@@ -58,13 +59,13 @@ fn build_session_list(db: &SqliteLogger) -> Result<Vec<SessionListEntry>> {
     let mut sessions = Vec::new();
 
     for info in db.list_sessions()? {
-        let event_count = db.query_events(&info.session_id).map(|e| e.len()).unwrap_or(0);
+        let event_count = db.query_events_with_pid(&info.session_id, info.pid).map(|e| e.len()).unwrap_or(0);
         sessions.push(SessionListEntry { info, event_count });
     }
 
-    for orphan_id in db.list_orphan_session_ids()? {
-        if let Some(info) = db.infer_session_info(&orphan_id)? {
-            let event_count = db.query_events(&orphan_id).map(|e| e.len()).unwrap_or(0);
+    for (orphan_id, pid) in db.list_orphan_session_ids()? {
+        if let Some(info) = db.infer_session_info(&orphan_id, pid)? {
+            let event_count = db.query_events_with_pid(&orphan_id, pid).map(|e| e.len()).unwrap_or(0);
             sessions.push(SessionListEntry { info, event_count });
         }
     }
@@ -143,9 +144,9 @@ impl ReplayApp {
         initial_session: Option<&str>,
     ) -> Result<Self> {
         let view = if let Some(id) = initial_session {
-            let info = resolve_session_info(&db, id)?
+            let info = resolve_session_info(&db, id, None)?
                 .ok_or_else(|| format!("Session not found: {}", id))?;
-            let events = db.query_events(id)?;
+            let events = db.query_events_with_pid(id, info.pid)?;
             let base_timestamp = events.first().map(|e| e.timestamp_ms).unwrap_or(0);
             let replay = SessionReplay::new(events, info.cols, info.rows);
             View::Replay(ReplayViewState {
@@ -197,10 +198,10 @@ impl ReplayApp {
         }
     }
 
-    fn open_session(&mut self, session_id: &str) -> Result<()> {
-        let info = resolve_session_info(&self.db, session_id)?
+    fn open_session(&mut self, session_id: &str, pid: Option<u32>) -> Result<()> {
+        let info = resolve_session_info(&self.db, session_id, pid)?
             .ok_or_else(|| format!("Session not found: {}", session_id))?;
-        let events = self.db.query_events(session_id)?;
+        let events = self.db.query_events_with_pid(session_id, info.pid)?;
         let base_timestamp = events.first().map(|e| e.timestamp_ms).unwrap_or(0);
         let replay = SessionReplay::new(events, info.cols, info.rows);
         self.view = View::Replay(ReplayViewState {
@@ -234,7 +235,8 @@ impl ReplayApp {
                     if let Some(i) = state.table_state.selected() {
                         if i < self.sessions.len() {
                             let session_id = self.sessions[i].info.session_id.clone();
-                            self.open_session(&session_id)?;
+                            let pid = self.sessions[i].info.pid;
+                            self.open_session(&session_id, pid)?;
                         }
                     }
                 }
@@ -355,8 +357,10 @@ fn render_session_list(
             let size = format!("{}x{}", s.info.cols, s.info.rows);
             let name = s.info.name.as_deref().unwrap_or("-").to_string();
             let short_id = s.info.session_id.get(..8).unwrap_or(&s.info.session_id).to_string();
+            let pid = s.info.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".to_string());
             Row::new(vec![
                 RCell::from(short_id),
+                RCell::from(pid),
                 RCell::from(name),
                 RCell::from(s.info.command.clone()),
                 RCell::from(size),
@@ -369,6 +373,7 @@ fn render_session_list(
 
     let widths = [
         Constraint::Length(10),
+        Constraint::Length(8),
         Constraint::Length(12),
         Constraint::Min(15),
         Constraint::Length(8),
@@ -379,6 +384,7 @@ fn render_session_list(
 
     let header = Row::new(vec![
         RCell::from("ID"),
+        RCell::from("PID"),
         RCell::from("Name"),
         RCell::from("Command"),
         RCell::from("Size"),
@@ -725,6 +731,7 @@ mod tests {
             started_at_ms: 1000,
             ended_at_ms: Some(2000),
             name: None,
+            pid: None,
         };
         let entry = SessionListEntry {
             info,
@@ -941,7 +948,7 @@ mod tests {
     fn test_resolve_session_info_registered() {
         let mut db = SqliteLogger::in_memory().unwrap();
         db.log_session_start("s1", "zsh", 120, 40, None).unwrap();
-        let info = resolve_session_info(&db, "s1").unwrap().unwrap();
+        let info = resolve_session_info(&db, "s1", None).unwrap().unwrap();
         assert_eq!(info.command, "zsh");
         assert_eq!(info.cols, 120);
     }
@@ -953,7 +960,7 @@ mod tests {
             use tttt_log::LogSink;
             db.log_event(&LogEvent::with_timestamp(2000, "orphan".to_string(), Direction::Output, b"data".to_vec())).unwrap();
         }
-        let info = resolve_session_info(&db, "orphan").unwrap().unwrap();
+        let info = resolve_session_info(&db, "orphan", None).unwrap().unwrap();
         assert_eq!(info.command, "unknown");
         assert_eq!(info.cols, 80);
         assert_eq!(info.started_at_ms, 2000);
@@ -962,7 +969,7 @@ mod tests {
     #[test]
     fn test_resolve_session_info_missing() {
         let db = SqliteLogger::in_memory().unwrap();
-        let info = resolve_session_info(&db, "nope").unwrap();
+        let info = resolve_session_info(&db, "nope", None).unwrap();
         assert!(info.is_none());
     }
 
