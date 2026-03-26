@@ -102,6 +102,36 @@ fn write_all(fd: i32, data: &[u8]) -> nix::Result<()> {
     Ok(())
 }
 
+/// Maps a raw prefix-key byte to its human-readable name.
+fn prefix_key_name(key: u8) -> String {
+    match key {
+        0x1c => "Ctrl+\\".to_string(),
+        0x01 => "Ctrl+A".to_string(),
+        0x02 => "Ctrl+B".to_string(),
+        b    => format!("0x{:02x}", b),
+    }
+}
+
+/// Builds the full help-screen string (with terminal escape sequences).
+fn format_help_screen(prefix_name: &str) -> String {
+    format!(
+        "{}{}\x1b[1mtttt help\x1b[0m  (prefix: {})\
+        {}  0-9  Switch to terminal N\
+        {}  n    Next terminal\
+        {}  p    Previous terminal\
+        {}  d    Detach/quit\
+        {}  r    Live reload (execv)\
+        {}  ?    This help\
+        {}  {p}{p}  Send literal prefix\
+        {}Press any key to dismiss...",
+        clear_screen(), cursor_goto(2, 4), prefix_name,
+        cursor_goto(4, 4), cursor_goto(5, 4), cursor_goto(6, 4),
+        cursor_goto(7, 4), cursor_goto(8, 4),
+        cursor_goto(9, 4), cursor_goto(11, 4),
+        cursor_goto(13, 4), p = prefix_name,
+    )
+}
+
 /// Main application state.
 pub struct App {
     config: Config,
@@ -916,28 +946,8 @@ impl App {
     }
 
     fn show_help(&mut self, stdout_fd: i32) -> Result<(), Box<dyn std::error::Error>> {
-        let prefix_name = match self.config.prefix_key {
-            0x1c => "Ctrl+\\".to_string(),
-            0x01 => "Ctrl+A".to_string(),
-            0x02 => "Ctrl+B".to_string(),
-            b => format!("0x{:02x}", b),
-        };
-        let help = format!(
-            "{}{}\x1b[1mtttt help\x1b[0m  (prefix: {})\
-            {}  0-9  Switch to terminal N\
-            {}  n    Next terminal\
-            {}  p    Previous terminal\
-            {}  d    Detach/quit\
-            {}  r    Live reload (execv)\
-            {}  ?    This help\
-            {}  {p}{p}  Send literal prefix\
-            {}Press any key to dismiss...",
-            clear_screen(), cursor_goto(2, 4), prefix_name,
-            cursor_goto(4, 4), cursor_goto(5, 4), cursor_goto(6, 4),
-            cursor_goto(7, 4), cursor_goto(8, 4),
-            cursor_goto(9, 4), cursor_goto(11, 4),
-            cursor_goto(13, 4), p = prefix_name,
-        );
+        let prefix_name = prefix_key_name(self.config.prefix_key);
+        let help = format_help_screen(&prefix_name);
         write_all(stdout_fd, help.as_bytes())?;
         let stdin_fd = std::io::stdin().as_raw_fd();
         let mut buf = [0u8; 64];
@@ -1363,5 +1373,59 @@ impl App {
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Chunk 1: prefix_key_name / format_help_screen ────────────────────────
+
+    #[test]
+    fn test_prefix_key_name_ctrl_backslash() {
+        assert_eq!(prefix_key_name(0x1c), "Ctrl+\\");
+    }
+
+    #[test]
+    fn test_prefix_key_name_ctrl_a() {
+        assert_eq!(prefix_key_name(0x01), "Ctrl+A");
+    }
+
+    #[test]
+    fn test_prefix_key_name_ctrl_b() {
+        assert_eq!(prefix_key_name(0x02), "Ctrl+B");
+    }
+
+    #[test]
+    fn test_prefix_key_name_unknown_key() {
+        assert_eq!(prefix_key_name(0x05), "0x05");
+        assert_eq!(prefix_key_name(0xff), "0xff");
+    }
+
+    #[test]
+    fn test_format_help_screen_contains_prefix() {
+        let help = format_help_screen("Ctrl+A");
+        assert!(help.contains("Ctrl+A"), "help screen should contain the prefix name");
+    }
+
+    #[test]
+    fn test_format_help_screen_contains_keybindings() {
+        let help = format_help_screen("Ctrl+\\");
+        assert!(help.contains("Switch to terminal"), "should mention switching");
+        assert!(help.contains("Next terminal"), "should mention next");
+        assert!(help.contains("Previous terminal"), "should mention prev");
+        assert!(help.contains("Detach/quit"), "should mention detach");
+        assert!(help.contains("Live reload"), "should mention reload");
+        assert!(help.contains("This help"), "should mention help");
+        assert!(help.contains("Press any key"), "should mention dismiss");
+    }
+
+    #[test]
+    fn test_format_help_screen_prefix_appears_twice_for_literal_prefix() {
+        // The "send literal prefix" line shows "prefix prefix" (e.g. "Ctrl+A Ctrl+A")
+        let help = format_help_screen("XX");
+        let count = help.matches("XX").count();
+        assert!(count >= 2, "prefix should appear at least twice (label + literal-prefix entry)");
     }
 }
