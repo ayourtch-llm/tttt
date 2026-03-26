@@ -334,23 +334,6 @@ impl ReplayApp {
         Ok(())
     }
 
-    fn open_session(&mut self, session_id: &str, pid: Option<u32>) -> Result<()> {
-        let info = resolve_session_info(&self.db, session_id, pid)?
-            .ok_or_else(|| format!("Session not found: {}", session_id))?;
-        let events = self.db.query_events_with_pid(session_id, info.pid)?;
-        let base_timestamp = events.first().map(|e| e.timestamp_ms).unwrap_or(0);
-        let replay = SessionReplay::new(events, info.cols, info.rows);
-        self.view = View::Replay(ReplayViewState {
-            replay,
-            session_info: info,
-            playing: false,
-            speed: 1.0,
-            last_tick: Instant::now(),
-            base_timestamp,
-            playback_pos_ms: 0,
-        });
-        Ok(())
-    }
 
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
         let num_sessions = self.sessions.len();

@@ -249,6 +249,280 @@ mod tests {
         (client, server)
     }
 
+    fn make_handler() -> PtyToolHandler<MockPty> {
+        PtyToolHandler::new_owned(
+            SessionManager::<MockPty>::new(),
+            std::path::PathBuf::from("/tmp"),
+        )
+    }
+
+    // ── is_jsonrpc_notification ──────────────────────────────────────────────
+
+    #[test]
+    fn test_is_notification_null_no_space() {
+        assert!(is_jsonrpc_notification(r#"{"id":null,"method":"initialized"}"#));
+    }
+
+    #[test]
+    fn test_is_notification_null_with_space() {
+        assert!(is_jsonrpc_notification(r#"{"id": null,"method":"initialized"}"#));
+    }
+
+    #[test]
+    fn test_is_not_notification_numeric_id() {
+        assert!(!is_jsonrpc_notification(r#"{"id":1,"method":"ping"}"#));
+    }
+
+    #[test]
+    fn test_is_not_notification_string_id() {
+        assert!(!is_jsonrpc_notification(r#"{"id":"abc","method":"ping"}"#));
+    }
+
+    #[test]
+    fn test_is_not_notification_id_zero() {
+        assert!(!is_jsonrpc_notification(r#"{"id":0,"method":"ping"}"#));
+    }
+
+    // ── process_jsonrpc_request ──────────────────────────────────────────────
+
+    #[test]
+    fn test_process_parse_error() {
+        let mut handler = make_handler();
+        let resp = process_jsonrpc_request("not json {{{", &mut handler, "srv");
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32700); // parse error code
+    }
+
+    #[test]
+    fn test_process_ping() {
+        let mut handler = make_handler();
+        let req = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#;
+        let resp = process_jsonrpc_request(req, &mut handler, "srv");
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"], serde_json::json!({}));
+        assert_eq!(v["id"], 1);
+    }
+
+    #[test]
+    fn test_process_initialized_notification_returns_empty() {
+        let mut handler = make_handler();
+        let req = r#"{"jsonrpc":"2.0","id":null,"method":"initialized","params":{}}"#;
+        let resp = process_jsonrpc_request(req, &mut handler, "srv");
+        assert!(resp.is_empty());
+    }
+
+    #[test]
+    fn test_process_notifications_cancelled_returns_empty() {
+        let mut handler = make_handler();
+        let req = r#"{"jsonrpc":"2.0","id":null,"method":"notifications/cancelled","params":{}}"#;
+        let resp = process_jsonrpc_request(req, &mut handler, "srv");
+        assert!(resp.is_empty());
+    }
+
+    #[test]
+    fn test_process_unknown_method() {
+        let mut handler = make_handler();
+        let req = r#"{"jsonrpc":"2.0","id":2,"method":"no/such","params":{}}"#;
+        let resp = process_jsonrpc_request(req, &mut handler, "srv");
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32601); // method not found
+        assert_eq!(v["id"], 2);
+    }
+
+    #[test]
+    fn test_process_tools_call_unknown_tool() {
+        let mut handler = make_handler();
+        let req = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"does_not_exist","arguments":{}}}"#;
+        let resp = process_jsonrpc_request(req, &mut handler, "srv");
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32601); // ToolNotFound → method_not_found
+        assert_eq!(v["id"], 3);
+    }
+
+    #[test]
+    fn test_process_tools_call_success_pty_launch() {
+        let mut handler = make_handler();
+        let req = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tttt_pty_launch","arguments":{}}}"#;
+        let resp = process_jsonrpc_request(req, &mut handler, "srv");
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(v["result"]["content"].is_array(), "expected content array");
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        let result: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(result["session_id"], "pty-1");
+    }
+
+    #[test]
+    fn test_process_initialize_returns_server_info() {
+        let mut handler = make_handler();
+        let req = r#"{"jsonrpc":"2.0","id":5,"method":"initialize","params":{}}"#;
+        let resp = process_jsonrpc_request(req, &mut handler, "my-server");
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["serverInfo"]["name"], "my-server");
+        assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
+    }
+
+    #[test]
+    fn test_process_tools_list() {
+        let mut handler = make_handler();
+        let req = r#"{"jsonrpc":"2.0","id":6,"method":"tools/list","params":{}}"#;
+        let resp = process_jsonrpc_request(req, &mut handler, "srv");
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert!(v["result"]["tools"].is_array());
+        assert!(!v["result"]["tools"].as_array().unwrap().is_empty());
+    }
+
+    // ── send_and_receive notification path ───────────────────────────────────
+
+    #[test]
+    fn test_send_and_receive_notification_returns_none() {
+        let (mut client, mut server) = make_socket_pair();
+        // Spawn a thread that reads the framed message from the server side.
+        let server_handle = std::thread::spawn(move || {
+            let mut len_buf = [0u8; 4];
+            server.read_exact(&mut len_buf).unwrap();
+            let n = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; n];
+            server.read_exact(&mut buf).unwrap();
+        });
+
+        let result = send_and_receive(&mut client, b"hello", true).unwrap();
+        assert!(result.is_none());
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_send_and_receive_request_returns_response() {
+        let (mut client, mut server) = make_socket_pair();
+        let reply = b"world";
+        let server_handle = std::thread::spawn(move || {
+            // read the framed request
+            let mut len_buf = [0u8; 4];
+            server.read_exact(&mut len_buf).unwrap();
+            let n = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; n];
+            server.read_exact(&mut buf).unwrap();
+            // write a framed reply
+            let rlen = reply.len() as u32;
+            server.write_all(&rlen.to_be_bytes()).unwrap();
+            server.write_all(reply).unwrap();
+            server.flush().unwrap();
+        });
+
+        let result = send_and_receive(&mut client, b"hello", false).unwrap();
+        assert_eq!(result, Some(b"world".to_vec()));
+        server_handle.join().unwrap();
+    }
+
+    // ── connect_with_retry ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_connect_with_retry_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retry.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        let accept_handle = std::thread::spawn(move || {
+            let _ = listener.accept().unwrap();
+        });
+
+        let result = connect_with_retry(&path_str, 3);
+        assert!(result.is_ok());
+        accept_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_connect_with_retry_failure() {
+        let result = connect_with_retry("/nonexistent_tttt_test.sock", 1);
+        assert!(result.is_err());
+    }
+
+    // ── run_proxy end-to-end ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_run_proxy_initialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("run_proxy.sock");
+        let sock_str = sock_path.to_string_lossy().to_string();
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        // Server thread: accept one connection, handle it with PtyToolHandler
+        let server_handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut handler = PtyToolHandler::new_owned(
+                SessionManager::<MockPty>::new(),
+                std::path::PathBuf::from("/tmp"),
+            );
+            handle_proxy_client(stream, &mut handler, "tttt").unwrap();
+        });
+
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n";
+        let reader = std::io::BufReader::new(std::io::Cursor::new(input.as_bytes().to_vec()));
+        let mut output: Vec<u8> = Vec::new();
+
+        run_proxy(reader, &mut output, &sock_str).unwrap();
+
+        let out_str = String::from_utf8(output).unwrap();
+        let v: serde_json::Value = serde_json::from_str(out_str.trim()).unwrap();
+        assert_eq!(v["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(v["result"]["serverInfo"]["name"], "tttt");
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_run_proxy_notification_produces_no_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("run_proxy_notif.sock");
+        let sock_str = sock_path.to_string_lossy().to_string();
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let server_handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut handler = make_handler();
+            handle_proxy_client(stream, &mut handler, "tttt").unwrap();
+        });
+
+        // A notification (id:null) should be forwarded but produce no output line
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"initialized\",\"params\":{}}\n";
+        let reader = std::io::BufReader::new(std::io::Cursor::new(input.as_bytes().to_vec()));
+        let mut output: Vec<u8> = Vec::new();
+
+        run_proxy(reader, &mut output, &sock_str).unwrap();
+
+        assert!(output.is_empty(), "notifications should produce no proxy output");
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_run_proxy_empty_lines_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("run_proxy_empty.sock");
+        let sock_str = sock_path.to_string_lossy().to_string();
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let server_handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut handler = make_handler();
+            handle_proxy_client(stream, &mut handler, "tttt").unwrap();
+        });
+
+        // Only blank lines + real request
+        let input = "\n\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{}}\n";
+        let reader = std::io::BufReader::new(std::io::Cursor::new(input.as_bytes().to_vec()));
+        let mut output: Vec<u8> = Vec::new();
+
+        run_proxy(reader, &mut output, &sock_str).unwrap();
+
+        let out_str = String::from_utf8(output).unwrap();
+        let v: serde_json::Value = serde_json::from_str(out_str.trim()).unwrap();
+        assert_eq!(v["result"], serde_json::json!({}));
+        server_handle.join().unwrap();
+    }
+
     #[test]
     fn test_proxy_roundtrip_initialize() {
         let (client_stream, server_stream) = make_socket_pair();
