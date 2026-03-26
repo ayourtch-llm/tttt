@@ -102,6 +102,38 @@ fn write_all(fd: i32, data: &[u8]) -> nix::Result<()> {
     Ok(())
 }
 
+/// What to do when the active session exits.
+#[derive(Debug, PartialEq)]
+enum SessionExitAction {
+    /// Active session is still running (or there is no active session).
+    NoExit,
+    /// Switch to a different running session.
+    SwitchTo(String),
+    /// All sessions have exited — time to quit the event loop.
+    AllExited,
+}
+
+/// Determine what to do when the active session may have exited.
+///
+/// `is_running` returns `true` when a session with that ID is still running.
+fn compute_exit_action(
+    active_id: Option<&str>,
+    session_order: &[String],
+    is_running: impl Fn(&str) -> bool,
+) -> SessionExitAction {
+    let Some(id) = active_id else {
+        return SessionExitAction::NoExit;
+    };
+    if is_running(id) {
+        return SessionExitAction::NoExit;
+    }
+    // Active session has exited — find another running one
+    if let Some(next) = session_order.iter().find(|s| s.as_str() != id && is_running(s)) {
+        return SessionExitAction::SwitchTo(next.clone());
+    }
+    SessionExitAction::AllExited
+}
+
 /// Compute PTY dimensions from the raw terminal size and sidebar width.
 fn calculate_pane_dimensions(cols: u16, rows: u16, sidebar_width: u16) -> (u16, u16) {
     (cols.saturating_sub(sidebar_width), rows.saturating_sub(1))
@@ -1108,26 +1140,36 @@ impl App {
     }
 
     fn check_session_exit(&mut self) -> bool {
-        if let Some(ref id) = self.active_session {
-            let mgr = self.sessions.lock().unwrap();
-            let exited = mgr.get(id).map_or(false, |s| matches!(s.status(), SessionStatus::Exited(_)));
-            if exited {
-                let id_owned = id.clone();
-                let next = self.session_order.iter()
-                    .find(|s| *s != id && mgr.get(s).map_or(false, |sess| matches!(sess.status(), SessionStatus::Running)))
-                    .cloned();
-                drop(mgr);
-                if let Some(ref logger) = self.sqlite_logger {
-                    let _ = logger.lock().unwrap().log_session_end(&id_owned);
+        let mgr = self.sessions.lock().unwrap();
+        let is_running = |id: &str| mgr.get(id)
+            .map_or(false, |s| matches!(s.status(), SessionStatus::Running));
+        let action = compute_exit_action(
+            self.active_session.as_deref(),
+            &self.session_order,
+            is_running,
+        );
+        drop(mgr);
+
+        match action {
+            SessionExitAction::NoExit => false,
+            SessionExitAction::SwitchTo(next_id) => {
+                if let Some(ref exited_id) = self.active_session {
+                    if let Some(ref logger) = self.sqlite_logger {
+                        let _ = logger.lock().unwrap().log_session_end(exited_id);
+                    }
                 }
-                if let Some(next_id) = next {
-                    self.active_session = Some(next_id);
-                } else {
-                    return true;
+                self.active_session = Some(next_id);
+                false
+            }
+            SessionExitAction::AllExited => {
+                if let Some(ref exited_id) = self.active_session {
+                    if let Some(ref logger) = self.sqlite_logger {
+                        let _ = logger.lock().unwrap().log_session_end(exited_id);
+                    }
                 }
+                true
             }
         }
-        false
     }
 
     fn handle_scheduler_event(&mut self, event: SchedulerEvent) {
@@ -1488,6 +1530,47 @@ mod tests {
         assert!(help.contains("Live reload"), "should mention reload");
         assert!(help.contains("This help"), "should mention help");
         assert!(help.contains("Press any key"), "should mention dismiss");
+    }
+
+    // ── Chunk 6: compute_exit_action ─────────────────────────────────────────
+
+    #[test]
+    fn test_compute_exit_action_no_active_session() {
+        let order = ss(&["a", "b"]);
+        let action = compute_exit_action(None, &order, |_| true);
+        assert_eq!(action, SessionExitAction::NoExit);
+    }
+
+    #[test]
+    fn test_compute_exit_action_still_running() {
+        let order = ss(&["a", "b"]);
+        let action = compute_exit_action(Some("a"), &order, |_| true);
+        assert_eq!(action, SessionExitAction::NoExit);
+    }
+
+    #[test]
+    fn test_compute_exit_action_exited_with_fallback() {
+        let order = ss(&["a", "b"]);
+        // "a" exited, "b" still running
+        let action = compute_exit_action(Some("a"), &order, |id| id == "b");
+        assert_eq!(action, SessionExitAction::SwitchTo("b".to_string()));
+    }
+
+    #[test]
+    fn test_compute_exit_action_all_exited() {
+        let order = ss(&["a", "b"]);
+        // Both exited
+        let action = compute_exit_action(Some("a"), &order, |_| false);
+        assert_eq!(action, SessionExitAction::AllExited);
+    }
+
+    #[test]
+    fn test_compute_exit_action_skips_self_in_fallback() {
+        // session_order has the active session first — should not switch to itself
+        let order = ss(&["a", "b", "c"]);
+        // "a" exited, "b" exited, "c" running
+        let action = compute_exit_action(Some("a"), &order, |id| id == "c");
+        assert_eq!(action, SessionExitAction::SwitchTo("c".to_string()));
     }
 
     // ── Chunk 5: calculate_pane_dimensions / calculate_min_dimensions ─────────
