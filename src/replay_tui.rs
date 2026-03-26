@@ -54,19 +54,25 @@ fn resolve_session_info(db: &SqliteLogger, session_id: &str, pid: Option<u32>) -
 }
 
 /// Build the full session list: registered sessions + orphan sessions inferred from events.
+/// NULL-pid orphan sessions are split by time gaps > 5 min into separate chunks.
 /// Sorted by started_at_ms so orphans interleave correctly with registered sessions.
 fn build_session_list(db: &SqliteLogger) -> Result<Vec<SessionListEntry>> {
     let mut sessions = Vec::new();
 
     for info in db.list_sessions()? {
         let event_count = db.query_events_with_pid(&info.session_id, info.pid).map(|e| e.len()).unwrap_or(0);
-        sessions.push(SessionListEntry { info, event_count });
+        sessions.push(SessionListEntry { info, event_count, load_strategy: LoadStrategy::ByPid });
     }
 
-    for (orphan_id, pid) in db.list_orphan_session_ids()? {
-        if let Some(info) = db.infer_session_info(&orphan_id, pid)? {
-            let event_count = db.query_events_with_pid(&orphan_id, pid).map(|e| e.len()).unwrap_or(0);
-            sessions.push(SessionListEntry { info, event_count });
+    for info in db.list_orphan_session_chunks()? {
+        if info.pid.is_some() {
+            let event_count = db.query_events_with_pid(&info.session_id, info.pid).map(|e| e.len()).unwrap_or(0);
+            sessions.push(SessionListEntry { info, event_count, load_strategy: LoadStrategy::ByPid });
+        } else {
+            let to_ms = info.ended_at_ms.unwrap_or(i64::MAX as u64);
+            let event_count = db.query_events_in_range(&info.session_id, info.started_at_ms, to_ms)
+                .map(|e| e.len()).unwrap_or(0);
+            sessions.push(SessionListEntry { info, event_count, load_strategy: LoadStrategy::ByTimeRange });
         }
     }
 
@@ -106,9 +112,19 @@ fn run_app<B: ratatui::backend::Backend>(
     Ok(())
 }
 
+/// How to load events for a session list entry when the user opens it.
+#[derive(Copy, Clone)]
+enum LoadStrategy {
+    /// Filter by (session_id, pid). pid=None means "all events" (legacy).
+    ByPid,
+    /// Filter by (session_id, NULL pid, timestamp range). Used for gap-split legacy chunks.
+    ByTimeRange,
+}
+
 struct SessionListEntry {
     info: SessionInfo,
     event_count: usize,
+    load_strategy: LoadStrategy,
 }
 
 struct SessionListState {
@@ -198,6 +214,33 @@ impl ReplayApp {
         }
     }
 
+    /// Open a session from the sessions list by index, using its stored load strategy.
+    fn open_entry(&mut self, idx: usize) -> Result<()> {
+        let (info, load_strategy) = {
+            let entry = &self.sessions[idx];
+            (entry.info.clone(), entry.load_strategy)
+        };
+        let events = match load_strategy {
+            LoadStrategy::ByPid => self.db.query_events_with_pid(&info.session_id, info.pid)?,
+            LoadStrategy::ByTimeRange => {
+                let to_ms = info.ended_at_ms.unwrap_or(i64::MAX as u64);
+                self.db.query_events_in_range(&info.session_id, info.started_at_ms, to_ms)?
+            }
+        };
+        let base_timestamp = events.first().map(|e| e.timestamp_ms).unwrap_or(0);
+        let replay = SessionReplay::new(events, info.cols, info.rows);
+        self.view = View::Replay(ReplayViewState {
+            replay,
+            session_info: info,
+            playing: false,
+            speed: 1.0,
+            last_tick: Instant::now(),
+            base_timestamp,
+            playback_pos_ms: 0,
+        });
+        Ok(())
+    }
+
     fn open_session(&mut self, session_id: &str, pid: Option<u32>) -> Result<()> {
         let info = resolve_session_info(&self.db, session_id, pid)?
             .ok_or_else(|| format!("Session not found: {}", session_id))?;
@@ -234,9 +277,7 @@ impl ReplayApp {
                 KeyCode::Enter => {
                     if let Some(i) = state.table_state.selected() {
                         if i < self.sessions.len() {
-                            let session_id = self.sessions[i].info.session_id.clone();
-                            let pid = self.sessions[i].info.pid;
-                            self.open_session(&session_id, pid)?;
+                            self.open_entry(i)?;
                         }
                     }
                 }
@@ -736,6 +777,7 @@ mod tests {
         let entry = SessionListEntry {
             info,
             event_count: 42,
+            load_strategy: LoadStrategy::ByPid,
         };
         assert_eq!(entry.event_count, 42);
         assert_eq!(entry.info.session_id, "test-id");
@@ -755,6 +797,7 @@ mod tests {
         let sessions = vec![SessionListEntry {
             info: db.list_sessions().unwrap().into_iter().next().unwrap(),
             event_count: 2,
+            load_strategy: LoadStrategy::ByPid,
         }];
         let app = ReplayApp::new(db, sessions, None).unwrap();
         assert!(matches!(app.view, View::SessionList(_)));
@@ -765,7 +808,7 @@ mod tests {
         let db = make_db_with_session();
         let info = db.get_session_info("sess1").unwrap().unwrap();
         let event_count = db.query_events("sess1").unwrap().len();
-        let sessions = vec![SessionListEntry { info, event_count }];
+        let sessions = vec![SessionListEntry { info, event_count, load_strategy: LoadStrategy::ByPid }];
         let app = ReplayApp::new(db, sessions, Some("sess1")).unwrap();
         assert!(matches!(app.view, View::Replay(_)));
     }
@@ -784,6 +827,7 @@ mod tests {
         let sessions = vec![SessionListEntry {
             info,
             event_count: 2,
+            load_strategy: LoadStrategy::ByPid,
         }];
         let app = ReplayApp::new(db, sessions, Some("sess1")).unwrap();
         if let View::Replay(state) = &app.view {
@@ -992,5 +1036,100 @@ mod tests {
         } else {
             panic!("expected Replay view");
         }
+    }
+
+    // Helper: insert a NULL-pid event into an existing in-memory logger
+    fn insert_null_pid_event_tui(db: &SqliteLogger, session_id: &str, ts: u64) {
+        db.insert_raw_event_null_pid(session_id, ts).unwrap();
+    }
+
+    #[test]
+    fn test_build_session_list_null_pid_orphan_not_split_when_continuous() {
+        let db = SqliteLogger::in_memory().unwrap();
+        // Three events well within 5 min of each other
+        insert_null_pid_event_tui(&db, "pty-1", 1_000);
+        insert_null_pid_event_tui(&db, "pty-1", 60_000);
+        insert_null_pid_event_tui(&db, "pty-1", 120_000);
+
+        let sessions = build_session_list(&db).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].info.session_id, "pty-1");
+        assert_eq!(sessions[0].event_count, 3);
+        assert!(matches!(sessions[0].load_strategy, LoadStrategy::ByTimeRange));
+    }
+
+    #[test]
+    fn test_build_session_list_null_pid_orphan_split_on_gap() {
+        let db = SqliteLogger::in_memory().unwrap();
+        let gap = tttt_log::SqliteLogger::gap_threshold_ms() + 1;
+        insert_null_pid_event_tui(&db, "pty-1", 1_000);
+        insert_null_pid_event_tui(&db, "pty-1", 1_000 + gap);
+
+        let sessions = build_session_list(&db).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].info.session_id, "pty-1");
+        assert_eq!(sessions[1].info.session_id, "pty-1");
+        // Each chunk has 1 event
+        assert_eq!(sessions[0].event_count, 1);
+        assert_eq!(sessions[1].event_count, 1);
+        // Both use time-range loading
+        assert!(matches!(sessions[0].load_strategy, LoadStrategy::ByTimeRange));
+        assert!(matches!(sessions[1].load_strategy, LoadStrategy::ByTimeRange));
+    }
+
+    #[test]
+    fn test_open_entry_time_range_loads_correct_chunk() {
+        let db = SqliteLogger::in_memory().unwrap();
+        let gap = tttt_log::SqliteLogger::gap_threshold_ms() + 1;
+        // Chunk 1: ts 1_000 and 2_000
+        insert_null_pid_event_tui(&db, "pty-1", 1_000);
+        insert_null_pid_event_tui(&db, "pty-1", 2_000);
+        // Chunk 2: ts 2_000+gap and 2_000+gap+5_000 (gap measured from last event of chunk 1)
+        insert_null_pid_event_tui(&db, "pty-1", 2_000 + gap);
+        insert_null_pid_event_tui(&db, "pty-1", 2_000 + gap + 5_000);
+
+        let sessions = build_session_list(&db).unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        // Open the first chunk (entries are sorted by started_at_ms)
+        let mut app = ReplayApp::new(db, sessions, None).unwrap();
+        app.open_entry(0).unwrap();
+        if let View::Replay(state) = &app.view {
+            // First chunk has 2 events (ts 1000 and 2000)
+            assert_eq!(state.replay.event_count(), 2);
+            assert_eq!(state.session_info.started_at_ms, 1_000);
+        } else {
+            panic!("expected Replay view");
+        }
+
+        // Open the second chunk
+        app.open_entry(1).unwrap();
+        if let View::Replay(state) = &app.view {
+            assert_eq!(state.replay.event_count(), 2);
+            assert_eq!(state.session_info.started_at_ms, 2_000 + gap);
+        } else {
+            panic!("expected Replay view");
+        }
+    }
+
+    #[test]
+    fn test_build_session_list_pid_and_null_pid_separate() {
+        let mut db = SqliteLogger::in_memory().unwrap();
+        // Pid-aware event (current run)
+        {
+            use tttt_log::LogSink;
+            db.log_event(&LogEvent::with_timestamp(500, "pty-1".to_string(), Direction::Output, b"x".to_vec())).unwrap();
+        }
+        // NULL-pid legacy event, far away in time
+        let gap = tttt_log::SqliteLogger::gap_threshold_ms() + 1;
+        insert_null_pid_event_tui(&db, "pty-1", 500 + gap);
+
+        let sessions = build_session_list(&db).unwrap();
+        // Expect 2 entries: one ByPid, one ByTimeRange
+        assert_eq!(sessions.len(), 2);
+        let by_pid: Vec<_> = sessions.iter().filter(|s| matches!(s.load_strategy, LoadStrategy::ByPid)).collect();
+        let by_range: Vec<_> = sessions.iter().filter(|s| matches!(s.load_strategy, LoadStrategy::ByTimeRange)).collect();
+        assert_eq!(by_pid.len(), 1);
+        assert_eq!(by_range.len(), 1);
     }
 }

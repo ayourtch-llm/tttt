@@ -360,6 +360,134 @@ impl SqliteLogger {
         }
     }
 
+    /// Time gap threshold used to split NULL-pid orphan sessions: 5 minutes.
+    const GAP_THRESHOLD_MS: u64 = 5 * 60 * 1000;
+
+    /// Expose the gap threshold for tests in other crates.
+    pub fn gap_threshold_ms() -> u64 {
+        Self::GAP_THRESHOLD_MS
+    }
+
+    /// Insert an event with an explicit NULL pid.  Intended for test code that needs to
+    /// simulate legacy data recorded before the pid column was added.
+    #[doc(hidden)]
+    pub fn insert_raw_event_null_pid(
+        &self,
+        session_id: &str,
+        timestamp_ms: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO events (session_id, timestamp_ms, direction, data, pid)
+             VALUES (?1, ?2, 'output', X'68', NULL)",
+            rusqlite::params![session_id, timestamp_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Split a single (session_id, NULL-pid) orphan into chunks separated by gaps
+    /// longer than `GAP_THRESHOLD_MS`.  Returns one `SessionInfo` per chunk.
+    fn split_null_pid_orphan_into_chunks(&self, session_id: &str) -> Result<Vec<SessionInfo>> {
+        let sql = if self.events_has_pid {
+            "SELECT timestamp_ms FROM events
+             WHERE session_id = ?1 AND pid IS NULL
+             ORDER BY timestamp_ms"
+        } else {
+            "SELECT timestamp_ms FROM events
+             WHERE session_id = ?1
+             ORDER BY timestamp_ms"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let timestamps: Vec<u64> = stmt
+            .query_map([session_id], |row| row.get::<_, u64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        if timestamps.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut chunks: Vec<(u64, u64)> = Vec::new();
+        let mut chunk_start = timestamps[0];
+        let mut chunk_end = timestamps[0];
+
+        for &ts in &timestamps[1..] {
+            if ts.saturating_sub(chunk_end) > Self::GAP_THRESHOLD_MS {
+                chunks.push((chunk_start, chunk_end));
+                chunk_start = ts;
+            }
+            chunk_end = ts;
+        }
+        chunks.push((chunk_start, chunk_end));
+
+        Ok(chunks
+            .into_iter()
+            .map(|(start_ms, end_ms)| SessionInfo {
+                session_id: session_id.to_string(),
+                command: "unknown".to_string(),
+                cols: 80,
+                rows: 24,
+                started_at_ms: start_ms,
+                ended_at_ms: Some(end_ms),
+                name: None,
+                pid: None,
+            })
+            .collect())
+    }
+
+    /// Build the full list of orphan session chunks, ready for display.
+    ///
+    /// - Orphans with a non-NULL pid → one `SessionInfo` per (session_id, pid) pair.
+    /// - Orphans with NULL pid → split by time gaps > 5 min; one `SessionInfo` per chunk.
+    pub fn list_orphan_session_chunks(&self) -> Result<Vec<SessionInfo>> {
+        let mut result = Vec::new();
+        for (session_id, pid) in self.list_orphan_session_ids()? {
+            if pid.is_some() {
+                if let Some(info) = self.infer_session_info(&session_id, pid)? {
+                    result.push(info);
+                }
+            } else {
+                let chunks = self.split_null_pid_orphan_into_chunks(&session_id)?;
+                result.extend(chunks);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Query events for a session whose pid is NULL, restricted to a timestamp range.
+    /// Used to replay individual time-gap-split chunks of legacy NULL-pid orphan sessions.
+    /// The bounds are inclusive on both ends.
+    /// `to_ms` is capped at `i64::MAX` to stay within SQLite's signed integer range.
+    pub fn query_events_in_range(
+        &self,
+        session_id: &str,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<LogEvent>> {
+        let to_ms = to_ms.min(i64::MAX as u64);
+        if self.events_has_pid {
+            let mut stmt = self.conn.prepare(
+                "SELECT session_id, timestamp_ms, direction, data FROM events
+                 WHERE session_id = ?1 AND pid IS NULL
+                   AND timestamp_ms >= ?2 AND timestamp_ms <= ?3
+                 ORDER BY timestamp_ms",
+            )?;
+            let events = stmt
+                .query_map(rusqlite::params![session_id, from_ms, to_ms], Self::map_event_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(events)
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT session_id, timestamp_ms, direction, data FROM events
+                 WHERE session_id = ?1
+                   AND timestamp_ms >= ?2 AND timestamp_ms <= ?3
+                 ORDER BY timestamp_ms",
+            )?;
+            let events = stmt
+                .query_map(rusqlite::params![session_id, from_ms, to_ms], Self::map_event_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(events)
+        }
+    }
+
     /// Get info for a specific session by ID.
     /// Returns None if the sessions table does not exist or the session is not found.
     pub fn get_session_info(&self, session_id: &str) -> Result<Option<SessionInfo>> {
@@ -1017,5 +1145,178 @@ mod tests {
         // Old event should be queryable; its pid column is NULL
         let events = logger.query_events("s1").unwrap();
         assert_eq!(events.len(), 1);
+    }
+
+    // --- Gap-based chunk splitting tests ---
+
+    /// Helper: insert a NULL-pid event (simulates legacy data).
+    fn insert_null_pid_event(logger: &SqliteLogger, session_id: &str, ts: u64) {
+        logger.insert_raw_event_null_pid(session_id, ts).unwrap();
+    }
+
+    #[test]
+    fn test_no_split_when_continuous() {
+        let logger = SqliteLogger::in_memory().unwrap();
+        // Three events within 5 minutes of each other
+        insert_null_pid_event(&logger, "pty-1", 1_000);
+        insert_null_pid_event(&logger, "pty-1", 100_000);
+        insert_null_pid_event(&logger, "pty-1", 200_000);
+
+        let chunks = logger.split_null_pid_orphan_into_chunks("pty-1").unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].started_at_ms, 1_000);
+        assert_eq!(chunks[0].ended_at_ms, Some(200_000));
+    }
+
+    #[test]
+    fn test_chunk_splitting_on_time_gap() {
+        let logger = SqliteLogger::in_memory().unwrap();
+        // Two clusters separated by > 5 minutes
+        let gap = SqliteLogger::GAP_THRESHOLD_MS + 1;
+        insert_null_pid_event(&logger, "pty-1", 1_000);
+        insert_null_pid_event(&logger, "pty-1", 60_000);
+        insert_null_pid_event(&logger, "pty-1", 60_000 + gap);
+        insert_null_pid_event(&logger, "pty-1", 60_000 + gap + 10_000);
+
+        let chunks = logger.split_null_pid_orphan_into_chunks("pty-1").unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].started_at_ms, 1_000);
+        assert_eq!(chunks[0].ended_at_ms, Some(60_000));
+        assert_eq!(chunks[1].started_at_ms, 60_000 + gap);
+        assert_eq!(chunks[1].ended_at_ms, Some(60_000 + gap + 10_000));
+        // All chunks have pid=None
+        assert!(chunks.iter().all(|c| c.pid.is_none()));
+    }
+
+    #[test]
+    fn test_chunk_splitting_exact_gap_boundary_not_split() {
+        let logger = SqliteLogger::in_memory().unwrap();
+        // Gap exactly equal to threshold — should NOT split
+        insert_null_pid_event(&logger, "pty-1", 0);
+        insert_null_pid_event(&logger, "pty-1", SqliteLogger::GAP_THRESHOLD_MS);
+
+        let chunks = logger.split_null_pid_orphan_into_chunks("pty-1").unwrap();
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn test_chunk_splitting_multiple_gaps() {
+        let logger = SqliteLogger::in_memory().unwrap();
+        let g = SqliteLogger::GAP_THRESHOLD_MS + 1;
+        insert_null_pid_event(&logger, "s1", 0);
+        insert_null_pid_event(&logger, "s1", g);
+        insert_null_pid_event(&logger, "s1", g * 2);
+
+        let chunks = logger.split_null_pid_orphan_into_chunks("s1").unwrap();
+        assert_eq!(chunks.len(), 3);
+    }
+
+    #[test]
+    fn test_chunk_splitting_single_event() {
+        let logger = SqliteLogger::in_memory().unwrap();
+        insert_null_pid_event(&logger, "s1", 5_000);
+
+        let chunks = logger.split_null_pid_orphan_into_chunks("s1").unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].started_at_ms, 5_000);
+        assert_eq!(chunks[0].ended_at_ms, Some(5_000));
+    }
+
+    #[test]
+    fn test_chunk_splitting_empty() {
+        let logger = SqliteLogger::in_memory().unwrap();
+        let chunks = logger.split_null_pid_orphan_into_chunks("no-events").unwrap();
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_list_orphan_session_chunks_pid_aware_unchanged() {
+        // A pid-aware orphan should produce exactly one chunk (the pid-based inferred info)
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        let pid = logger.pid.unwrap();
+        logger.log_event(&LogEvent::with_timestamp(1000, "pty-1".to_string(), Direction::Output, b"x".to_vec())).unwrap();
+
+        let chunks = logger.list_orphan_session_chunks().unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].pid, Some(pid));
+    }
+
+    #[test]
+    fn test_list_orphan_session_chunks_null_pid_split() {
+        let logger = SqliteLogger::in_memory().unwrap();
+        let g = SqliteLogger::GAP_THRESHOLD_MS + 1;
+        insert_null_pid_event(&logger, "pty-1", 1_000);
+        insert_null_pid_event(&logger, "pty-1", 1_000 + g);
+
+        let chunks = logger.list_orphan_session_chunks().unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|c| c.pid.is_none()));
+    }
+
+    #[test]
+    fn test_query_events_in_range() {
+        let logger = SqliteLogger::in_memory().unwrap();
+        insert_null_pid_event(&logger, "s1", 1_000);
+        insert_null_pid_event(&logger, "s1", 5_000);
+        insert_null_pid_event(&logger, "s1", 10_000);
+
+        let events = logger.query_events_in_range("s1", 1_000, 5_000).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].timestamp_ms, 1_000);
+        assert_eq!(events[1].timestamp_ms, 5_000);
+    }
+
+    #[test]
+    fn test_query_events_in_range_inclusive_bounds() {
+        let logger = SqliteLogger::in_memory().unwrap();
+        insert_null_pid_event(&logger, "s1", 100);
+        insert_null_pid_event(&logger, "s1", 200);
+        insert_null_pid_event(&logger, "s1", 300);
+
+        // Exact boundary match
+        let events = logger.query_events_in_range("s1", 100, 100).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].timestamp_ms, 100);
+    }
+
+    #[test]
+    fn test_query_events_in_range_excludes_pid_events() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        // One event from this pid (non-null pid)
+        logger.log_event(&LogEvent::with_timestamp(5_000, "s1".to_string(), Direction::Output, b"pid".to_vec())).unwrap();
+        // One event with null pid
+        insert_null_pid_event(&logger, "s1", 5_000);
+
+        let events = logger.query_events_in_range("s1", 0, i64::MAX as u64).unwrap();
+        // Only the NULL-pid event should appear
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_query_events_in_range_empty() {
+        let logger = SqliteLogger::in_memory().unwrap();
+        let events = logger.query_events_in_range("no-such", 0, i64::MAX as u64).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_null_pid_chunks_not_mixed_with_pid_chunks() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        let current_pid = logger.pid.unwrap();
+        let g = SqliteLogger::GAP_THRESHOLD_MS + 1;
+
+        // Pid-aware event in run A
+        logger.log_event(&LogEvent::with_timestamp(1_000, "pty-1".to_string(), Direction::Output, b"a".to_vec())).unwrap();
+        // Two NULL-pid events forming separate chunks
+        insert_null_pid_event(&logger, "pty-1", 2_000_000);
+        insert_null_pid_event(&logger, "pty-1", 2_000_000 + g);
+
+        let chunks = logger.list_orphan_session_chunks().unwrap();
+        // 1 pid-aware chunk + 2 null-pid chunks = 3 total
+        assert_eq!(chunks.len(), 3);
+        let pid_chunks: Vec<_> = chunks.iter().filter(|c| c.pid == Some(current_pid)).collect();
+        let null_chunks: Vec<_> = chunks.iter().filter(|c| c.pid.is_none()).collect();
+        assert_eq!(pid_chunks.len(), 1);
+        assert_eq!(null_chunks.len(), 2);
     }
 }
