@@ -127,8 +127,105 @@ struct SessionListEntry {
     load_strategy: LoadStrategy,
 }
 
+/// Gap threshold for visual grouping separators: 5 minutes.
+const VISUAL_GAP_THRESHOLD_MS: u64 = 5 * 60 * 1_000;
+
+/// Returns the session indices before which a separator row should appear.
+/// A separator is inserted when the gap between the previous session's end
+/// (or start if no end) and the next session's start exceeds the threshold.
+fn compute_separator_positions(sessions: &[SessionListEntry]) -> Vec<usize> {
+    let mut positions = Vec::new();
+    for i in 1..sessions.len() {
+        let prev_end = sessions[i - 1]
+            .info
+            .ended_at_ms
+            .unwrap_or(sessions[i - 1].info.started_at_ms);
+        let curr_start = sessions[i].info.started_at_ms;
+        if curr_start.saturating_sub(prev_end) > VISUAL_GAP_THRESHOLD_MS {
+            positions.push(i);
+        }
+    }
+    positions
+}
+
+/// Convert session-based separator positions to visual row indices.
+/// `sep_before[k]` = the session index before which separator k appears.
+/// Returns the visual row indices (accounting for inserted separator rows).
+fn separator_visual_indices(sep_before: &[usize]) -> Vec<usize> {
+    sep_before
+        .iter()
+        .enumerate()
+        .map(|(count, &session_idx)| session_idx + count)
+        .collect()
+}
+
+/// Map a visual row index to a session index.
+/// Returns `None` if the visual row is a separator.
+fn visual_to_session_idx(visual: usize, sep_visual: &[usize]) -> Option<usize> {
+    if sep_visual.contains(&visual) {
+        return None;
+    }
+    let sep_before = sep_visual.iter().filter(|&&s| s < visual).count();
+    Some(visual - sep_before)
+}
+
 struct SessionListState {
     table_state: TableState,
+    /// Visual row indices (in the rendered table) that are separator rows.
+    separator_indices: Vec<usize>,
+}
+
+impl SessionListState {
+    fn new(sessions: &[SessionListEntry]) -> Self {
+        let sep_before = compute_separator_positions(sessions);
+        let sep_visual = separator_visual_indices(&sep_before);
+        let mut table_state = TableState::default();
+        if !sessions.is_empty() {
+            table_state.select(Some(0));
+        }
+        SessionListState { table_state, separator_indices: sep_visual }
+    }
+
+    /// Total number of visual rows (sessions + separators).
+    fn total_rows(&self, num_sessions: usize) -> usize {
+        num_sessions + self.separator_indices.len()
+    }
+
+    /// Return the session index for the currently selected visual row,
+    /// or None if nothing is selected or the selection is a separator.
+    fn selected_session_idx(&self) -> Option<usize> {
+        self.table_state
+            .selected()
+            .and_then(|v| visual_to_session_idx(v, &self.separator_indices))
+    }
+
+    /// Move selection down, skipping separator rows.
+    fn move_down(&mut self, num_sessions: usize) {
+        let total = self.total_rows(num_sessions);
+        let current = self.table_state.selected().unwrap_or(0);
+        let mut next = current + 1;
+        while next < total && self.separator_indices.contains(&next) {
+            next += 1;
+        }
+        if next < total {
+            self.table_state.select(Some(next));
+        }
+    }
+
+    /// Move selection up, skipping separator rows.
+    fn move_up(&mut self) {
+        let current = match self.table_state.selected() {
+            Some(c) if c > 0 => c,
+            _ => return,
+        };
+        let mut prev = current - 1;
+        while prev > 0 && self.separator_indices.contains(&prev) {
+            prev -= 1;
+        }
+        if !self.separator_indices.contains(&prev) {
+            self.table_state.select(Some(prev));
+        }
+    }
 }
 
 struct ReplayViewState {
@@ -175,11 +272,7 @@ impl ReplayApp {
                 playback_pos_ms: 0,
             })
         } else {
-            let mut table_state = TableState::default();
-            if !sessions.is_empty() {
-                table_state.select(Some(0));
-            }
-            View::SessionList(SessionListState { table_state })
+            View::SessionList(SessionListState::new(&sessions))
         };
 
         Ok(Self {
@@ -260,24 +353,20 @@ impl ReplayApp {
     }
 
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
+        let num_sessions = self.sessions.len();
         match &mut self.view {
             View::SessionList(state) => match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
-                    let i = state.table_state.selected().unwrap_or(0);
-                    if i + 1 < self.sessions.len() {
-                        state.table_state.select(Some(i + 1));
-                    }
+                    state.move_down(num_sessions);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    let i = state.table_state.selected().unwrap_or(0);
-                    if i > 0 {
-                        state.table_state.select(Some(i - 1));
-                    }
+                    state.move_up();
                 }
                 KeyCode::Enter => {
-                    if let Some(i) = state.table_state.selected() {
-                        if i < self.sessions.len() {
-                            self.open_entry(i)?;
+                    let maybe_idx = state.selected_session_idx();
+                    if let Some(session_idx) = maybe_idx {
+                        if session_idx < num_sessions {
+                            self.open_entry(session_idx)?;
                         }
                     }
                 }
@@ -355,11 +444,8 @@ impl ReplayApp {
                     state.speed = (state.speed / 2.0).max(0.125);
                 }
                 KeyCode::Char('q') | KeyCode::Esc => {
-                    let mut table_state = TableState::default();
-                    if !self.sessions.is_empty() {
-                        table_state.select(Some(0));
-                    }
-                    self.view = View::SessionList(SessionListState { table_state });
+                    let new_state = SessionListState::new(&self.sessions);
+                    self.view = View::SessionList(new_state);
                 }
                 _ => {}
             },
@@ -386,31 +472,57 @@ fn render_session_list(
 ) {
     let area = frame.area();
 
-    let rows: Vec<Row> = sessions
-        .iter()
-        .map(|s| {
-            let started = format_timestamp_ms(s.info.started_at_ms);
-            let duration = format_duration_ms(
-                s.info
-                    .ended_at_ms
-                    .map(|e| e.saturating_sub(s.info.started_at_ms)),
+    let sep_before = compute_separator_positions(sessions);
+    let sep_style = Style::default().fg(Color::DarkGray);
+    let mut sep_iter = sep_before.iter().peekable();
+
+    let mut rows: Vec<Row> = Vec::new();
+    for (i, s) in sessions.iter().enumerate() {
+        // Insert separator row before this session if a gap precedes it
+        if sep_iter.peek() == Some(&&i) {
+            sep_iter.next();
+            let prev_end = sessions[i - 1]
+                .info
+                .ended_at_ms
+                .unwrap_or(sessions[i - 1].info.started_at_ms);
+            let gap_ms = s.info.started_at_ms.saturating_sub(prev_end);
+            let gap_label = format!("── {} gap ──", format_duration_ms(Some(gap_ms)));
+            rows.push(
+                Row::new(vec![
+                    RCell::from(gap_label),
+                    RCell::from(""),
+                    RCell::from(""),
+                    RCell::from(""),
+                    RCell::from(""),
+                    RCell::from(""),
+                    RCell::from(""),
+                    RCell::from(""),
+                ])
+                .style(sep_style),
             );
-            let size = format!("{}x{}", s.info.cols, s.info.rows);
-            let name = s.info.name.as_deref().unwrap_or("-").to_string();
-            let short_id = s.info.session_id.get(..8).unwrap_or(&s.info.session_id).to_string();
-            let pid = s.info.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".to_string());
-            Row::new(vec![
-                RCell::from(short_id),
-                RCell::from(pid),
-                RCell::from(name),
-                RCell::from(s.info.command.clone()),
-                RCell::from(size),
-                RCell::from(started),
-                RCell::from(duration),
-                RCell::from(s.event_count.to_string()),
-            ])
-        })
-        .collect();
+        }
+
+        let started = format_timestamp_ms(s.info.started_at_ms);
+        let duration = format_duration_ms(
+            s.info
+                .ended_at_ms
+                .map(|e| e.saturating_sub(s.info.started_at_ms)),
+        );
+        let size = format!("{}x{}", s.info.cols, s.info.rows);
+        let name = s.info.name.as_deref().unwrap_or("-").to_string();
+        let short_id = s.info.session_id.get(..8).unwrap_or(&s.info.session_id).to_string();
+        let pid = s.info.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".to_string());
+        rows.push(Row::new(vec![
+            RCell::from(short_id),
+            RCell::from(pid),
+            RCell::from(name),
+            RCell::from(s.info.command.clone()),
+            RCell::from(size),
+            RCell::from(started),
+            RCell::from(duration),
+            RCell::from(s.event_count.to_string()),
+        ]));
+    }
 
     let widths = [
         Constraint::Length(10),
@@ -1131,5 +1243,241 @@ mod tests {
         let by_range: Vec<_> = sessions.iter().filter(|s| matches!(s.load_strategy, LoadStrategy::ByTimeRange)).collect();
         assert_eq!(by_pid.len(), 1);
         assert_eq!(by_range.len(), 1);
+    }
+
+    // ── Visual grouping / separator tests ────────────────────────────────────
+
+    /// Build a minimal SessionListEntry with only timestamps set.
+    fn make_entry(started: u64, ended: Option<u64>) -> SessionListEntry {
+        SessionListEntry {
+            info: SessionInfo {
+                session_id: "s".to_string(),
+                command: "sh".to_string(),
+                cols: 80,
+                rows: 24,
+                started_at_ms: started,
+                ended_at_ms: ended,
+                name: None,
+                pid: None,
+            },
+            event_count: 0,
+            load_strategy: LoadStrategy::ByPid,
+        }
+    }
+
+    #[test]
+    fn test_compute_separator_positions_empty() {
+        let positions = compute_separator_positions(&[]);
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn test_compute_separator_positions_single() {
+        let sessions = vec![make_entry(0, None)];
+        let positions = compute_separator_positions(&sessions);
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn test_compute_separator_positions_no_gap() {
+        // Two sessions 1 min apart — below threshold, no separator
+        let sessions = vec![
+            make_entry(0, Some(60_000)),
+            make_entry(60_000, Some(120_000)),
+        ];
+        let positions = compute_separator_positions(&sessions);
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn test_compute_separator_positions_exact_threshold_not_split() {
+        // Gap exactly == threshold: NOT > threshold, so no separator
+        let sessions = vec![
+            make_entry(0, Some(0)),
+            make_entry(VISUAL_GAP_THRESHOLD_MS, None),
+        ];
+        let positions = compute_separator_positions(&sessions);
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn test_compute_separator_positions_gap_detected() {
+        // Gap of threshold+1 → separator before index 1
+        let sessions = vec![
+            make_entry(0, Some(1_000)),
+            make_entry(1_000 + VISUAL_GAP_THRESHOLD_MS + 1, None),
+        ];
+        let positions = compute_separator_positions(&sessions);
+        assert_eq!(positions, vec![1]);
+    }
+
+    #[test]
+    fn test_compute_separator_positions_gap_uses_started_when_no_end() {
+        // Previous session has no ended_at_ms; gap is measured from started_at_ms
+        let sessions = vec![
+            make_entry(0, None),  // no ended_at_ms → use started_at_ms = 0
+            make_entry(VISUAL_GAP_THRESHOLD_MS + 1, None),
+        ];
+        let positions = compute_separator_positions(&sessions);
+        assert_eq!(positions, vec![1]);
+    }
+
+    #[test]
+    fn test_compute_separator_positions_multiple_gaps() {
+        let g = VISUAL_GAP_THRESHOLD_MS + 1;
+        let sessions = vec![
+            make_entry(0, Some(100)),
+            make_entry(100 + g, Some(200 + g)),
+            make_entry(200 + g * 2, None),
+        ];
+        let positions = compute_separator_positions(&sessions);
+        assert_eq!(positions, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_separator_visual_indices_empty() {
+        assert!(separator_visual_indices(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_separator_visual_indices_one() {
+        // Separator before session 1: visual row = 1 + 0 = 1
+        let vis = separator_visual_indices(&[1]);
+        assert_eq!(vis, vec![1]);
+    }
+
+    #[test]
+    fn test_separator_visual_indices_two() {
+        // Seps before sessions 1 and 3:
+        //   sep 0: visual = 1 + 0 = 1
+        //   sep 1: visual = 3 + 1 = 4
+        let vis = separator_visual_indices(&[1, 3]);
+        assert_eq!(vis, vec![1, 4]);
+    }
+
+    #[test]
+    fn test_visual_to_session_idx_no_seps() {
+        assert_eq!(visual_to_session_idx(0, &[]), Some(0));
+        assert_eq!(visual_to_session_idx(3, &[]), Some(3));
+    }
+
+    #[test]
+    fn test_visual_to_session_idx_separator_returns_none() {
+        // separator at visual 1
+        let sep = vec![1];
+        assert_eq!(visual_to_session_idx(1, &sep), None);
+    }
+
+    #[test]
+    fn test_visual_to_session_idx_after_separator() {
+        // visual layout: 0→s0, 1→sep, 2→s1, 3→s2, 4→sep, 5→s3
+        let sep = vec![1, 4];
+        assert_eq!(visual_to_session_idx(0, &sep), Some(0));
+        assert_eq!(visual_to_session_idx(1, &sep), None);
+        assert_eq!(visual_to_session_idx(2, &sep), Some(1));
+        assert_eq!(visual_to_session_idx(3, &sep), Some(2));
+        assert_eq!(visual_to_session_idx(4, &sep), None);
+        assert_eq!(visual_to_session_idx(5, &sep), Some(3));
+    }
+
+    #[test]
+    fn test_session_list_state_new_no_separators() {
+        // Sessions close together → no separators, selection starts at 0
+        let sessions = vec![
+            make_entry(0, Some(1_000)),
+            make_entry(1_001, Some(2_000)),
+        ];
+        let state = SessionListState::new(&sessions);
+        assert!(state.separator_indices.is_empty());
+        assert_eq!(state.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn test_session_list_state_new_with_separator() {
+        let g = VISUAL_GAP_THRESHOLD_MS + 1;
+        let sessions = vec![
+            make_entry(0, Some(1_000)),
+            make_entry(1_000 + g, None),
+        ];
+        let state = SessionListState::new(&sessions);
+        // Separator before session 1 → visual index 1
+        assert_eq!(state.separator_indices, vec![1]);
+    }
+
+    #[test]
+    fn test_selected_session_idx_on_session_row() {
+        let sessions = vec![make_entry(0, None), make_entry(1, None)];
+        let mut state = SessionListState::new(&sessions);
+        state.table_state.select(Some(0));
+        assert_eq!(state.selected_session_idx(), Some(0));
+    }
+
+    #[test]
+    fn test_selected_session_idx_on_separator_row() {
+        let g = VISUAL_GAP_THRESHOLD_MS + 1;
+        let sessions = vec![make_entry(0, Some(0)), make_entry(g + 1, None)];
+        let mut state = SessionListState::new(&sessions);
+        // Force-select the separator row (visual 1)
+        state.table_state.select(Some(1));
+        assert_eq!(state.selected_session_idx(), None);
+    }
+
+    #[test]
+    fn test_move_down_skips_separator() {
+        let g = VISUAL_GAP_THRESHOLD_MS + 1;
+        // 3 sessions: sep before index 1
+        let sessions = vec![
+            make_entry(0, Some(100)),
+            make_entry(100 + g, Some(200 + g)),
+            make_entry(200 + g, None),
+        ];
+        let mut state = SessionListState::new(&sessions);
+        // separator_indices should be [1] (visual row 1)
+        assert_eq!(state.separator_indices, vec![1]);
+        // Start at visual 0 (session 0)
+        assert_eq!(state.table_state.selected(), Some(0));
+        // Move down: skip separator at visual 1, land on visual 2 (session 1)
+        state.move_down(3);
+        assert_eq!(state.table_state.selected(), Some(2));
+        // Move down again: land on visual 3 (session 2)
+        state.move_down(3);
+        assert_eq!(state.table_state.selected(), Some(3));
+        // Move down past end: stay at 3
+        state.move_down(3);
+        assert_eq!(state.table_state.selected(), Some(3));
+    }
+
+    #[test]
+    fn test_move_up_skips_separator() {
+        let g = VISUAL_GAP_THRESHOLD_MS + 1;
+        let sessions = vec![
+            make_entry(0, Some(100)),
+            make_entry(100 + g, None),
+        ];
+        let mut state = SessionListState::new(&sessions);
+        // visual: 0→s0, 1→sep, 2→s1
+        // Start at visual 2 (session 1)
+        state.table_state.select(Some(2));
+        // Move up: skip separator at visual 1, land on visual 0 (session 0)
+        state.move_up();
+        assert_eq!(state.table_state.selected(), Some(0));
+        // Move up past start: stay at 0
+        state.move_up();
+        assert_eq!(state.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn test_enter_maps_visual_to_session_idx() {
+        let g = VISUAL_GAP_THRESHOLD_MS + 1;
+        let sessions = vec![
+            make_entry(0, Some(100)),
+            make_entry(100 + g, None),
+        ];
+        let state = SessionListState::new(&sessions);
+        // visual 2 → session 1
+        assert_eq!(
+            visual_to_session_idx(2, &state.separator_indices),
+            Some(1)
+        );
     }
 }
