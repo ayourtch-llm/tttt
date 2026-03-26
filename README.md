@@ -6,7 +6,7 @@ Think of it as **tmux designed for AI agents**: session management, screen readi
 
 ![tttt in action — sidebar shows 4 sessions and reminder messages](images/screenshot.jpg)
 
-> **WARNING: This software gives AI agents direct access to terminal sessions, including the ability to execute commands, send keystrokes, and manage processes. Session sandboxing is not yet implemented. Use only in experimental / proof-of-concept environments and always supervise the running agents. Do not deploy in production or on systems with sensitive data without proper isolation in place.**
+> **WARNING: This software gives AI agents direct access to terminal sessions, including the ability to execute commands, send keystrokes, and manage processes. Session sandboxing is not yet implemented. Use only in experimental / proof-of-concept environments and always supervise the running agents. Do not deploy in production or on systems with sensitive data without proper isolation in place. ALSO: If you enable the input logging, everything including your password keystrokes are logged into ~/.local/share/tttt/tttt.db - keep this in mind and avoid entering any sensitive info ! **
 
 ## Why This Exists
 

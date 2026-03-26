@@ -25,6 +25,11 @@ struct Cli {
     #[arg(long)]
     full_dump: bool,
 
+    /// Log user keystrokes (input events) to SQLite. WARNING: this records
+    /// everything typed, including passwords. Disabled by default.
+    #[arg(long)]
+    danger_log_user_input_including_passwords: bool,
+
     /// Arguments to pass to the root command (after --)
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     root_args: Vec<String>,
@@ -113,6 +118,9 @@ fn run_tui(cli: Cli) {
     }
     if let Some(dir) = cli.workdir {
         config.work_dir = dir;
+    }
+    if cli.danger_log_user_input_including_passwords {
+        config.log_input = true;
     }
 
     let mut app = app::App::new(config);
