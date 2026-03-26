@@ -102,6 +102,24 @@ fn write_all(fd: i32, data: &[u8]) -> nix::Result<()> {
     Ok(())
 }
 
+/// Compute the new session index after a relative navigation step.
+///
+/// Returns `None` when `total == 0`. `current_idx = None` is treated as 0.
+/// Wraps around in both directions.
+fn compute_relative_index(
+    current_idx: Option<usize>,
+    delta: i32,
+    total: usize,
+) -> Option<usize> {
+    if total == 0 {
+        return None;
+    }
+    let cur = current_idx.unwrap_or(0) as i32;
+    let len = total as i32;
+    let new_idx = ((cur + delta) % len + len) % len;
+    Some(new_idx as usize)
+}
+
 /// Maps a raw prefix-key byte to its human-readable name.
 fn prefix_key_name(key: u8) -> String {
     match key {
@@ -934,14 +952,12 @@ impl App {
     }
 
     fn switch_relative(&mut self, delta: i32, stdout_fd: i32) -> Result<(), Box<dyn std::error::Error>> {
-        if self.session_order.is_empty() { return Ok(()); }
         let current_idx = self.active_session.as_ref()
-            .and_then(|id| self.session_order.iter().position(|s| s == id))
-            .unwrap_or(0);
-        let len = self.session_order.len() as i32;
-        let new_idx = ((current_idx as i32 + delta) % len + len) % len;
-        let id = self.session_order[new_idx as usize].clone();
-        self.switch_to_session(&id, stdout_fd)?;
+            .and_then(|id| self.session_order.iter().position(|s| s == id));
+        if let Some(new_idx) = compute_relative_index(current_idx, delta, self.session_order.len()) {
+            let id = self.session_order[new_idx].clone();
+            self.switch_to_session(&id, stdout_fd)?;
+        }
         Ok(())
     }
 
@@ -1419,6 +1435,48 @@ mod tests {
         assert!(help.contains("Live reload"), "should mention reload");
         assert!(help.contains("This help"), "should mention help");
         assert!(help.contains("Press any key"), "should mention dismiss");
+    }
+
+    // ── Chunk 2: compute_relative_index ──────────────────────────────────────
+
+    #[test]
+    fn test_compute_relative_index_empty_returns_none() {
+        assert_eq!(compute_relative_index(None, 1, 0), None);
+        assert_eq!(compute_relative_index(Some(0), 1, 0), None);
+    }
+
+    #[test]
+    fn test_compute_relative_index_single_element() {
+        assert_eq!(compute_relative_index(Some(0), 1, 1), Some(0));
+        assert_eq!(compute_relative_index(Some(0), -1, 1), Some(0));
+    }
+
+    #[test]
+    fn test_compute_relative_index_forward() {
+        assert_eq!(compute_relative_index(Some(0), 1, 3), Some(1));
+        assert_eq!(compute_relative_index(Some(1), 1, 3), Some(2));
+    }
+
+    #[test]
+    fn test_compute_relative_index_forward_wrap() {
+        assert_eq!(compute_relative_index(Some(2), 1, 3), Some(0));
+    }
+
+    #[test]
+    fn test_compute_relative_index_backward() {
+        assert_eq!(compute_relative_index(Some(2), -1, 3), Some(1));
+        assert_eq!(compute_relative_index(Some(1), -1, 3), Some(0));
+    }
+
+    #[test]
+    fn test_compute_relative_index_backward_wrap() {
+        assert_eq!(compute_relative_index(Some(0), -1, 3), Some(2));
+    }
+
+    #[test]
+    fn test_compute_relative_index_none_current_treated_as_zero() {
+        assert_eq!(compute_relative_index(None, 1, 3), Some(1));
+        assert_eq!(compute_relative_index(None, -1, 3), Some(2));
     }
 
     #[test]
