@@ -102,6 +102,32 @@ fn write_all(fd: i32, data: &[u8]) -> nix::Result<()> {
     Ok(())
 }
 
+/// Decide whether to render now given the current debounce state.
+///
+/// Returns `true` when `dirty` is true AND either:
+/// - the burst has ended (`last_pty_data` is ≥ `debounce_ms` ago), or
+/// - the max latency has been exceeded (`first_dirty` is ≥ `4 × debounce_ms` ago).
+///
+/// Returns `false` immediately when `dirty` is false.
+fn should_render_now(
+    dirty: bool,
+    last_pty_data: Option<Instant>,
+    first_dirty: Option<Instant>,
+    now: Instant,
+    debounce_ms: u64,
+) -> bool {
+    if !dirty {
+        return false;
+    }
+    let burst_ended = last_pty_data
+        .map(|t| now.duration_since(t).as_millis() >= debounce_ms as u128)
+        .unwrap_or(true);
+    let max_latency_exceeded = first_dirty
+        .map(|t| now.duration_since(t).as_millis() >= (debounce_ms * 4) as u128)
+        .unwrap_or(false);
+    burst_ended || max_latency_exceeded
+}
+
 /// Reconcile the ordered session list against the ground-truth set.
 ///
 /// - Preserves the relative order of IDs already in `current`.
@@ -730,13 +756,13 @@ impl App {
             // into a single clean update.
             if self.server_render_dirty {
                 let now = Instant::now();
-                let burst_ended = self.last_pty_data_time
-                    .map(|t| now.duration_since(t).as_millis() >= RENDER_DEBOUNCE_MS as u128)
-                    .unwrap_or(true);
-                let max_latency_exceeded = self.first_dirty_time
-                    .map(|t| now.duration_since(t).as_millis() >= (RENDER_DEBOUNCE_MS * 4) as u128)
-                    .unwrap_or(false);
-                let should_render = burst_ended || max_latency_exceeded;
+                let should_render = should_render_now(
+                    self.server_render_dirty,
+                    self.last_pty_data_time,
+                    self.first_dirty_time,
+                    now,
+                    RENDER_DEBOUNCE_MS,
+                );
 
                 if should_render {
                     if let Some(id) = self.active_session.clone() {
@@ -1446,6 +1472,58 @@ mod tests {
         assert!(help.contains("Live reload"), "should mention reload");
         assert!(help.contains("This help"), "should mention help");
         assert!(help.contains("Press any key"), "should mention dismiss");
+    }
+
+    // ── Chunk 4: should_render_now ───────────────────────────────────────────
+
+    #[test]
+    fn test_should_render_now_not_dirty_returns_false() {
+        let now = Instant::now();
+        assert!(!should_render_now(false, None, None, now, 50));
+        // Even with very old timestamps, dirty=false must win
+        let old = now - std::time::Duration::from_secs(10);
+        assert!(!should_render_now(false, Some(old), Some(old), now, 50));
+    }
+
+    #[test]
+    fn test_should_render_now_no_last_pty_data_burst_ended() {
+        // last_pty_data = None → burst_ended defaults to true
+        let now = Instant::now();
+        assert!(should_render_now(true, None, None, now, 50));
+    }
+
+    #[test]
+    fn test_should_render_now_burst_still_active() {
+        let now = Instant::now();
+        // last_pty_data just 1 ms ago, debounce is 50 ms → burst not ended
+        let recent = now - std::time::Duration::from_millis(1);
+        assert!(!should_render_now(true, Some(recent), Some(recent), now, 50));
+    }
+
+    #[test]
+    fn test_should_render_now_burst_ended() {
+        let now = Instant::now();
+        let old_enough = now - std::time::Duration::from_millis(60);
+        // burst ended but first_dirty is also old → renders
+        assert!(should_render_now(true, Some(old_enough), Some(old_enough), now, 50));
+    }
+
+    #[test]
+    fn test_should_render_now_max_latency_exceeded_during_burst() {
+        let now = Instant::now();
+        let burst_recent = now - std::time::Duration::from_millis(1); // burst not ended
+        let very_old = now - std::time::Duration::from_millis(250);   // > 4*50
+        // Still within burst but max latency exceeded → must render
+        assert!(should_render_now(true, Some(burst_recent), Some(very_old), now, 50));
+    }
+
+    #[test]
+    fn test_should_render_now_within_debounce_no_max_latency() {
+        let now = Instant::now();
+        let burst_recent = now - std::time::Duration::from_millis(1);
+        let first_dirty_recent = now - std::time::Duration::from_millis(10);
+        // burst not ended, max latency not exceeded → do not render
+        assert!(!should_render_now(true, Some(burst_recent), Some(first_dirty_recent), now, 50));
     }
 
     // ── Chunk 3: reconcile_session_order ─────────────────────────────────────
