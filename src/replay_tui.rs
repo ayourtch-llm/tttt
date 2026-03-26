@@ -25,12 +25,7 @@ pub fn run_replay(db_path: &Path, session_id: Option<&str>) -> Result<()> {
     let db = SqliteLogger::open_read_only(db_path)
         .map_err(|e| format!("Failed to open database {}: {}", db_path.display(), e))?;
 
-    let session_infos = db.list_sessions()?;
-    let mut sessions = Vec::new();
-    for info in session_infos {
-        let event_count = db.query_events(&info.session_id).map(|e| e.len()).unwrap_or(0);
-        sessions.push(SessionListEntry { info, event_count });
-    }
+    let sessions = build_session_list(&db)?;
 
     let mut app = ReplayApp::new(db, sessions, session_id)?;
 
@@ -47,6 +42,35 @@ pub fn run_replay(db_path: &Path, session_id: Option<&str>) -> Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+/// Get session info from the sessions table, falling back to inferred info for orphans.
+fn resolve_session_info(db: &SqliteLogger, session_id: &str) -> Result<Option<SessionInfo>> {
+    if let Some(info) = db.get_session_info(session_id)? {
+        return Ok(Some(info));
+    }
+    Ok(db.infer_session_info(session_id)?)
+}
+
+/// Build the full session list: registered sessions + orphan sessions inferred from events.
+/// Sorted by started_at_ms so orphans interleave correctly with registered sessions.
+fn build_session_list(db: &SqliteLogger) -> Result<Vec<SessionListEntry>> {
+    let mut sessions = Vec::new();
+
+    for info in db.list_sessions()? {
+        let event_count = db.query_events(&info.session_id).map(|e| e.len()).unwrap_or(0);
+        sessions.push(SessionListEntry { info, event_count });
+    }
+
+    for orphan_id in db.list_orphan_session_ids()? {
+        if let Some(info) = db.infer_session_info(&orphan_id)? {
+            let event_count = db.query_events(&orphan_id).map(|e| e.len()).unwrap_or(0);
+            sessions.push(SessionListEntry { info, event_count });
+        }
+    }
+
+    sessions.sort_by_key(|s| s.info.started_at_ms);
+    Ok(sessions)
 }
 
 fn run_app<B: ratatui::backend::Backend>(
@@ -119,8 +143,7 @@ impl ReplayApp {
         initial_session: Option<&str>,
     ) -> Result<Self> {
         let view = if let Some(id) = initial_session {
-            let info = db
-                .get_session_info(id)?
+            let info = resolve_session_info(&db, id)?
                 .ok_or_else(|| format!("Session not found: {}", id))?;
             let events = db.query_events(id)?;
             let base_timestamp = events.first().map(|e| e.timestamp_ms).unwrap_or(0);
@@ -175,9 +198,7 @@ impl ReplayApp {
     }
 
     fn open_session(&mut self, session_id: &str) -> Result<()> {
-        let info = self
-            .db
-            .get_session_info(session_id)?
+        let info = resolve_session_info(&self.db, session_id)?
             .ok_or_else(|| format!("Session not found: {}", session_id))?;
         let events = self.db.query_events(session_id)?;
         let base_timestamp = events.first().map(|e| e.timestamp_ms).unwrap_or(0);
@@ -842,5 +863,127 @@ mod tests {
         let db = SqliteLogger::in_memory().unwrap();
         let result = ReplayApp::new(db, vec![], Some("nonexistent"));
         assert!(result.is_err());
+    }
+
+    // --- Orphan session tests ---
+
+    #[test]
+    fn test_build_session_list_no_orphans() {
+        let mut db = SqliteLogger::in_memory().unwrap();
+        db.log_session_start("s1", "bash", 80, 24, None).unwrap();
+        {
+            use tttt_log::LogSink;
+            db.log_event(&LogEvent::with_timestamp(1000, "s1".to_string(), Direction::Output, b"hi".to_vec())).unwrap();
+        }
+        let sessions = build_session_list(&db).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].info.command, "bash");
+    }
+
+    #[test]
+    fn test_build_session_list_with_orphan() {
+        let mut db = SqliteLogger::in_memory().unwrap();
+        // Orphan: events only, no sessions entry
+        {
+            use tttt_log::LogSink;
+            db.log_event(&LogEvent::with_timestamp(500, "orphan".to_string(), Direction::Output, b"old data".to_vec())).unwrap();
+        }
+        // Registered session
+        db.log_session_start("registered", "bash", 80, 24, None).unwrap();
+
+        let sessions = build_session_list(&db).unwrap();
+        assert_eq!(sessions.len(), 2);
+        let ids: Vec<&str> = sessions.iter().map(|s| s.info.session_id.as_str()).collect();
+        assert!(ids.contains(&"orphan"));
+        assert!(ids.contains(&"registered"));
+    }
+
+    #[test]
+    fn test_build_session_list_orphan_inferred_info() {
+        let mut db = SqliteLogger::in_memory().unwrap();
+        {
+            use tttt_log::LogSink;
+            db.log_event(&LogEvent::with_timestamp(1000, "orphan".to_string(), Direction::Output, b"x".to_vec())).unwrap();
+            db.log_event(&LogEvent::with_timestamp(5000, "orphan".to_string(), Direction::Output, b"y".to_vec())).unwrap();
+        }
+        let sessions = build_session_list(&db).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.info.session_id, "orphan");
+        assert_eq!(s.info.command, "unknown");
+        assert_eq!(s.info.cols, 80);
+        assert_eq!(s.info.rows, 24);
+        assert_eq!(s.info.started_at_ms, 1000);
+        assert_eq!(s.info.ended_at_ms, Some(5000));
+        assert_eq!(s.event_count, 2);
+    }
+
+    #[test]
+    fn test_build_session_list_sorted_by_start_time() {
+        let mut db = SqliteLogger::in_memory().unwrap();
+        {
+            use tttt_log::LogSink;
+            // Orphan with early timestamp
+            db.log_event(&LogEvent::with_timestamp(100, "early-orphan".to_string(), Direction::Output, b"a".to_vec())).unwrap();
+            // Orphan with late timestamp
+            db.log_event(&LogEvent::with_timestamp(9000, "late-orphan".to_string(), Direction::Output, b"b".to_vec())).unwrap();
+        }
+        // Registered session with middle timestamp (but log_session_start uses wall clock,
+        // so we check relative ordering of orphans)
+        let sessions = build_session_list(&db).unwrap();
+        assert_eq!(sessions.len(), 2);
+        // early-orphan (ts=100) should come before late-orphan (ts=9000)
+        assert_eq!(sessions[0].info.session_id, "early-orphan");
+        assert_eq!(sessions[1].info.session_id, "late-orphan");
+    }
+
+    #[test]
+    fn test_resolve_session_info_registered() {
+        let mut db = SqliteLogger::in_memory().unwrap();
+        db.log_session_start("s1", "zsh", 120, 40, None).unwrap();
+        let info = resolve_session_info(&db, "s1").unwrap().unwrap();
+        assert_eq!(info.command, "zsh");
+        assert_eq!(info.cols, 120);
+    }
+
+    #[test]
+    fn test_resolve_session_info_orphan_fallback() {
+        let mut db = SqliteLogger::in_memory().unwrap();
+        {
+            use tttt_log::LogSink;
+            db.log_event(&LogEvent::with_timestamp(2000, "orphan".to_string(), Direction::Output, b"data".to_vec())).unwrap();
+        }
+        let info = resolve_session_info(&db, "orphan").unwrap().unwrap();
+        assert_eq!(info.command, "unknown");
+        assert_eq!(info.cols, 80);
+        assert_eq!(info.started_at_ms, 2000);
+    }
+
+    #[test]
+    fn test_resolve_session_info_missing() {
+        let db = SqliteLogger::in_memory().unwrap();
+        let info = resolve_session_info(&db, "nope").unwrap();
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn test_replay_app_can_open_orphan_session() {
+        let mut db = SqliteLogger::in_memory().unwrap();
+        {
+            use tttt_log::LogSink;
+            db.log_event(&LogEvent::with_timestamp(1000, "orphan".to_string(), Direction::Output, b"hello".to_vec())).unwrap();
+            db.log_event(&LogEvent::with_timestamp(2000, "orphan".to_string(), Direction::Output, b" world".to_vec())).unwrap();
+        }
+        let sessions = build_session_list(&db).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let app = ReplayApp::new(db, sessions, Some("orphan")).unwrap();
+        if let View::Replay(state) = &app.view {
+            assert_eq!(state.replay.event_count(), 2);
+            assert_eq!(state.session_info.command, "unknown");
+            assert_eq!(state.session_info.cols, 80);
+            assert_eq!(state.session_info.rows, 24);
+        } else {
+            panic!("expected Replay view");
+        }
     }
 }

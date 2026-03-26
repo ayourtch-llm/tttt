@@ -165,6 +165,44 @@ impl SqliteLogger {
         Ok(sessions)
     }
 
+    /// List session IDs that have events but no entry in the sessions table.
+    pub fn list_orphan_session_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT session_id FROM events
+             WHERE session_id NOT IN (SELECT session_id FROM sessions)
+             ORDER BY session_id",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    /// Build a synthetic SessionInfo for an orphan session from its events.
+    /// Returns None if the session has no events.
+    pub fn infer_session_info(&self, session_id: &str) -> Result<Option<SessionInfo>> {
+        let row: Option<(u64, u64)> = self
+            .conn
+            .query_row(
+                "SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM events WHERE session_id = ?1",
+                [session_id],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+            )
+            .ok();
+        match row {
+            None => Ok(None),
+            Some((min_ts, max_ts)) => Ok(Some(SessionInfo {
+                session_id: session_id.to_string(),
+                command: "unknown".to_string(),
+                cols: 80,
+                rows: 24,
+                started_at_ms: min_ts,
+                ended_at_ms: Some(max_ts),
+                name: None,
+            })),
+        }
+    }
+
     /// Get info for a specific session by ID.
     pub fn get_session_info(&self, session_id: &str) -> Result<Option<SessionInfo>> {
         let mut stmt = self.conn.prepare(
@@ -440,6 +478,83 @@ mod tests {
 
         let count = logger.lock().unwrap().event_count().unwrap();
         assert_eq!(count, 1);
+    }
+
+    // --- Orphan session tests ---
+
+    #[test]
+    fn test_list_orphan_session_ids_none() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        logger.log_session_start("s1", "bash", 80, 24, None).unwrap();
+        logger.log_event(&LogEvent::with_timestamp(1, "s1".to_string(), Direction::Output, b"hi".to_vec())).unwrap();
+        // s1 has a sessions entry, so no orphans
+        let orphans = logger.list_orphan_session_ids().unwrap();
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn test_list_orphan_session_ids_found() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        // s1 has events but no sessions entry
+        logger.log_event(&LogEvent::with_timestamp(1000, "s1".to_string(), Direction::Output, b"hello".to_vec())).unwrap();
+        logger.log_event(&LogEvent::with_timestamp(2000, "s1".to_string(), Direction::Output, b" world".to_vec())).unwrap();
+        let orphans = logger.list_orphan_session_ids().unwrap();
+        assert_eq!(orphans, vec!["s1"]);
+    }
+
+    #[test]
+    fn test_list_orphan_session_ids_mixed() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        // registered session
+        logger.log_session_start("registered", "bash", 80, 24, None).unwrap();
+        logger.log_event(&LogEvent::with_timestamp(1, "registered".to_string(), Direction::Output, b"ok".to_vec())).unwrap();
+        // orphan sessions
+        logger.log_event(&LogEvent::with_timestamp(10, "orphan-a".to_string(), Direction::Output, b"a".to_vec())).unwrap();
+        logger.log_event(&LogEvent::with_timestamp(20, "orphan-b".to_string(), Direction::Output, b"b".to_vec())).unwrap();
+        let orphans = logger.list_orphan_session_ids().unwrap();
+        assert_eq!(orphans.len(), 2);
+        assert!(orphans.contains(&"orphan-a".to_string()));
+        assert!(orphans.contains(&"orphan-b".to_string()));
+    }
+
+    #[test]
+    fn test_list_orphan_session_ids_empty_db() {
+        let logger = SqliteLogger::in_memory().unwrap();
+        let orphans = logger.list_orphan_session_ids().unwrap();
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn test_infer_session_info_no_events() {
+        let logger = SqliteLogger::in_memory().unwrap();
+        let info = logger.infer_session_info("nonexistent").unwrap();
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn test_infer_session_info_basic() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        logger.log_event(&LogEvent::with_timestamp(1000, "orphan".to_string(), Direction::Output, b"hello".to_vec())).unwrap();
+        logger.log_event(&LogEvent::with_timestamp(3000, "orphan".to_string(), Direction::Output, b"bye".to_vec())).unwrap();
+
+        let info = logger.infer_session_info("orphan").unwrap().unwrap();
+        assert_eq!(info.session_id, "orphan");
+        assert_eq!(info.command, "unknown");
+        assert_eq!(info.cols, 80);
+        assert_eq!(info.rows, 24);
+        assert_eq!(info.started_at_ms, 1000);
+        assert_eq!(info.ended_at_ms, Some(3000));
+        assert!(info.name.is_none());
+    }
+
+    #[test]
+    fn test_infer_session_info_single_event() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        logger.log_event(&LogEvent::with_timestamp(5000, "solo".to_string(), Direction::Input, b"x".to_vec())).unwrap();
+
+        let info = logger.infer_session_info("solo").unwrap().unwrap();
+        assert_eq!(info.started_at_ms, 5000);
+        assert_eq!(info.ended_at_ms, Some(5000));
     }
 
     #[test]
