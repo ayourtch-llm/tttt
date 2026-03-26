@@ -102,6 +102,33 @@ fn write_all(fd: i32, data: &[u8]) -> nix::Result<()> {
     Ok(())
 }
 
+/// Compute PTY dimensions from the raw terminal size and sidebar width.
+fn calculate_pane_dimensions(cols: u16, rows: u16, sidebar_width: u16) -> (u16, u16) {
+    (cols.saturating_sub(sidebar_width), rows.saturating_sub(1))
+}
+
+/// Compute the minimum PTY size across the server baseline and all connected viewers.
+///
+/// `viewers` is a slice of `(cols, rows)` tuples — the usable area already
+/// reported by each viewer (no further sidebar subtraction needed here).
+/// The result is clamped so it never exceeds `(server_cols, server_rows)`.
+fn calculate_min_dimensions(
+    viewers: &[(u16, u16)],
+    server_cols: u16,
+    server_rows: u16,
+) -> (u16, u16) {
+    let mut min_cols = server_cols;
+    let mut min_rows = server_rows;
+    for &(c, r) in viewers {
+        min_cols = min_cols.min(c);
+        min_rows = min_rows.min(r);
+    }
+    // Clamp to the server baseline (never grow larger than the server can show)
+    min_cols = min_cols.min(server_cols);
+    min_rows = min_rows.min(server_rows);
+    (min_cols, min_rows)
+}
+
 /// Decide whether to render now given the current debounce state.
 ///
 /// Returns `true` when `dirty` is true AND either:
@@ -246,8 +273,7 @@ impl App {
     pub fn new(config: Config) -> Self {
         let display_config = config.display_config();
         let (cols, rows) = terminal_size();
-        let pty_cols = cols.saturating_sub(config.sidebar_width);
-        let pty_rows = rows.saturating_sub(1);
+        let (pty_cols, pty_rows) = calculate_pane_dimensions(cols, rows, config.sidebar_width);
         Self {
             sessions: Arc::new(Mutex::new(SessionManager::with_max_sessions(config.max_sessions))),
             input_parser: InputParser::new(display_config),
@@ -503,8 +529,9 @@ impl App {
     }
 
     pub fn launch_root(&mut self) -> Result<String, Box<dyn std::error::Error>> {
-        let pty_cols = self.screen_cols.saturating_sub(self.config.sidebar_width);
-        let pty_rows = self.screen_rows.saturating_sub(1);
+        let (pty_cols, pty_rows) = calculate_pane_dimensions(
+            self.screen_cols, self.screen_rows, self.config.sidebar_width,
+        );
 
         // If MCP socket is available, generate config and inject --mcp-config
         // for agents that support it (e.g., claude)
@@ -546,8 +573,9 @@ impl App {
 
     /// Create a new PTY session with the default shell.
     pub fn create_session(&mut self, stdout_fd: i32) -> Result<(), Box<dyn std::error::Error>> {
-        let pty_cols = self.screen_cols.saturating_sub(self.config.sidebar_width);
-        let pty_rows = self.screen_rows.saturating_sub(1);
+        let (pty_cols, pty_rows) = calculate_pane_dimensions(
+            self.screen_cols, self.screen_rows, self.config.sidebar_width,
+        );
 
         let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         let tttt_pid = std::process::id();
@@ -1034,8 +1062,7 @@ impl App {
         let (cols, rows) = terminal_size();
         self.screen_cols = cols;
         self.screen_rows = rows;
-        let pty_cols = cols.saturating_sub(self.config.sidebar_width);
-        let pty_rows = rows.saturating_sub(1);
+        let (pty_cols, pty_rows) = calculate_pane_dimensions(cols, rows, self.config.sidebar_width);
         self.pane_renderer.resize(pty_cols, pty_rows);
         let resized_ids: Vec<String> = {
             let mut mgr = self.sessions.lock().unwrap();
@@ -1304,32 +1331,21 @@ impl App {
     /// Resize the PTY to the minimum size across the main terminal and all connected viewers.
     /// Clears the main terminal and forces a full redraw to remove stale content.
     fn resize_pty_to_min_and_redraw(&mut self, stdout_fd: i32) {
-        let sidebar = self.config.sidebar_width;
         // The PTY can never be larger than the main terminal's usable area
-        let max_pty_cols = self.screen_cols.saturating_sub(sidebar);
-        let max_pty_rows = self.screen_rows.saturating_sub(1);
-        
-        // Start with main terminal size as the baseline
-        let mut min_cols = max_pty_cols;
-        let mut min_rows = max_pty_rows;
+        let (max_pty_cols, max_pty_rows) = calculate_pane_dimensions(
+            self.screen_cols, self.screen_rows, self.config.sidebar_width,
+        );
 
-        // Find minimum across all connected viewers.
-        // Attach clients don't have a sidebar, so use their cols directly
-        // as usable PTY width (no sidebar subtraction).
-        for client in &self.viewer_clients {
-            if !client.connected {
-                continue;
-            }
-            let c = client.cols; // no sidebar on attach clients
-            let r = client.rows.saturating_sub(1);
-            min_cols = min_cols.min(c);
-            min_rows = min_rows.min(r);
-        }
+        // Build the viewer dimensions slice (only connected clients).
+        // Attach clients don't have a sidebar, so use their cols directly;
+        // subtract 1 from rows for the status bar.
+        let viewer_dims: Vec<(u16, u16)> = self.viewer_clients.iter()
+            .filter(|c| c.connected)
+            .map(|c| (c.cols, c.rows.saturating_sub(1)))
+            .collect();
 
-        // Clamp to maximum PTY size (main terminal's usable area)
-        // This ensures the PTY never grows larger than what the main window can display
-        min_cols = min_cols.min(max_pty_cols);
-        min_rows = min_rows.min(max_pty_rows);
+        let (min_cols, min_rows) =
+            calculate_min_dimensions(&viewer_dims, max_pty_cols, max_pty_rows);
 
         // Check if dimensions actually changed
         let (old_cols, old_rows) = self.pane_renderer.dimensions();
@@ -1472,6 +1488,50 @@ mod tests {
         assert!(help.contains("Live reload"), "should mention reload");
         assert!(help.contains("This help"), "should mention help");
         assert!(help.contains("Press any key"), "should mention dismiss");
+    }
+
+    // ── Chunk 5: calculate_pane_dimensions / calculate_min_dimensions ─────────
+
+    #[test]
+    fn test_calculate_pane_dimensions_basic() {
+        assert_eq!(calculate_pane_dimensions(120, 40, 20), (100, 39));
+    }
+
+    #[test]
+    fn test_calculate_pane_dimensions_zero_sidebar() {
+        assert_eq!(calculate_pane_dimensions(80, 24, 0), (80, 23));
+    }
+
+    #[test]
+    fn test_calculate_pane_dimensions_saturates_cols() {
+        assert_eq!(calculate_pane_dimensions(10, 24, 20), (0, 23));
+    }
+
+    #[test]
+    fn test_calculate_pane_dimensions_saturates_rows() {
+        assert_eq!(calculate_pane_dimensions(80, 0, 0), (80, 0));
+    }
+
+    #[test]
+    fn test_calculate_min_dimensions_no_viewers() {
+        assert_eq!(calculate_min_dimensions(&[], 100, 39), (100, 39));
+    }
+
+    #[test]
+    fn test_calculate_min_dimensions_smaller_viewer() {
+        assert_eq!(calculate_min_dimensions(&[(60, 20)], 100, 39), (60, 20));
+    }
+
+    #[test]
+    fn test_calculate_min_dimensions_larger_viewer_clamped() {
+        // Viewer larger than server → clamped to server baseline
+        assert_eq!(calculate_min_dimensions(&[(200, 50)], 100, 39), (100, 39));
+    }
+
+    #[test]
+    fn test_calculate_min_dimensions_multiple_viewers() {
+        let viewers = [(80, 30), (60, 25), (90, 35)];
+        assert_eq!(calculate_min_dimensions(&viewers, 100, 39), (60, 25));
     }
 
     // ── Chunk 4: should_render_now ───────────────────────────────────────────
