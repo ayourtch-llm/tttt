@@ -143,8 +143,23 @@ impl SqliteLogger {
         Ok(())
     }
 
+    /// Returns true if the sessions table exists in this database.
+    fn has_sessions_table(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
     /// List all sessions ordered by start time.
+    /// Returns an empty Vec if the sessions table does not exist.
     pub fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
+        if !self.has_sessions_table() {
+            return Ok(Vec::new());
+        }
         let mut stmt = self.conn.prepare(
             "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name
              FROM sessions ORDER BY started_at_ms",
@@ -166,12 +181,16 @@ impl SqliteLogger {
     }
 
     /// List session IDs that have events but no entry in the sessions table.
+    /// If the sessions table does not exist, returns ALL distinct session IDs from events.
     pub fn list_orphan_session_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
+        let sql = if self.has_sessions_table() {
             "SELECT DISTINCT session_id FROM events
              WHERE session_id NOT IN (SELECT session_id FROM sessions)
-             ORDER BY session_id",
-        )?;
+             ORDER BY session_id"
+        } else {
+            "SELECT DISTINCT session_id FROM events ORDER BY session_id"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
         let ids = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -204,7 +223,11 @@ impl SqliteLogger {
     }
 
     /// Get info for a specific session by ID.
+    /// Returns None if the sessions table does not exist or the session is not found.
     pub fn get_session_info(&self, session_id: &str) -> Result<Option<SessionInfo>> {
+        if !self.has_sessions_table() {
+            return Ok(None);
+        }
         let mut stmt = self.conn.prepare(
             "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name
              FROM sessions WHERE session_id = ?1",
@@ -478,6 +501,113 @@ mod tests {
 
         let count = logger.lock().unwrap().event_count().unwrap();
         assert_eq!(count, 1);
+    }
+
+    // --- Legacy DB helper (events table only, no sessions table) ---
+
+    fn legacy_in_memory() -> SqliteLogger {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                data BLOB NOT NULL
+            );
+            CREATE INDEX idx_events_session ON events(session_id, timestamp_ms);",
+        )
+        .unwrap();
+        SqliteLogger { conn }
+    }
+
+    // --- has_sessions_table tests ---
+
+    #[test]
+    fn test_has_sessions_table_true() {
+        let logger = SqliteLogger::in_memory().unwrap();
+        assert!(logger.has_sessions_table());
+    }
+
+    #[test]
+    fn test_has_sessions_table_false() {
+        let logger = legacy_in_memory();
+        assert!(!logger.has_sessions_table());
+    }
+
+    // --- Graceful fallback on legacy DB ---
+
+    #[test]
+    fn test_list_sessions_legacy_db_returns_empty() {
+        let logger = legacy_in_memory();
+        let sessions = logger.list_sessions().unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn test_get_session_info_legacy_db_returns_none() {
+        let logger = legacy_in_memory();
+        let info = logger.get_session_info("any-id").unwrap();
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn test_list_orphan_session_ids_legacy_db_returns_all() {
+        let mut logger = legacy_in_memory();
+        logger.log_event(&LogEvent::with_timestamp(1, "s1".to_string(), Direction::Output, b"a".to_vec())).unwrap();
+        logger.log_event(&LogEvent::with_timestamp(2, "s2".to_string(), Direction::Output, b"b".to_vec())).unwrap();
+        let orphans = logger.list_orphan_session_ids().unwrap();
+        assert_eq!(orphans.len(), 2);
+        assert!(orphans.contains(&"s1".to_string()));
+        assert!(orphans.contains(&"s2".to_string()));
+    }
+
+    #[test]
+    fn test_list_orphan_session_ids_legacy_db_empty_events() {
+        let logger = legacy_in_memory();
+        let orphans = logger.list_orphan_session_ids().unwrap();
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn test_infer_session_info_legacy_db() {
+        let mut logger = legacy_in_memory();
+        logger.log_event(&LogEvent::with_timestamp(1000, "orphan".to_string(), Direction::Output, b"hi".to_vec())).unwrap();
+        let info = logger.infer_session_info("orphan").unwrap().unwrap();
+        assert_eq!(info.session_id, "orphan");
+        assert_eq!(info.command, "unknown");
+        assert_eq!(info.started_at_ms, 1000);
+    }
+
+    #[test]
+    fn test_open_read_only_legacy_db_list_sessions_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        // Create a DB with only the events table (simulating pre-sessions-table era)
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    direction TEXT NOT NULL,
+                    data BLOB NOT NULL
+                );",
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO events (session_id, timestamp_ms, direction, data) VALUES ('s1', 1000, 'output', X'68656c6c6f')",
+                [],
+            ).unwrap();
+        }
+        let ro = SqliteLogger::open_read_only(&path).unwrap();
+        // Should not crash
+        let sessions = ro.list_sessions().unwrap();
+        assert!(sessions.is_empty());
+        let info = ro.get_session_info("s1").unwrap();
+        assert!(info.is_none());
+        let orphans = ro.list_orphan_session_ids().unwrap();
+        assert_eq!(orphans, vec!["s1".to_string()]);
     }
 
     // --- Orphan session tests ---
