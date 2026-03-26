@@ -605,11 +605,36 @@ impl App {
         if self.mcp_socket_path.is_some() {
             if let Ok(config_path) = self.generate_mcp_config() {
                 mcp_config_path = Some(config_path.clone());
-                // Check if the command looks like claude and inject --mcp-config
                 let cmd = &self.config.root_command;
                 if cmd.contains("claude") && !args.iter().any(|a| a.contains("mcp-config")) {
+                    // Claude uses --mcp-config with a JSON file
                     args.push("--mcp-config".to_string());
                     args.push(config_path);
+                } else if cmd.contains("apchat") {
+                    // For apchat: load extra args from tmp/apchat.args or APCHAT_ARGS env var
+                    let extra_args_str = std::env::var("APCHAT_ARGS").ok().or_else(|| {
+                        let args_file = self.config.work_dir.join("tmp/apchat.args");
+                        std::fs::read_to_string(&args_file).ok().map(|s| s.trim().to_string())
+                    });
+                    if let Some(extra) = extra_args_str {
+                        if let Ok(parsed) = shell_words::split(&extra) {
+                            args.extend(parsed);
+                        }
+                    }
+                    // Inject --mcp-server with quoted command string
+                    if !args.iter().any(|a| a.contains("mcp-server")) {
+                        let mcp_socket = self.mcp_socket_path.as_ref().unwrap();
+                        let tttt_bin = std::env::current_exe()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("tttt"));
+                        let mcp_server_cmd = shell_words::join(&[
+                            tttt_bin.to_string_lossy().as_ref(),
+                            "mcp-server",
+                            "--connect",
+                            mcp_socket.as_str(),
+                        ]);
+                        args.push("--mcp-server".to_string());
+                        args.push(mcp_server_cmd);
+                    }
                 }
             }
         }
