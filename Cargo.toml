@@ -26,6 +26,8 @@ toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
+ratatui = "0.29"
+crossterm = "0.28"
 
 [package]
 name = "tttt"
@@ -50,6 +52,9 @@ vt100 = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 base64 = "0.22"
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

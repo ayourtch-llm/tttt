@@ -118,6 +118,11 @@ impl SessionReplay {
         }
     }
 
+    /// Expose the raw vt100 screen for cell-by-cell access (e.g. for ratatui rendering).
+    pub fn screen(&self) -> &vt100::Screen {
+        self.screen.screen()
+    }
+
     /// Returns (index, timestamp_ms, direction) for every event.
     pub fn timeline(&self) -> Vec<(usize, u64, Direction)> {
         self.events

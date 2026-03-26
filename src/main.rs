@@ -2,6 +2,7 @@ mod app;
 mod attach;
 mod config;
 mod reload;
+mod replay_tui;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -59,6 +60,17 @@ enum Commands {
         #[arg(short, long)]
         socket: Option<String>,
     },
+
+    /// Replay a recorded terminal session
+    Replay {
+        /// Path to the SQLite database (default: from config)
+        #[arg(short, long)]
+        database: Option<std::path::PathBuf>,
+
+        /// Session ID to open directly (default: show session list)
+        #[arg(short, long)]
+        session: Option<String>,
+    },
 }
 
 fn main() {
@@ -81,6 +93,15 @@ fn main() {
         }
         Some(Commands::Attach { socket }) => {
             run_attach(socket);
+        }
+        Some(Commands::Replay { database, session }) => {
+            let db_path = database.unwrap_or_else(|| {
+                config::Config::load_default().db_path
+            });
+            if let Err(e) = replay_tui::run_replay(&db_path, session.as_deref()) {
+                eprintln!("Replay error: {}", e);
+                std::process::exit(1);
+            }
         }
         None => {
             run_tui(cli);
