@@ -102,6 +102,25 @@ fn write_all(fd: i32, data: &[u8]) -> nix::Result<()> {
     Ok(())
 }
 
+/// Reconcile the ordered session list against the ground-truth set.
+///
+/// - Preserves the relative order of IDs already in `current`.
+/// - Appends any IDs in `actual` not yet present in `current`.
+/// - Removes IDs that are no longer in `actual`.
+fn reconcile_session_order(current: &[String], actual: &[String]) -> Vec<String> {
+    let mut result: Vec<String> = current
+        .iter()
+        .filter(|id| actual.contains(id))
+        .cloned()
+        .collect();
+    for id in actual {
+        if !result.contains(id) {
+            result.push(id.clone());
+        }
+    }
+    result
+}
+
 /// Compute the new session index after a relative navigation step.
 ///
 /// Returns `None` when `total == 0`. `current_idx = None` is treated as 0.
@@ -870,17 +889,9 @@ impl App {
     /// Sync session_order with the actual sessions (MCP may have added new ones).
     fn sync_session_order(&mut self) {
         let mgr = self.sessions.lock().unwrap();
-        let current_ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
+        let actual_ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
         drop(mgr);
-
-        // Add any new sessions not in our order
-        for id in &current_ids {
-            if !self.session_order.contains(id) {
-                self.session_order.push(id.clone());
-            }
-        }
-        // Remove any sessions that no longer exist
-        self.session_order.retain(|id| current_ids.contains(id));
+        self.session_order = reconcile_session_order(&self.session_order, &actual_ids);
     }
 
     fn handle_input_event(&mut self, event: InputEvent, stdout_fd: i32) -> Result<bool, Box<dyn std::error::Error>> {
@@ -1435,6 +1446,44 @@ mod tests {
         assert!(help.contains("Live reload"), "should mention reload");
         assert!(help.contains("This help"), "should mention help");
         assert!(help.contains("Press any key"), "should mention dismiss");
+    }
+
+    // ── Chunk 3: reconcile_session_order ─────────────────────────────────────
+
+    fn ss(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+
+    #[test]
+    fn test_reconcile_empty_current_returns_actual() {
+        assert_eq!(reconcile_session_order(&ss(&[]), &ss(&["a", "b"])), ss(&["a", "b"]));
+    }
+
+    #[test]
+    fn test_reconcile_empty_actual_returns_empty() {
+        assert_eq!(reconcile_session_order(&ss(&["a", "b"]), &ss(&[])), ss(&[]));
+    }
+
+    #[test]
+    fn test_reconcile_preserves_existing_order() {
+        let result = reconcile_session_order(&ss(&["b", "a"]), &ss(&["a", "b"]));
+        assert_eq!(result, ss(&["b", "a"]));
+    }
+
+    #[test]
+    fn test_reconcile_appends_new_ids() {
+        let result = reconcile_session_order(&ss(&["a"]), &ss(&["a", "b", "c"]));
+        assert_eq!(result, ss(&["a", "b", "c"]));
+    }
+
+    #[test]
+    fn test_reconcile_removes_stale_ids() {
+        let result = reconcile_session_order(&ss(&["a", "b", "c"]), &ss(&["a", "c"]));
+        assert_eq!(result, ss(&["a", "c"]));
+    }
+
+    #[test]
+    fn test_reconcile_add_and_remove_simultaneously() {
+        let result = reconcile_session_order(&ss(&["a", "b"]), &ss(&["b", "c"]));
+        assert_eq!(result, ss(&["b", "c"]));
     }
 
     // ── Chunk 2: compute_relative_index ──────────────────────────────────────
