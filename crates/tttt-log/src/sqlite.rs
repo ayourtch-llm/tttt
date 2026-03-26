@@ -278,8 +278,12 @@ impl SqliteLogger {
         if self.events_has_pid {
             let sql = if self.has_sessions_table() {
                 "SELECT session_id, pid FROM events
-                 WHERE session_id NOT IN (SELECT session_id FROM sessions)
                  GROUP BY session_id, pid
+                 HAVING NOT EXISTS (
+                     SELECT 1 FROM sessions s
+                     WHERE s.session_id = events.session_id
+                       AND (s.pid = events.pid OR (s.pid IS NULL AND events.pid IS NULL))
+                 )
                  ORDER BY session_id, pid"
             } else {
                 "SELECT session_id, pid FROM events
