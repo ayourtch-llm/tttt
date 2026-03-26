@@ -1463,4 +1463,391 @@ mod tests {
             Some(1)
         );
     }
+
+    // ── TestBackend rendering and key-handling tests ──────────────────────────
+
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn make_terminal() -> Terminal<TestBackend> {
+        Terminal::new(TestBackend::new(140, 35)).unwrap()
+    }
+
+    fn make_app_in_list() -> ReplayApp {
+        let db = make_db_with_session();
+        let sessions = build_session_list(&db).unwrap();
+        ReplayApp::new(db, sessions, None).unwrap()
+    }
+
+    fn make_app_two_sessions() -> ReplayApp {
+        use tttt_log::LogSink;
+        let mut db = SqliteLogger::in_memory().unwrap();
+        db.log_session_start("s1", "bash", 80, 24, None).unwrap();
+        db.log_session_start("s2", "zsh", 80, 24, None).unwrap();
+        db.log_event(&LogEvent::with_timestamp(
+            1000, "s1".to_string(), Direction::Output, b"x".to_vec())).unwrap();
+        db.log_event(&LogEvent::with_timestamp(
+            2000, "s2".to_string(), Direction::Output, b"y".to_vec())).unwrap();
+        let sessions = build_session_list(&db).unwrap();
+        ReplayApp::new(db, sessions, None).unwrap()
+    }
+
+    fn make_app_in_replay() -> ReplayApp {
+        let db = make_db_with_session();
+        let sessions = build_session_list(&db).unwrap();
+        ReplayApp::new(db, sessions, Some("sess1")).unwrap()
+    }
+
+    fn press(code: KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn buf_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+    }
+
+    // --- rendering: session list ---
+
+    #[test]
+    fn test_render_session_list_shows_header() {
+        let mut app = make_app_in_list();
+        let mut terminal = make_terminal();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let text = buf_text(&terminal);
+        assert!(text.contains("ID"), "expected 'ID' header");
+        assert!(text.contains("Command"), "expected 'Command' header");
+        assert!(text.contains("Started"), "expected 'Started' header");
+    }
+
+    #[test]
+    fn test_render_session_list_shows_session_command() {
+        let mut app = make_app_in_list();
+        let mut terminal = make_terminal();
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert!(buf_text(&terminal).contains("bash"), "expected 'bash' in session list");
+    }
+
+    #[test]
+    fn test_render_session_list_shows_pid_column() {
+        let mut app = make_app_in_list();
+        let mut terminal = make_terminal();
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert!(buf_text(&terminal).contains("PID"), "expected 'PID' column header");
+    }
+
+    #[test]
+    fn test_render_session_list_shows_title() {
+        let mut app = make_app_in_list();
+        let mut terminal = make_terminal();
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert!(buf_text(&terminal).contains("Sessions"), "expected 'Sessions' title");
+    }
+
+    #[test]
+    fn test_render_session_list_with_separator() {
+        let g = VISUAL_GAP_THRESHOLD_MS + 1;
+        let entries = vec![
+            make_entry(0, Some(1_000)),
+            make_entry(1_000 + g, None),
+        ];
+        let db = SqliteLogger::in_memory().unwrap();
+        let mut app = ReplayApp::new(db, entries, None).unwrap();
+        let mut terminal = make_terminal();
+        terminal.draw(|f| app.render(f)).unwrap();
+        // "── 60m 0s gap ──" is the label; the first column is 10 chars wide
+        // so "gap" is truncated. Check for the "──" prefix which is always present.
+        assert!(buf_text(&terminal).contains("──"), "expected '──' separator decoration in buffer");
+    }
+
+    // --- rendering: replay view ---
+
+    #[test]
+    fn test_render_replay_paused_icon() {
+        let mut app = make_app_in_replay();
+        let mut terminal = make_terminal();
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert!(buf_text(&terminal).contains("[|]"), "paused replay should show '[|]' icon");
+    }
+
+    #[test]
+    fn test_render_replay_playing_icon() {
+        let mut app = make_app_in_replay();
+        if let View::Replay(state) = &mut app.view {
+            state.playing = true;
+        }
+        let mut terminal = make_terminal();
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert!(buf_text(&terminal).contains("[>]"), "playing replay should show '[>]' icon");
+    }
+
+    #[test]
+    fn test_render_replay_event_count() {
+        let mut app = make_app_in_replay();
+        let mut terminal = make_terminal();
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert!(buf_text(&terminal).contains("0/2"), "status bar should show '0/2'");
+    }
+
+    #[test]
+    fn test_render_replay_speed() {
+        let mut app = make_app_in_replay();
+        let mut terminal = make_terminal();
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert!(buf_text(&terminal).contains("1.000x"), "status bar should show default speed");
+    }
+
+    #[test]
+    fn test_render_replay_shows_command() {
+        let mut app = make_app_in_replay();
+        let mut terminal = make_terminal();
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert!(buf_text(&terminal).contains("bash"), "status bar should show command 'bash'");
+    }
+
+    // --- key handling: session list ---
+
+    #[test]
+    fn test_handle_key_j_moves_down() {
+        let mut app = make_app_two_sessions();
+        let sel_before = if let View::SessionList(s) = &app.view {
+            s.table_state.selected()
+        } else { panic!("expected SessionList") };
+        assert_eq!(sel_before, Some(0));
+        app.handle_key(press(KeyCode::Char('j'))).unwrap();
+        let sel = if let View::SessionList(s) = &app.view {
+            s.table_state.selected()
+        } else { panic!("expected SessionList") };
+        assert_eq!(sel, Some(1));
+    }
+
+    #[test]
+    fn test_handle_key_down_arrow_moves_down() {
+        let mut app = make_app_two_sessions();
+        app.handle_key(press(KeyCode::Down)).unwrap();
+        let sel = if let View::SessionList(s) = &app.view {
+            s.table_state.selected()
+        } else { panic!("expected SessionList") };
+        assert_eq!(sel, Some(1));
+    }
+
+    #[test]
+    fn test_handle_key_k_moves_up() {
+        let mut app = make_app_two_sessions();
+        app.handle_key(press(KeyCode::Char('j'))).unwrap();
+        app.handle_key(press(KeyCode::Char('k'))).unwrap();
+        let sel = if let View::SessionList(s) = &app.view {
+            s.table_state.selected()
+        } else { panic!("expected SessionList") };
+        assert_eq!(sel, Some(0));
+    }
+
+    #[test]
+    fn test_handle_key_up_arrow_moves_up() {
+        let mut app = make_app_two_sessions();
+        app.handle_key(press(KeyCode::Down)).unwrap();
+        app.handle_key(press(KeyCode::Up)).unwrap();
+        let sel = if let View::SessionList(s) = &app.view {
+            s.table_state.selected()
+        } else { panic!("expected SessionList") };
+        assert_eq!(sel, Some(0));
+    }
+
+    #[test]
+    fn test_handle_key_q_in_session_list_quits() {
+        let mut app = make_app_in_list();
+        assert!(!app.should_quit);
+        app.handle_key(press(KeyCode::Char('q'))).unwrap();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_handle_key_esc_in_session_list_quits() {
+        let mut app = make_app_in_list();
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_handle_key_enter_opens_session() {
+        let mut app = make_app_in_list();
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.view, View::Replay(_)), "Enter should open Replay view");
+    }
+
+    #[test]
+    fn test_handle_key_enter_with_no_sessions_does_nothing() {
+        let db = SqliteLogger::in_memory().unwrap();
+        let mut app = ReplayApp::new(db, vec![], None).unwrap();
+        app.handle_key(press(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.view, View::SessionList(_)));
+    }
+
+    // --- key handling: replay view ---
+
+    #[test]
+    fn test_handle_key_q_in_replay_returns_to_list() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::Char('q'))).unwrap();
+        assert!(matches!(app.view, View::SessionList(_)));
+        assert!(!app.should_quit, "q in replay must not quit the app");
+    }
+
+    #[test]
+    fn test_handle_key_esc_in_replay_returns_to_list() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::Esc)).unwrap();
+        assert!(matches!(app.view, View::SessionList(_)));
+    }
+
+    #[test]
+    fn test_handle_key_space_toggles_playing_on() {
+        let mut app = make_app_in_replay();
+        assert!(!app.is_playing());
+        app.handle_key(press(KeyCode::Char(' '))).unwrap();
+        assert!(app.is_playing());
+    }
+
+    #[test]
+    fn test_handle_key_space_toggles_playing_off() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::Char(' '))).unwrap();
+        app.handle_key(press(KeyCode::Char(' '))).unwrap();
+        assert!(!app.is_playing());
+    }
+
+    #[test]
+    fn test_handle_key_right_steps_forward() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        let idx = if let View::Replay(s) = &app.view { s.replay.current_index() } else { panic!() };
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn test_handle_key_l_steps_forward() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::Char('l'))).unwrap();
+        let idx = if let View::Replay(s) = &app.view { s.replay.current_index() } else { panic!() };
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn test_handle_key_left_at_start_stays_at_zero() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::Left)).unwrap();
+        let idx = if let View::Replay(s) = &app.view { s.replay.current_index() } else { panic!() };
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_handle_key_left_after_right_goes_back() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        app.handle_key(press(KeyCode::Left)).unwrap();
+        let idx = if let View::Replay(s) = &app.view { s.replay.current_index() } else { panic!() };
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_handle_key_h_steps_backward() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::Char('l'))).unwrap();
+        app.handle_key(press(KeyCode::Char('h'))).unwrap();
+        let idx = if let View::Replay(s) = &app.view { s.replay.current_index() } else { panic!() };
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_handle_key_home_seeks_to_start() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        app.handle_key(press(KeyCode::Home)).unwrap();
+        let idx = if let View::Replay(s) = &app.view { s.replay.current_index() } else { panic!() };
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_handle_key_g_seeks_to_start() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        app.handle_key(press(KeyCode::Char('g'))).unwrap();
+        let idx = if let View::Replay(s) = &app.view { s.replay.current_index() } else { panic!() };
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_handle_key_end_seeks_to_end() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::End)).unwrap();
+        let idx = if let View::Replay(s) = &app.view { s.replay.current_index() } else { panic!() };
+        assert_eq!(idx, 2);
+    }
+
+    #[test]
+    fn test_handle_key_capital_g_seeks_to_end() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::Char('G'))).unwrap();
+        let idx = if let View::Replay(s) = &app.view { s.replay.current_index() } else { panic!() };
+        assert_eq!(idx, 2);
+    }
+
+    #[test]
+    fn test_handle_key_plus_increases_speed() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::Char('+'))).unwrap();
+        let speed = if let View::Replay(s) = &app.view { s.speed } else { panic!() };
+        assert_eq!(speed, 2.0);
+    }
+
+    #[test]
+    fn test_handle_key_equals_increases_speed() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::Char('='))).unwrap();
+        let speed = if let View::Replay(s) = &app.view { s.speed } else { panic!() };
+        assert_eq!(speed, 2.0);
+    }
+
+    #[test]
+    fn test_handle_key_minus_decreases_speed() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::Char('-'))).unwrap();
+        let speed = if let View::Replay(s) = &app.view { s.speed } else { panic!() };
+        assert_eq!(speed, 0.5);
+    }
+
+    #[test]
+    fn test_handle_key_bracket_right_jumps_10_forward() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::Char(']'))).unwrap();
+        let idx = if let View::Replay(s) = &app.view { s.replay.current_index() } else { panic!() };
+        assert_eq!(idx, 2); // 0+10 clamped to event_count=2
+    }
+
+    #[test]
+    fn test_handle_key_bracket_left_jumps_10_backward() {
+        let mut app = make_app_in_replay();
+        app.handle_key(press(KeyCode::End)).unwrap();
+        app.handle_key(press(KeyCode::Char('['))).unwrap();
+        let idx = if let View::Replay(s) = &app.view { s.replay.current_index() } else { panic!() };
+        assert_eq!(idx, 0); // 2.saturating_sub(10)=0
+    }
+
+    #[test]
+    fn test_handle_key_right_disables_playing() {
+        let mut app = make_app_in_replay();
+        if let View::Replay(state) = &mut app.view { state.playing = true; }
+        app.handle_key(press(KeyCode::Right)).unwrap();
+        let playing = if let View::Replay(s) = &app.view { s.playing } else { panic!() };
+        assert!(!playing, "Right arrow should stop playback");
+    }
+
+    #[test]
+    fn test_handle_key_left_disables_playing() {
+        let mut app = make_app_in_replay();
+        if let View::Replay(state) = &mut app.view { state.playing = true; }
+        app.handle_key(press(KeyCode::Left)).unwrap();
+        let playing = if let View::Replay(s) = &app.view { s.playing } else { panic!() };
+        assert!(!playing, "Left arrow should stop playback");
+    }
 }
