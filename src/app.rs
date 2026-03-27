@@ -194,6 +194,68 @@ fn calculate_min_dimensions(
     (min_cols, min_rows)
 }
 
+/// Build the escape-sequence string that fills the right-margin gap (between
+/// the PTY right edge and the sidebar) with gray dots.
+///
+/// * `min_cols`     — current PTY width (columns used by the PTY)
+/// * `max_pty_cols` — maximum usable columns (screen width minus sidebar)
+/// * `screen_rows`  — full terminal height (the loop covers the whole height,
+///                    not just the PTY height, so rows below the PTY are also
+///                    filled)
+///
+/// Returns an empty string when `min_cols >= max_pty_cols` (no gap).
+fn build_width_gap_output(min_cols: u16, max_pty_cols: u16, screen_rows: u16) -> String {
+    if min_cols >= max_pty_cols {
+        return String::new();
+    }
+    let dot_attr = "\x1b[2;90m";
+    let reset = "\x1b[0m";
+    let dots: String = ".".repeat((max_pty_cols - min_cols) as usize);
+    let mut out = String::new();
+    for row in 0..screen_rows {
+        out.push_str(&format!(
+            "\x1b[{};{}H{}{}{}",
+            row + 1,
+            min_cols + 1,
+            dot_attr,
+            dots,
+            reset,
+        ));
+    }
+    out
+}
+
+/// Build the escape-sequence string that fills rows below the PTY area
+/// (from `min_rows` up to `max_pty_rows`) with gray dots across the full
+/// pane width.
+///
+/// * `min_rows`     — current PTY height
+/// * `max_pty_rows` — maximum usable rows for the PTY (screen rows minus
+///                    one for the status bar, i.e. `screen_rows - 1`)
+/// * `max_pty_cols` — full pane width (columns to fill with dots)
+///
+/// Returns an empty string when `min_rows >= max_pty_rows` (no gap).
+fn build_height_gap_output(min_rows: u16, max_pty_rows: u16, max_pty_cols: u16) -> String {
+    if min_rows >= max_pty_rows {
+        return String::new();
+    }
+    let dot_attr = "\x1b[2;90m";
+    let reset = "\x1b[0m";
+    let pane_dots: String = ".".repeat(max_pty_cols as usize);
+    let mut out = String::new();
+    for row in min_rows..max_pty_rows {
+        out.push_str(&format!(
+            "\x1b[{};{}H{}{}{}",
+            row + 1,
+            1,
+            dot_attr,
+            pane_dots,
+            reset,
+        ));
+    }
+    out
+}
+
 /// Decide whether to render now given the current debounce state.
 ///
 /// Returns `true` when `dirty` is true AND either:
@@ -1478,26 +1540,18 @@ impl App {
                     }
                 }
             }
-            // Fill gap between PTY area and sidebar with gray dots
+            // Fill gap between PTY area and sidebar with gray dots (full terminal height)
             let max_pty_cols = self.screen_cols.saturating_sub(self.config.sidebar_width);
-            if min_cols < max_pty_cols {
-                let dot_attr = "\x1b[2;90m"; // dim + gray
-                let reset = "\x1b[0m";
-                let dots: String = ".".repeat((max_pty_cols - min_cols) as usize);
-                for row in 0..min_rows {
-                    let _ = write_all(
-                        stdout_fd,
-                        format!(
-                            "\x1b[{};{}H{}{}{}",
-                            row + 1,
-                            min_cols + 1,
-                            dot_attr,
-                            dots,
-                            reset
-                        )
-                        .as_bytes(),
-                    );
-                }
+            let width_gap = build_width_gap_output(min_cols, max_pty_cols, self.screen_rows);
+            if !width_gap.is_empty() {
+                let _ = write_all(stdout_fd, width_gap.as_bytes());
+            }
+
+            // Fill height gap: rows below PTY area with gray dots across full pane width
+            let max_pty_rows = self.screen_rows.saturating_sub(1); // -1 for status bar
+            let height_gap = build_height_gap_output(min_rows, max_pty_rows, max_pty_cols);
+            if !height_gap.is_empty() {
+                let _ = write_all(stdout_fd, height_gap.as_bytes());
             }
 
             let _ = self.render_sidebar(stdout_fd);
@@ -1867,5 +1921,123 @@ mod tests {
         let help = format_help_screen("XX");
         let count = help.matches("XX").count();
         assert!(count >= 2, "prefix should appear at least twice (label + literal-prefix entry)");
+    }
+
+    // ── Gap-fill helpers: build_width_gap_output / build_height_gap_output ───
+
+    #[test]
+    fn test_build_width_gap_output_no_gap_returns_empty() {
+        // min_cols == max_pty_cols → no gap
+        assert_eq!(build_width_gap_output(80, 80, 24), "");
+    }
+
+    #[test]
+    fn test_build_width_gap_output_min_exceeds_max_returns_empty() {
+        // min_cols > max_pty_cols (degenerate) → no gap
+        assert_eq!(build_width_gap_output(100, 80, 24), "");
+    }
+
+    #[test]
+    fn test_build_width_gap_output_covers_full_screen_rows() {
+        // BUG: previously the loop was `0..min_rows` (only PTY height).
+        // After the fix the loop must be `0..screen_rows`.
+        // Verify that the output contains a move-to-cursor for the last
+        // screen row (row 24 when screen_rows=24).
+        let out = build_width_gap_output(60, 80, 24);
+        // The last row escape: \x1b[24;61H
+        assert!(
+            out.contains("\x1b[24;61H"),
+            "width gap must cover the full terminal height (last row = screen_rows)"
+        );
+    }
+
+    #[test]
+    fn test_build_width_gap_output_does_not_exceed_screen_rows() {
+        // The output must NOT contain a row beyond screen_rows.
+        let out = build_width_gap_output(60, 80, 24);
+        // Row 25 would be beyond screen_rows=24
+        assert!(
+            !out.contains("\x1b[25;"),
+            "width gap must not write beyond screen_rows"
+        );
+    }
+
+    #[test]
+    fn test_build_width_gap_output_correct_column_and_dot_count() {
+        // min_cols=60, max_pty_cols=80 → gap of 20 dots starting at col 61
+        let out = build_width_gap_output(60, 80, 5);
+        let dots = ".".repeat(20);
+        // Each row line should contain the dot string
+        assert!(out.contains(&dots), "gap dots count should match max_pty_cols - min_cols");
+        // Column start should be min_cols + 1 = 61
+        assert!(out.contains("\x1b[1;61H"), "first row should start at column 61");
+    }
+
+    #[test]
+    fn test_build_width_gap_output_contains_dim_gray_attribute() {
+        let out = build_width_gap_output(40, 80, 5);
+        assert!(out.contains("\x1b[2;90m"), "must use dim+gray attribute");
+        assert!(out.contains("\x1b[0m"), "must reset attribute after dots");
+    }
+
+    #[test]
+    fn test_build_height_gap_output_no_gap_returns_empty() {
+        // min_rows == max_pty_rows → no height gap
+        assert_eq!(build_height_gap_output(23, 23, 80), "");
+    }
+
+    #[test]
+    fn test_build_height_gap_output_min_exceeds_max_returns_empty() {
+        // degenerate: min_rows > max_pty_rows
+        assert_eq!(build_height_gap_output(25, 23, 80), "");
+    }
+
+    #[test]
+    fn test_build_height_gap_output_fills_rows_from_min_to_max() {
+        // min_rows=10, max_pty_rows=23, max_pty_cols=80
+        // Should produce rows 11..23 (1-indexed)
+        let out = build_height_gap_output(10, 23, 80);
+        // First gap row (1-indexed = 11)
+        assert!(
+            out.contains("\x1b[11;1H"),
+            "height gap must start at row min_rows+1"
+        );
+        // Last gap row (1-indexed = 23)
+        assert!(
+            out.contains("\x1b[23;1H"),
+            "height gap must end at row max_pty_rows"
+        );
+        // Must not contain a row that is below min_rows (row 10 or earlier)
+        assert!(
+            !out.contains("\x1b[10;1H"),
+            "height gap must not include PTY rows"
+        );
+        // Must not exceed max_pty_rows
+        assert!(
+            !out.contains("\x1b[24;1H"),
+            "height gap must not exceed max_pty_rows"
+        );
+    }
+
+    #[test]
+    fn test_build_height_gap_output_full_pane_width_dots() {
+        // max_pty_cols=80 → each row filled with 80 dots
+        let out = build_height_gap_output(10, 12, 80);
+        let dots = ".".repeat(80);
+        assert!(out.contains(&dots), "height gap dots must span full pane width");
+    }
+
+    #[test]
+    fn test_build_height_gap_output_contains_dim_gray_attribute() {
+        let out = build_height_gap_output(5, 10, 40);
+        assert!(out.contains("\x1b[2;90m"), "must use dim+gray attribute");
+        assert!(out.contains("\x1b[0m"), "must reset attribute after dots");
+    }
+
+    #[test]
+    fn test_build_height_gap_output_column_starts_at_one() {
+        // Height gap always fills from column 1
+        let out = build_height_gap_output(5, 8, 40);
+        assert!(out.contains(";1H"), "height gap rows must start at column 1");
     }
 }
