@@ -61,6 +61,11 @@ impl SqliteLogger {
         if !column_exists(&conn, "sessions", "pid") {
             let _ = conn.execute("ALTER TABLE sessions ADD COLUMN pid INTEGER", []);
         }
+        // Create index on (session_id, pid) after pid column is guaranteed to exist.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_events_session_pid
+                ON events(session_id, pid);",
+        )?;
         Ok(Self {
             conn,
             pid: Some(std::process::id()),
@@ -489,6 +494,61 @@ impl SqliteLogger {
                 .query_map(rusqlite::params![session_id, from_ms, to_ms], Self::map_event_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(events)
+        }
+    }
+
+    /// Count events for a session filtered by optional PID.
+    /// Like `query_events_with_pid` but returns only the count, avoiding data transfer.
+    pub fn count_events_with_pid(
+        &self,
+        session_id: &str,
+        pid: Option<u32>,
+    ) -> Result<usize> {
+        if let Some(p) = pid {
+            if self.events_has_pid {
+                let count: usize = self.conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND pid = ?2",
+                    rusqlite::params![session_id, p],
+                    |row| row.get(0),
+                )?;
+                return Ok(count);
+            }
+        }
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Count events for a session with NULL pid in a timestamp range.
+    /// Like `query_events_in_range` but returns only the count, avoiding data transfer.
+    pub fn count_events_in_range(
+        &self,
+        session_id: &str,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<usize> {
+        let to_ms = to_ms.min(i64::MAX as u64);
+        if self.events_has_pid {
+            let count: usize = self.conn.query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE session_id = ?1 AND pid IS NULL
+                   AND timestamp_ms >= ?2 AND timestamp_ms <= ?3",
+                rusqlite::params![session_id, from_ms, to_ms],
+                |row| row.get(0),
+            )?;
+            Ok(count)
+        } else {
+            let count: usize = self.conn.query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE session_id = ?1
+                   AND timestamp_ms >= ?2 AND timestamp_ms <= ?3",
+                rusqlite::params![session_id, from_ms, to_ms],
+                |row| row.get(0),
+            )?;
+            Ok(count)
         }
     }
 

@@ -60,18 +60,18 @@ fn build_session_list(db: &SqliteLogger) -> Result<Vec<SessionListEntry>> {
     let mut sessions = Vec::new();
 
     for info in db.list_sessions()? {
-        let event_count = db.query_events_with_pid(&info.session_id, info.pid).map(|e| e.len()).unwrap_or(0);
+        let event_count = db.count_events_with_pid(&info.session_id, info.pid).unwrap_or(0);
         sessions.push(SessionListEntry { info, event_count, load_strategy: LoadStrategy::ByPid });
     }
 
     for info in db.list_orphan_session_chunks()? {
         if info.pid.is_some() {
-            let event_count = db.query_events_with_pid(&info.session_id, info.pid).map(|e| e.len()).unwrap_or(0);
+            let event_count = db.count_events_with_pid(&info.session_id, info.pid).unwrap_or(0);
             sessions.push(SessionListEntry { info, event_count, load_strategy: LoadStrategy::ByPid });
         } else {
             let to_ms = info.ended_at_ms.unwrap_or(i64::MAX as u64);
-            let event_count = db.query_events_in_range(&info.session_id, info.started_at_ms, to_ms)
-                .map(|e| e.len()).unwrap_or(0);
+            let event_count = db.count_events_in_range(&info.session_id, info.started_at_ms, to_ms)
+                .unwrap_or(0);
             sessions.push(SessionListEntry { info, event_count, load_strategy: LoadStrategy::ByTimeRange });
         }
     }
