@@ -1,0 +1,19 @@
+#!/bin/bash
+# Lazy-install wrapper for OpenAI Codex CLI (@openai/codex)
+# Installs on first use, then passes through to the real binary.
+set -e
+
+INSTALL_DIR="/opt/harness/bin"
+REAL_BIN="$INSTALL_DIR/codex"
+
+if [ ! -x "$REAL_BIN" ]; then
+    echo "OpenAI Codex CLI not found. Installing @openai/codex..."
+    mkdir -p "$INSTALL_DIR"
+    npm install -g --prefix /opt/harness @openai/codex
+    if [ ! -x "$REAL_BIN" ]; then
+        echo "Error: codex binary not found after install" >&2
+        exit 1
+    fi
+fi
+
+exec "$REAL_BIN" "$@"

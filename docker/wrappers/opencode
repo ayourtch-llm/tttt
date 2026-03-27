@@ -1,0 +1,27 @@
+#!/bin/bash
+# Lazy-install wrapper for OpenCode CLI (anomalyco/opencode)
+# Installs on first use, then passes through to the real binary.
+set -e
+
+INSTALL_DIR="/opt/harness/bin"
+REAL_BIN="$INSTALL_DIR/opencode"
+
+if [ ! -x "$REAL_BIN" ]; then
+    echo "OpenCode CLI not found. Installing from GitHub releases..."
+    ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
+    case "$ARCH" in
+        amd64|x86_64) OPENCODE_ARCH="x64" ;;
+        arm64|aarch64) OPENCODE_ARCH="arm64" ;;
+        *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+    esac
+    mkdir -p "$INSTALL_DIR"
+    curl -fsSL "https://github.com/anomalyco/opencode/releases/latest/download/opencode-linux-${OPENCODE_ARCH}.tar.gz" | \
+        tar xz -C "$INSTALL_DIR"
+    chmod +x "$REAL_BIN"
+    if [ ! -x "$REAL_BIN" ]; then
+        echo "Error: opencode binary not found after install" >&2
+        exit 1
+    fi
+fi
+
+exec "$REAL_BIN" "$@"

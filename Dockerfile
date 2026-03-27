@@ -29,27 +29,21 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Claude Code CLI via npm
-RUN npm install -g @anthropic-ai/claude-code
-
-# Install OpenAI Codex CLI via npm
-RUN npm install -g @openai/codex
-
-# Install Google Gemini CLI via npm
-RUN npm install -g @google/gemini-cli
-
-# Copy apchat from ghcr.io
+# Copy apchat from ghcr.io (our own project, OK to bundle)
 COPY --from=ghcr.io/ayourtch-llm/apchat:latest /usr/local/bin/apchat /usr/local/bin/apchat
 
-# Install OpenCode CLI (detect architecture and download appropriate binary)
-RUN ARCH=$(dpkg --print-architecture) && \
-    case "$ARCH" in \
-        amd64) OPENCODE_ARCH="x64" ;; \
-        arm64) OPENCODE_ARCH="arm64" ;; \
-        *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
-    esac && \
-    curl -fsSL "https://github.com/anomalyco/opencode/releases/latest/download/opencode-linux-${OPENCODE_ARCH}.tar.gz" | tar xz -C /usr/local/bin && \
-    chmod +x /usr/local/bin/opencode
+# Install lazy-install wrapper scripts for AI harnesses.
+# These wrappers install the real tool on first use rather than bundling
+# vendor packages in the image (EULA compliance).
+COPY docker/wrappers/claude  /usr/local/bin/claude
+COPY docker/wrappers/codex   /usr/local/bin/codex
+COPY docker/wrappers/gemini  /usr/local/bin/gemini
+COPY docker/wrappers/opencode /usr/local/bin/opencode
+RUN chmod +x /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/gemini /usr/local/bin/opencode
+
+# Create the harness install directory and give the tttt user write access
+# so installs work without sudo at runtime
+RUN mkdir -p /opt/harness && chown -R 1000:1000 /opt/harness
 
 # Copy tttt binary from builder
 COPY --from=builder /app/target/release/tttt /usr/local/bin/tttt

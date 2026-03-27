@@ -1,0 +1,19 @@
+#!/bin/bash
+# Lazy-install wrapper for Google Gemini CLI (@google/gemini-cli)
+# Installs on first use, then passes through to the real binary.
+set -e
+
+INSTALL_DIR="/opt/harness/bin"
+REAL_BIN="$INSTALL_DIR/gemini"
+
+if [ ! -x "$REAL_BIN" ]; then
+    echo "Google Gemini CLI not found. Installing @google/gemini-cli..."
+    mkdir -p "$INSTALL_DIR"
+    npm install -g --prefix /opt/harness @google/gemini-cli
+    if [ ! -x "$REAL_BIN" ]; then
+        echo "Error: gemini binary not found after install" >&2
+        exit 1
+    fi
+fi
+
+exec "$REAL_BIN" "$@"

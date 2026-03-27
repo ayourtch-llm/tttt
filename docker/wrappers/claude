@@ -1,0 +1,19 @@
+#!/bin/bash
+# Lazy-install wrapper for Claude Code (@anthropic-ai/claude-code)
+# Installs on first use, then passes through to the real binary.
+set -e
+
+INSTALL_DIR="/opt/harness/bin"
+REAL_BIN="$INSTALL_DIR/claude"
+
+if [ ! -x "$REAL_BIN" ]; then
+    echo "Claude Code not found. Installing @anthropic-ai/claude-code..."
+    mkdir -p "$INSTALL_DIR"
+    npm install -g --prefix /opt/harness @anthropic-ai/claude-code
+    if [ ! -x "$REAL_BIN" ]; then
+        echo "Error: claude binary not found after install" >&2
+        exit 1
+    fi
+fi
+
+exec "$REAL_BIN" "$@"
