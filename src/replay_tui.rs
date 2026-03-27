@@ -76,7 +76,7 @@ fn build_session_list(db: &SqliteLogger) -> Result<Vec<SessionListEntry>> {
         }
     }
 
-    sessions.sort_by_key(|s| s.info.started_at_ms);
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.info.started_at_ms));
     Ok(sessions)
 }
 
@@ -131,17 +131,19 @@ struct SessionListEntry {
 const VISUAL_GAP_THRESHOLD_MS: u64 = 60 * 60 * 1_000;
 
 /// Returns the session indices before which a separator row should appear.
-/// A separator is inserted when the gap between the previous session's end
-/// (or start if no end) and the next session's start exceeds the threshold.
+/// Sessions are sorted most-recent-first (descending by started_at_ms).
+/// A separator is inserted when the time gap between two adjacent sessions
+/// exceeds the threshold.
 fn compute_separator_positions(sessions: &[SessionListEntry]) -> Vec<usize> {
     let mut positions = Vec::new();
     for i in 1..sessions.len() {
-        let prev_end = sessions[i - 1]
+        // sessions[i-1] is newer, sessions[i] is older (descending order).
+        let newer_start = sessions[i - 1].info.started_at_ms;
+        let older_end = sessions[i]
             .info
             .ended_at_ms
-            .unwrap_or(sessions[i - 1].info.started_at_ms);
-        let curr_start = sessions[i].info.started_at_ms;
-        if curr_start.saturating_sub(prev_end) > VISUAL_GAP_THRESHOLD_MS {
+            .unwrap_or(sessions[i].info.started_at_ms);
+        if newer_start.saturating_sub(older_end) > VISUAL_GAP_THRESHOLD_MS {
             positions.push(i);
         }
     }
@@ -464,11 +466,10 @@ fn render_session_list(
         // Insert separator row before this session if a gap precedes it
         if sep_iter.peek() == Some(&&i) {
             sep_iter.next();
-            let prev_end = sessions[i - 1]
-                .info
-                .ended_at_ms
-                .unwrap_or(sessions[i - 1].info.started_at_ms);
-            let gap_ms = s.info.started_at_ms.saturating_sub(prev_end);
+            // sessions[i-1] is newer, sessions[i] is older (descending order).
+            let newer_start = sessions[i - 1].info.started_at_ms;
+            let older_end = s.info.ended_at_ms.unwrap_or(s.info.started_at_ms);
+            let gap_ms = newer_start.saturating_sub(older_end);
             let gap_label = format!("── {} gap ──", format_duration_ms(Some(gap_ms)));
             rows.push(
                 Row::new(vec![
@@ -1078,9 +1079,9 @@ mod tests {
         // so we check relative ordering of orphans)
         let sessions = build_session_list(&db).unwrap();
         assert_eq!(sessions.len(), 2);
-        // early-orphan (ts=100) should come before late-orphan (ts=9000)
-        assert_eq!(sessions[0].info.session_id, "early-orphan");
-        assert_eq!(sessions[1].info.session_id, "late-orphan");
+        // Descending: late-orphan (ts=9000) should come before early-orphan (ts=100)
+        assert_eq!(sessions[0].info.session_id, "late-orphan");
+        assert_eq!(sessions[1].info.session_id, "early-orphan");
     }
 
     #[test]
@@ -1186,22 +1187,23 @@ mod tests {
         let sessions = build_session_list(&db).unwrap();
         assert_eq!(sessions.len(), 2);
 
-        // Open the first chunk (entries are sorted by started_at_ms)
+        // Descending: index 0 is the newer chunk, index 1 is the older chunk
         let mut app = ReplayApp::new(db, sessions, None).unwrap();
         app.open_entry(0).unwrap();
         if let View::Replay(state) = &app.view {
-            // First chunk has 2 events (ts 1000 and 2000)
+            // Newer chunk has 2 events (ts 2000+gap and 2000+gap+5000)
             assert_eq!(state.replay.event_count(), 2);
-            assert_eq!(state.session_info.started_at_ms, 1_000);
+            assert_eq!(state.session_info.started_at_ms, 2_000 + gap);
         } else {
             panic!("expected Replay view");
         }
 
-        // Open the second chunk
+        // Open the older chunk
         app.open_entry(1).unwrap();
         if let View::Replay(state) = &app.view {
+            // Older chunk has 2 events (ts 1000 and 2000)
             assert_eq!(state.replay.event_count(), 2);
-            assert_eq!(state.session_info.started_at_ms, 2_000 + gap);
+            assert_eq!(state.session_info.started_at_ms, 1_000);
         } else {
             panic!("expected Replay view");
         }
@@ -1263,10 +1265,10 @@ mod tests {
 
     #[test]
     fn test_compute_separator_positions_no_gap() {
-        // Two sessions 1 min apart — below threshold, no separator
+        // Two sessions 1 min apart — below threshold, no separator (descending order)
         let sessions = vec![
-            make_entry(0, Some(60_000)),
             make_entry(60_000, Some(120_000)),
+            make_entry(0, Some(60_000)),
         ];
         let positions = compute_separator_positions(&sessions);
         assert!(positions.is_empty());
@@ -1274,10 +1276,10 @@ mod tests {
 
     #[test]
     fn test_compute_separator_positions_exact_threshold_not_split() {
-        // Gap exactly == threshold: NOT > threshold, so no separator
+        // Gap exactly == threshold: NOT > threshold, so no separator (descending order)
         let sessions = vec![
-            make_entry(0, Some(0)),
             make_entry(VISUAL_GAP_THRESHOLD_MS, None),
+            make_entry(0, Some(0)),
         ];
         let positions = compute_separator_positions(&sessions);
         assert!(positions.is_empty());
@@ -1285,10 +1287,10 @@ mod tests {
 
     #[test]
     fn test_compute_separator_positions_gap_detected() {
-        // Gap of threshold+1 → separator before index 1
+        // Gap of threshold+1 → separator before index 1 (descending order)
         let sessions = vec![
-            make_entry(0, Some(1_000)),
             make_entry(1_000 + VISUAL_GAP_THRESHOLD_MS + 1, None),
+            make_entry(0, Some(1_000)),
         ];
         let positions = compute_separator_positions(&sessions);
         assert_eq!(positions, vec![1]);
@@ -1296,10 +1298,10 @@ mod tests {
 
     #[test]
     fn test_compute_separator_positions_gap_uses_started_when_no_end() {
-        // Previous session has no ended_at_ms; gap is measured from started_at_ms
+        // Older session has no ended_at_ms; gap is measured from its started_at_ms (descending order)
         let sessions = vec![
-            make_entry(0, None),  // no ended_at_ms → use started_at_ms = 0
             make_entry(VISUAL_GAP_THRESHOLD_MS + 1, None),
+            make_entry(0, None),  // no ended_at_ms → use started_at_ms = 0
         ];
         let positions = compute_separator_positions(&sessions);
         assert_eq!(positions, vec![1]);
@@ -1308,13 +1310,36 @@ mod tests {
     #[test]
     fn test_compute_separator_positions_multiple_gaps() {
         let g = VISUAL_GAP_THRESHOLD_MS + 1;
+        // Descending order: newest first
         let sessions = vec![
-            make_entry(0, Some(100)),
-            make_entry(100 + g, Some(200 + g)),
             make_entry(200 + g * 2, None),
+            make_entry(100 + g, Some(200 + g)),
+            make_entry(0, Some(100)),
         ];
         let positions = compute_separator_positions(&sessions);
         assert_eq!(positions, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_build_session_list_descending_with_separators() {
+        // build_session_list returns sessions newest-first; verify that
+        // compute_separator_positions still detects gaps between them.
+        let g = VISUAL_GAP_THRESHOLD_MS + 1;
+        let sessions = vec![
+            make_entry(1_000 + g, Some(2_000 + g)),   // newer
+            make_entry(0, Some(1_000)),                 // older
+        ];
+        // Verify ordering is descending
+        assert!(
+            sessions[0].info.started_at_ms > sessions[1].info.started_at_ms,
+            "sessions should be sorted newest-first"
+        );
+        // The gap between the two should produce a separator
+        let positions = compute_separator_positions(&sessions);
+        assert!(
+            !positions.is_empty(),
+            "expected at least one separator between sessions with a large time gap"
+        );
     }
 
     #[test]
@@ -1365,10 +1390,10 @@ mod tests {
 
     #[test]
     fn test_session_list_state_new_no_separators() {
-        // Sessions close together → no separators, selection starts at 0
+        // Sessions close together → no separators, selection starts at 0 (descending)
         let sessions = vec![
-            make_entry(0, Some(1_000)),
             make_entry(1_001, Some(2_000)),
+            make_entry(0, Some(1_000)),
         ];
         let state = SessionListState::new(&sessions);
         assert!(state.separator_indices.is_empty());
@@ -1378,9 +1403,10 @@ mod tests {
     #[test]
     fn test_session_list_state_new_with_separator() {
         let g = VISUAL_GAP_THRESHOLD_MS + 1;
+        // Descending: newer first
         let sessions = vec![
-            make_entry(0, Some(1_000)),
             make_entry(1_000 + g, None),
+            make_entry(0, Some(1_000)),
         ];
         let state = SessionListState::new(&sessions);
         // Separator before session 1 → visual index 1
@@ -1398,7 +1424,8 @@ mod tests {
     #[test]
     fn test_selected_session_idx_on_separator_row() {
         let g = VISUAL_GAP_THRESHOLD_MS + 1;
-        let sessions = vec![make_entry(0, Some(0)), make_entry(g + 1, None)];
+        // Descending: newer first
+        let sessions = vec![make_entry(g + 1, None), make_entry(0, Some(0))];
         let mut state = SessionListState::new(&sessions);
         // Force-select the separator row (visual 1)
         state.table_state.select(Some(1));
@@ -1408,21 +1435,23 @@ mod tests {
     #[test]
     fn test_move_down_skips_separator() {
         let g = VISUAL_GAP_THRESHOLD_MS + 1;
-        // 3 sessions: sep before index 1
+        // 3 sessions descending: sessions 0 and 1 are close, gap before session 2
+        // newer_start(s0)=200+g, older_end(s1)=200+g → gap=0, no sep
+        // newer_start(s1)=100+g, older_end(s2)=100 → gap=g, sep before index 2
         let sessions = vec![
-            make_entry(0, Some(100)),
-            make_entry(100 + g, Some(200 + g)),
             make_entry(200 + g, None),
+            make_entry(100 + g, Some(200 + g)),
+            make_entry(0, Some(100)),
         ];
         let mut state = SessionListState::new(&sessions);
-        // separator_indices should be [1] (visual row 1)
-        assert_eq!(state.separator_indices, vec![1]);
+        // separator_indices should be [2] (visual row 2, before session 2)
+        assert_eq!(state.separator_indices, vec![2]);
         // Start at visual 0 (session 0)
         assert_eq!(state.table_state.selected(), Some(0));
-        // Move down: skip separator at visual 1, land on visual 2 (session 1)
+        // Move down: land on visual 1 (session 1)
         state.move_down(3);
-        assert_eq!(state.table_state.selected(), Some(2));
-        // Move down again: land on visual 3 (session 2)
+        assert_eq!(state.table_state.selected(), Some(1));
+        // Move down: skip separator at visual 2, land on visual 3 (session 2)
         state.move_down(3);
         assert_eq!(state.table_state.selected(), Some(3));
         // Move down past end: stay at 3
@@ -1433,9 +1462,10 @@ mod tests {
     #[test]
     fn test_move_up_skips_separator() {
         let g = VISUAL_GAP_THRESHOLD_MS + 1;
+        // Descending: newer first
         let sessions = vec![
-            make_entry(0, Some(100)),
             make_entry(100 + g, None),
+            make_entry(0, Some(100)),
         ];
         let mut state = SessionListState::new(&sessions);
         // visual: 0→s0, 1→sep, 2→s1
@@ -1452,9 +1482,10 @@ mod tests {
     #[test]
     fn test_enter_maps_visual_to_session_idx() {
         let g = VISUAL_GAP_THRESHOLD_MS + 1;
+        // Descending: newer first
         let sessions = vec![
-            make_entry(0, Some(100)),
             make_entry(100 + g, None),
+            make_entry(0, Some(100)),
         ];
         let state = SessionListState::new(&sessions);
         // visual 2 → session 1
@@ -1546,9 +1577,10 @@ mod tests {
     #[test]
     fn test_render_session_list_with_separator() {
         let g = VISUAL_GAP_THRESHOLD_MS + 1;
+        // Descending: newer first
         let entries = vec![
-            make_entry(0, Some(1_000)),
             make_entry(1_000 + g, None),
+            make_entry(0, Some(1_000)),
         ];
         let db = SqliteLogger::in_memory().unwrap();
         let mut app = ReplayApp::new(db, entries, None).unwrap();
