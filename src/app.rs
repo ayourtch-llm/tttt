@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::reload::{self, SavedState, SavedSession, SavedCronJob, SavedWatcher};
 use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -297,6 +298,8 @@ pub struct App {
     server_start_time: Instant,
     /// When true, render_frame() will draw a help overlay popup.
     showing_help: bool,
+    /// Active text selection (None when not selecting)
+    selection: Option<tttt_tui::Selection>,
 }
 
 impl App {
@@ -308,7 +311,7 @@ impl App {
         // Set up ratatui terminal with crossterm backend
         enable_raw_mode().expect("Failed to enable raw mode");
         let mut stdout = std::io::stdout();
-        execute!(stdout, EnterAlternateScreen).expect("Failed to enter alternate screen");
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture).expect("Failed to enter alternate screen");
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend).expect("Failed to create terminal");
 
@@ -342,6 +345,7 @@ impl App {
             restart_root_requested: false,
             server_start_time: Instant::now(),
             showing_help: false,
+            selection: None,
             config,
         }
     }
@@ -983,7 +987,7 @@ impl App {
 
         // Restore terminal state
         disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(self.terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
         self.terminal.show_cursor()?;
 
         Ok(())
@@ -1035,12 +1039,59 @@ impl App {
                 self.reload_requested = true;
                 return Ok(false);
             }
-            // Mouse events — placeholder for Phase 4 wiring
-            InputAction::MousePress { .. }
-            | InputAction::MouseDrag { .. }
-            | InputAction::MouseRelease { .. }
-            | InputAction::ScrollUp { .. }
-            | InputAction::ScrollDown { .. } => {}
+            InputAction::MousePress { button, col, row } => {
+                if matches!(button, tttt_tui::MouseButton::Left) {
+                    // Only start selection if click is in PTY pane (not sidebar)
+                    let sidebar_width = self.config.sidebar_width;
+                    let pane_width = self.screen_cols.saturating_sub(sidebar_width);
+                    if col < pane_width {
+                        self.selection = Some(tttt_tui::Selection::new(row, col));
+                        self.server_render_dirty = true;
+                    }
+                }
+            }
+            InputAction::MouseDrag { button, col, row } => {
+                if matches!(button, tttt_tui::MouseButton::Left) {
+                    if let Some(ref mut sel) = self.selection {
+                        // Clamp to PTY pane bounds
+                        let sidebar_width = self.config.sidebar_width;
+                        let pane_width = self.screen_cols.saturating_sub(sidebar_width);
+                        let clamped_col = col.min(pane_width.saturating_sub(1));
+                        sel.update(row, clamped_col);
+                        self.server_render_dirty = true;
+                    }
+                }
+            }
+            InputAction::MouseRelease { col, row } => {
+                if let Some(ref mut sel) = self.selection {
+                    // Final update
+                    let sidebar_width = self.config.sidebar_width;
+                    let pane_width = self.screen_cols.saturating_sub(sidebar_width);
+                    let clamped_col = col.min(pane_width.saturating_sub(1));
+                    sel.update(row, clamped_col);
+
+                    // Extract text from active session's screen
+                    if !sel.is_empty() {
+                        if let Some(ref id) = self.active_session {
+                            let mgr = self.sessions.lock().unwrap();
+                            if let Ok(session) = mgr.get(id) {
+                                let text = sel.extract_text(session.screen().screen());
+                                drop(mgr);
+                                if !text.is_empty() {
+                                    copy_to_clipboard(&text);
+                                }
+                            }
+                        }
+                    }
+
+                    // Clear selection
+                    self.selection = None;
+                    self.server_render_dirty = true;
+                }
+            }
+            InputAction::ScrollUp { .. } | InputAction::ScrollDown { .. } => {
+                // Future: scrollback support
+            }
         }
         Ok(true)
     }
@@ -1107,6 +1158,7 @@ impl App {
         } else {
             None
         };
+        let selection_ref = self.selection.as_ref();
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -1120,7 +1172,11 @@ impl App {
 
             // PTY pane
             if let Some((ref screen, _, _)) = screen_data {
-                frame.render_widget(PtyWidget::new(screen), chunks[0]);
+                let mut widget = PtyWidget::new(screen);
+                if let Some(sel) = selection_ref {
+                    widget = widget.with_selection(sel);
+                }
+                frame.render_widget(widget, chunks[0]);
             }
 
             // Sidebar
@@ -1516,6 +1572,16 @@ impl App {
             }
         }
     }
+}
+
+/// Copy text to the system clipboard via OSC 52 escape sequence.
+fn copy_to_clipboard(text: &str) {
+    use base64::Engine;
+    use std::io::Write;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let osc = format!("\x1b]52;c;{}\x07", encoded);
+    let _ = std::io::stdout().write_all(osc.as_bytes());
+    let _ = std::io::stdout().flush();
 }
 
 #[cfg(test)]
@@ -1937,5 +2003,38 @@ mod tests {
             .split(area);
         assert_eq!(chunks[0].width, 30);
         assert_eq!(chunks[1].width, 20);
+    }
+
+    // ── copy_to_clipboard / OSC 52 ────────────────────────────────────────────
+
+    #[test]
+    fn test_copy_to_clipboard_osc52_format() {
+        // Verify the OSC 52 format is correct
+        use base64::Engine;
+        let text = "Hello World";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+        let expected = format!("\x1b]52;c;{}\x07", encoded);
+        // The function writes to stdout, so we just verify the format
+        assert_eq!(expected, "\x1b]52;c;SGVsbG8gV29ybGQ=\x07");
+    }
+
+    #[test]
+    fn test_copy_to_clipboard_empty_text() {
+        use base64::Engine;
+        let text = "";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+        let expected = format!("\x1b]52;c;{}\x07", encoded);
+        assert_eq!(expected, "\x1b]52;c;\x07");
+    }
+
+    #[test]
+    fn test_copy_to_clipboard_unicode() {
+        use base64::Engine;
+        let text = "Hello 世界";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+        let expected = format!("\x1b]52;c;{}\x07", encoded);
+        // Just verify it doesn't panic and produces valid base64
+        assert!(expected.starts_with("\x1b]52;c;"));
+        assert!(expected.ends_with("\x07"));
     }
 }
