@@ -214,6 +214,11 @@ impl<B: PtyBackend> PtySession<B> {
         &self.screen
     }
 
+    /// Check if the session's terminal has synchronized output mode active (DEC 2026).
+    pub fn synchronized_output(&self) -> bool {
+        self.screen.screen().synchronized_output()
+    }
+
     /// Access the PTY backend (for getting raw fd, etc.).
     pub fn backend(&self) -> &B {
         &self.backend

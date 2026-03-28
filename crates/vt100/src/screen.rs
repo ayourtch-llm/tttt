@@ -1680,7 +1680,13 @@ impl vte::Perform for Screen {
             .first()
             .is_some_and(|b| !matches!(b, b'?'))
         {
-            log::debug!("CSI with intermediate byte(s) {intermediates:?}, ignoring");
+            let msg = format!(
+                "CSI with intermediate byte(s) {intermediates:?}, ignoring: CSI {} {}",
+                param_str(params),
+                c
+            );
+            log::debug!("{msg}");
+            self.record_unhandled(msg);
             return;
         }
         match intermediates.first() {

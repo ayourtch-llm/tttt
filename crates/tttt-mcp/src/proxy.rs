@@ -17,7 +17,7 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 30;
 /// Base delay between reconnect attempts (doubles each retry, capped at 2s).
 const RECONNECT_BASE_DELAY_MS: u64 = 100;
 
-/// Send a request over the socket and read the response.
+/// Send a request over the socket and read the response (length-prefixed binary).
 /// Returns Ok(Some(response_bytes)) for normal requests, Ok(None) for notifications.
 /// Returns Err on connection failure (caller should reconnect).
 fn send_and_receive(
@@ -43,6 +43,48 @@ fn send_and_receive(
     Ok(Some(resp_buf))
 }
 
+/// Send a request over the socket using newline-delimited JSON framing.
+/// Returns Ok(Some(response_bytes)) for normal requests, Ok(None) for notifications.
+fn send_and_receive_ndjson(
+    socket: &mut UnixStream,
+    request: &[u8],
+    is_notification: bool,
+) -> Result<Option<Vec<u8>>, std::io::Error> {
+    socket.write_all(request)?;
+    socket.write_all(b"\n")?;
+    socket.flush()?;
+
+    if is_notification {
+        return Ok(None);
+    }
+
+    // Read response byte-by-byte until newline to avoid over-buffering
+    let mut resp = Vec::with_capacity(4096);
+    let mut byte = [0u8; 1];
+    loop {
+        socket.read_exact(&mut byte)?;
+        if byte[0] == b'\n' {
+            break;
+        }
+        resp.push(byte[0]);
+    }
+    Ok(Some(resp))
+}
+
+/// Write a response using the specified framing format.
+fn write_response<W: Write>(writer: &mut W, response: &str, ndjson: bool) -> std::io::Result<()> {
+    let resp_bytes = response.as_bytes();
+    if ndjson {
+        writer.write_all(resp_bytes)?;
+        writer.write_all(b"\n")?;
+    } else {
+        let resp_len = resp_bytes.len() as u32;
+        writer.write_all(&resp_len.to_be_bytes())?;
+        writer.write_all(resp_bytes)?;
+    }
+    writer.flush()
+}
+
 /// Try to connect to the socket, retrying with backoff.
 fn connect_with_retry(socket_path: &str, max_attempts: u32) -> Result<UnixStream, std::io::Error> {
     let mut delay_ms = RECONNECT_BASE_DELAY_MS;
@@ -63,11 +105,19 @@ fn connect_with_retry(socket_path: &str, max_attempts: u32) -> Result<UnixStream
 }
 
 /// Re-initialize the MCP session after reconnecting to a new server instance.
-fn reinitialize(socket: &mut UnixStream) -> Result<(), Box<dyn std::error::Error>> {
+fn reinitialize(
+    socket: &mut UnixStream,
+    debug_protocol: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let init_req = r#"{"jsonrpc":"2.0","id":"_reconnect_init","method":"initialize","params":{}}"#;
-    let _resp = send_and_receive(socket, init_req.as_bytes(), false)?;
+    let send_fn = if debug_protocol {
+        send_and_receive_ndjson
+    } else {
+        send_and_receive
+    };
+    let _resp = send_fn(socket, init_req.as_bytes(), false)?;
     let initialized = r#"{"jsonrpc":"2.0","id":null,"method":"initialized","params":{}}"#;
-    send_and_receive(socket, initialized.as_bytes(), true)?;
+    send_fn(socket, initialized.as_bytes(), true)?;
     Ok(())
 }
 
@@ -83,29 +133,52 @@ enum ProxyEvent {
     SocketError,
 }
 
-/// Spawn a thread that reads length-prefixed messages from a socket
-/// and sends them as `ProxyEvent::SocketResponse` over the channel.
-/// Returns the thread handle.
+/// Spawn a thread that reads messages from a socket and sends them as
+/// `ProxyEvent::SocketResponse` over the channel. When `ndjson` is true,
+/// reads newline-delimited JSON; otherwise reads length-prefixed binary.
 fn spawn_socket_reader(
     socket: UnixStream,
     tx: mpsc::Sender<ProxyEvent>,
+    ndjson: bool,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(socket);
-        loop {
-            let mut len_buf = [0u8; 4];
-            if reader.read_exact(&mut len_buf).is_err() {
-                let _ = tx.send(ProxyEvent::SocketError);
-                return;
+        if ndjson {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => {
+                        let _ = tx.send(ProxyEvent::SocketError);
+                        return;
+                    }
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            let resp_buf = trimmed.as_bytes().to_vec();
+                            if tx.send(ProxyEvent::SocketResponse(resp_buf)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
             }
-            let resp_len = u32::from_be_bytes(len_buf) as usize;
-            let mut resp_buf = vec![0u8; resp_len];
-            if reader.read_exact(&mut resp_buf).is_err() {
-                let _ = tx.send(ProxyEvent::SocketError);
-                return;
-            }
-            if tx.send(ProxyEvent::SocketResponse(resp_buf)).is_err() {
-                return; // receiver dropped
+        } else {
+            loop {
+                let mut len_buf = [0u8; 4];
+                if reader.read_exact(&mut len_buf).is_err() {
+                    let _ = tx.send(ProxyEvent::SocketError);
+                    return;
+                }
+                let resp_len = u32::from_be_bytes(len_buf) as usize;
+                let mut resp_buf = vec![0u8; resp_len];
+                if reader.read_exact(&mut resp_buf).is_err() {
+                    let _ = tx.send(ProxyEvent::SocketError);
+                    return;
+                }
+                if tx.send(ProxyEvent::SocketResponse(resp_buf)).is_err() {
+                    return;
+                }
             }
         }
     })
@@ -126,6 +199,7 @@ pub fn run_proxy<R: Read + Send + 'static, W: Write>(
     reader: R,
     mut writer: W,
     socket_path: &str,
+    debug_protocol: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel();
 
@@ -159,7 +233,7 @@ pub fn run_proxy<R: Read + Send + 'static, W: Write>(
     // Keep a sender clone for spawning new socket reader threads on reconnect.
     // Set to None when draining to allow the channel to close.
     let mut master_tx = Some(tx);
-    spawn_socket_reader(socket_read, master_tx.as_ref().unwrap().clone());
+    spawn_socket_reader(socket_read, master_tx.as_ref().unwrap().clone(), debug_protocol);
 
     let mut draining = false;
 
@@ -171,29 +245,35 @@ pub fn run_proxy<R: Read + Send + 'static, W: Write>(
                 }
 
                 let req_bytes = line.as_bytes();
-                let len = req_bytes.len() as u32;
 
-                match socket
-                    .write_all(&len.to_be_bytes())
-                    .and_then(|_| socket.write_all(req_bytes))
-                    .and_then(|_| socket.flush())
-                {
+                let write_request = |sock: &mut UnixStream| -> std::io::Result<()> {
+                    if debug_protocol {
+                        sock.write_all(req_bytes)?;
+                        sock.write_all(b"\n")?;
+                    } else {
+                        let len = req_bytes.len() as u32;
+                        sock.write_all(&len.to_be_bytes())?;
+                        sock.write_all(req_bytes)?;
+                    }
+                    sock.flush()
+                };
+
+                match write_request(&mut socket) {
                     Ok(()) => {}
                     Err(_) => {
                         // Connection lost — likely a live reload. Reconnect.
                         socket =
                             connect_with_retry(socket_path, MAX_RECONNECT_ATTEMPTS)?;
-                        reinitialize(&mut socket)?;
+                        reinitialize(&mut socket, debug_protocol)?;
                         let new_read = socket.try_clone()?;
                         spawn_socket_reader(
                             new_read,
                             master_tx.as_ref().unwrap().clone(),
+                            debug_protocol,
                         );
 
                         // Retry the write
-                        socket.write_all(&len.to_be_bytes())?;
-                        socket.write_all(req_bytes)?;
-                        socket.flush()?;
+                        write_request(&mut socket)?;
                     }
                 }
             }
@@ -217,11 +297,12 @@ pub fn run_proxy<R: Read + Send + 'static, W: Write>(
                     connect_with_retry(socket_path, MAX_RECONNECT_ATTEMPTS)
                 {
                     socket = new_socket;
-                    if reinitialize(&mut socket).is_ok() {
+                    if reinitialize(&mut socket, debug_protocol).is_ok() {
                         if let Ok(new_read) = socket.try_clone() {
                             spawn_socket_reader(
                                 new_read,
                                 master_tx.as_ref().unwrap().clone(),
+                                debug_protocol,
                             );
                         }
                     }
@@ -248,15 +329,17 @@ fn is_jsonrpc_notification(line: &str) -> bool {
 
 /// Events from the TUI-side socket reader thread.
 enum TuiSocketEvent {
-    /// A complete request read from the socket.
-    Request(Vec<u8>),
+    /// A complete request read from the socket. The bool indicates ndjson framing.
+    Request(Vec<u8>, bool),
     /// A cancellation notification was received (already applied to cancel token).
     CancelReceived,
     /// The socket reader encountered EOF or an error.
     Eof,
 }
 
-/// Read length-prefixed messages from a socket and send them over a channel.
+/// Read messages from a socket and send them over a channel.
+/// Auto-detects framing per-message: if first byte is `{` (0x7B), reads
+/// newline-delimited JSON; otherwise reads length-prefixed binary.
 /// Cancel notifications are detected inline and immediately applied to the
 /// cancel token, so long-running handlers can observe cancellation promptly.
 fn spawn_tui_socket_reader(
@@ -284,22 +367,54 @@ fn spawn_tui_socket_reader(
 
         let mut reader = BufReader::new(socket);
         loop {
-            let mut len_buf = [0u8; 4];
-            match reader.read_exact(&mut len_buf) {
-                Ok(()) => {}
-                Err(_) => {
-                    debug_log("EOF/error on socket read");
+            // Peek first byte to detect framing format
+            let first_byte = match reader.fill_buf() {
+                Ok([]) => {
+                    debug_log("EOF on socket read");
                     let _ = tx.send(TuiSocketEvent::Eof);
                     return;
                 }
-            }
-            let req_len = u32::from_be_bytes(len_buf) as usize;
-            let mut req_buf = vec![0u8; req_len];
-            if reader.read_exact(&mut req_buf).is_err() {
-                debug_log("EOF/error reading request body");
-                let _ = tx.send(TuiSocketEvent::Eof);
-                return;
-            }
+                Ok(b) => b[0],
+                Err(_) => {
+                    debug_log("error on socket read");
+                    let _ = tx.send(TuiSocketEvent::Eof);
+                    return;
+                }
+            };
+
+            let req_buf = if first_byte == b'{' {
+                // Ndjson framing: read until newline
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => {
+                        debug_log("EOF/error reading ndjson line");
+                        let _ = tx.send(TuiSocketEvent::Eof);
+                        return;
+                    }
+                    Ok(_) => line.trim().as_bytes().to_vec(),
+                }
+            } else {
+                // Length-prefixed binary framing
+                let mut len_buf = [0u8; 4];
+                match reader.read_exact(&mut len_buf) {
+                    Ok(()) => {}
+                    Err(_) => {
+                        debug_log("EOF/error on socket read");
+                        let _ = tx.send(TuiSocketEvent::Eof);
+                        return;
+                    }
+                }
+                let req_len = u32::from_be_bytes(len_buf) as usize;
+                let mut req_buf = vec![0u8; req_len];
+                if reader.read_exact(&mut req_buf).is_err() {
+                    debug_log("EOF/error reading request body");
+                    let _ = tx.send(TuiSocketEvent::Eof);
+                    return;
+                }
+                req_buf
+            };
+
+            let is_ndjson = first_byte == b'{';
 
             // Check for cancel notifications inline and set the token immediately
             let req_str = String::from_utf8_lossy(&req_buf);
@@ -314,11 +429,12 @@ fn spawn_tui_socket_reader(
                 }
             } else {
                 debug_log(&format!(
-                    "forwarding request len={}: {}",
+                    "forwarding request len={} ndjson={}: {}",
                     req_buf.len(),
+                    is_ndjson,
                     &req_str[..req_str.len().min(200)]
                 ));
-                if tx.send(TuiSocketEvent::Request(req_buf)).is_err() {
+                if tx.send(TuiSocketEvent::Request(req_buf, is_ndjson)).is_err() {
                     return;
                 }
             }
@@ -367,8 +483,8 @@ pub fn handle_proxy_client<H: crate::handler::ToolHandler>(
 
     loop {
         debug_log("waiting for request...");
-        let req_buf = match rx.recv() {
-            Ok(TuiSocketEvent::Request(buf)) => buf,
+        let (req_buf, client_ndjson) = match rx.recv() {
+            Ok(TuiSocketEvent::Request(buf, ndjson)) => (buf, ndjson),
             Ok(TuiSocketEvent::CancelReceived) => {
                 debug_log("cancel received while idle (no active tool call), ignoring");
                 continue;
@@ -410,7 +526,7 @@ pub fn handle_proxy_client<H: crate::handler::ToolHandler>(
         // After processing, drain any pending messages that arrived while blocked.
         loop {
             match rx.try_recv() {
-                Ok(TuiSocketEvent::Request(pending_buf)) => {
+                Ok(TuiSocketEvent::Request(pending_buf, pending_ndjson)) => {
                     let pending_str = String::from_utf8_lossy(&pending_buf);
                     debug_log(&format!(
                         "draining pending request len={}: {}",
@@ -425,11 +541,7 @@ pub fn handle_proxy_client<H: crate::handler::ToolHandler>(
                             "sending pending response len={}",
                             pending_response.len()
                         ));
-                        let resp_bytes = pending_response.as_bytes();
-                        let resp_len = resp_bytes.len() as u32;
-                        writer.write_all(&resp_len.to_be_bytes())?;
-                        writer.write_all(resp_bytes)?;
-                        writer.flush()?;
+                        write_response(&mut writer, &pending_response, pending_ndjson)?;
                         debug_log("pending response sent");
                     }
                 }
@@ -451,18 +563,14 @@ pub fn handle_proxy_client<H: crate::handler::ToolHandler>(
             continue;
         }
 
-        // Send length-prefixed response
-        let resp_bytes = response.as_bytes();
-        let resp_len = resp_bytes.len() as u32;
-        match writer.write_all(&resp_len.to_be_bytes()) {
+        // Send response using the same framing the client used
+        match write_response(&mut writer, &response, client_ndjson) {
             Ok(()) => {}
             Err(e) => {
                 debug_log(&format!("write error: {}", e));
-                return Err(Box::new(e));
+                return Err(e.into());
             }
         }
-        writer.write_all(resp_bytes)?;
-        writer.flush()?;
         debug_log("response sent");
     }
 
@@ -769,7 +877,7 @@ mod tests {
         let reader = std::io::BufReader::new(std::io::Cursor::new(input.as_bytes().to_vec()));
         let mut output: Vec<u8> = Vec::new();
 
-        run_proxy(reader, &mut output, &sock_str).unwrap();
+        run_proxy(reader, &mut output, &sock_str, false).unwrap();
 
         let out_str = String::from_utf8(output).unwrap();
         let v: serde_json::Value = serde_json::from_str(out_str.trim()).unwrap();
@@ -798,7 +906,7 @@ mod tests {
         let reader = std::io::BufReader::new(std::io::Cursor::new(input.as_bytes().to_vec()));
         let mut output: Vec<u8> = Vec::new();
 
-        run_proxy(reader, &mut output, &sock_str).unwrap();
+        run_proxy(reader, &mut output, &sock_str, false).unwrap();
 
         assert!(output.is_empty(), "notifications should produce no proxy output");
         server_handle.join().unwrap();
@@ -823,7 +931,7 @@ mod tests {
         let reader = std::io::BufReader::new(std::io::Cursor::new(input.as_bytes().to_vec()));
         let mut output: Vec<u8> = Vec::new();
 
-        run_proxy(reader, &mut output, &sock_str).unwrap();
+        run_proxy(reader, &mut output, &sock_str, false).unwrap();
 
         let out_str = String::from_utf8(output).unwrap();
         let v: serde_json::Value = serde_json::from_str(out_str.trim()).unwrap();

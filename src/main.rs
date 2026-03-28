@@ -54,6 +54,11 @@ enum Commands {
         /// When set, tool calls are forwarded to the TUI's shared SessionManager.
         #[arg(short, long)]
         connect: Option<String>,
+
+        /// Use newline-delimited JSON framing instead of length-prefixed binary.
+        /// Allows debugging with standard Unix tools (socat, jq, etc).
+        #[arg(long)]
+        debug_protocol: bool,
     },
 
     /// Attach to a running tttt instance as a viewer
@@ -115,9 +120,13 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.subcommand {
-        Some(Commands::McpServer { workdir, connect }) => {
+        Some(Commands::McpServer {
+            workdir,
+            connect,
+            debug_protocol,
+        }) => {
             if let Some(socket_path) = connect {
-                run_proxy_mcp_server(&socket_path);
+                run_proxy_mcp_server(&socket_path, debug_protocol);
             } else {
                 run_standalone_mcp_server(workdir);
             }
@@ -435,13 +444,13 @@ fn find_tttt_socket() -> SocketResult {
 }
 
 /// Proxy MCP server mode — forwards JSON-RPC between Claude (stdio) and tttt TUI (socket).
-fn run_proxy_mcp_server(socket_path: &str) {
+fn run_proxy_mcp_server(socket_path: &str, debug_protocol: bool) {
     use tttt_mcp::proxy::run_proxy;
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout().lock();
 
-    if let Err(e) = run_proxy(stdin, stdout, socket_path) {
+    if let Err(e) = run_proxy(stdin, stdout, socket_path, debug_protocol) {
         eprintln!("MCP proxy error: {}", e);
         std::process::exit(1);
     }

@@ -797,7 +797,7 @@ impl App {
                 unsafe { BorrowedFd::borrow_raw(stdin_fd) }, PollFlags::POLLIN,
             );
             // Shorter poll timeout when we have a pending render (for debounce responsiveness)
-            let poll_timeout_ms = if self.server_render_dirty { 10u16 } else { 100u16 };
+            let poll_timeout_ms = if self.server_render_dirty { 10u16 } else { 50u16 };
 
             let poll_result = if let Some(pty_raw_fd) = pty_fd {
                 let pty_pfd = PollFd::new(
@@ -861,20 +861,35 @@ impl App {
             // dirty AND enough time has passed since last PTY data.
             // This absorbs rapid redraws (e.g., Claude Code history)
             // into a single clean update.
+            //
+            // Synchronized output (DEC mode 2026): when the active session's
+            // screen has sync mode set, suppress rendering entirely. The app
+            // producing output has bracketed an update and we must wait until
+            // the bracket closes (decrst 2026) before presenting a frame.
             if self.server_render_dirty {
-                let now = Instant::now();
-                let should_render = should_render_now(
-                    self.server_render_dirty,
-                    self.last_pty_data_time,
-                    self.first_dirty_time,
-                    now,
-                    RENDER_DEBOUNCE_MS,
-                );
+                // Check if the active session has synchronized output enabled
+                let sync_active = self.active_session.as_ref().map_or(false, |id| {
+                    let mgr = self.sessions.lock().unwrap();
+                    mgr.get(id)
+                        .map(|s| s.synchronized_output())
+                        .unwrap_or(false)
+                });
 
-                if should_render {
-                    self.render_frame()?;
-                    self.server_render_dirty = false;
-                    self.first_dirty_time = None;
+                if !sync_active {
+                    let now = Instant::now();
+                    let should_render = should_render_now(
+                        self.server_render_dirty,
+                        self.last_pty_data_time,
+                        self.first_dirty_time,
+                        now,
+                        RENDER_DEBOUNCE_MS,
+                    );
+
+                    if should_render {
+                        self.render_frame()?;
+                        self.server_render_dirty = false;
+                        self.first_dirty_time = None;
+                    }
                 }
             }
 
@@ -1305,7 +1320,7 @@ impl App {
                     chunks[0].width,
                     1,
                 );
-                let hint_widget = Paragraph::new("Press Ctrl+\\ then q to detach from tttt")
+                let hint_widget = Paragraph::new("Press Ctrl+\\ then ? for help")
                     .style(Style::default().fg(Color::Yellow).bg(Color::Black));
                 frame.render_widget(hint_widget, hint_area);
             }

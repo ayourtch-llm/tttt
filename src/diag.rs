@@ -199,9 +199,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_diag_unhandled_decset_2026() {
-        // CSI ? 2026 h  = DECSET mode 2026 (synchronized output)
-        let seq = b"\x1b[?2026h";
+    fn test_diag_unhandled_decset_9999() {
+        // CSI ? 9999 h  = DECSET mode 9999 (not a real mode, will be unhandled)
+        let seq = b"\x1b[?9999h";
         let events = vec![
             make_output_event("test-session", 100, seq),
             make_output_event("test-session", 200, seq), // second occurrence
@@ -211,12 +211,12 @@ mod tests {
 
         assert_eq!(report.events_processed, 2);
 
-        // There should be at least one unhandled sequence entry mentioning 2026.
+        // There should be at least one unhandled sequence entry mentioning 9999.
         let found = report
             .sequences
             .iter()
-            .any(|s| s.message.contains("2026"));
-        assert!(found, "Expected unhandled DECSET 2026 in report, got: {:#?}", report.sequences);
+            .any(|s| s.message.contains("9999"));
+        assert!(found, "Expected unhandled DECSET 9999 in report, got: {:#?}", report.sequences);
     }
 
     // -----------------------------------------------------------------------
@@ -224,17 +224,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_diag_unhandled_csi_greater_1u() {
+    fn test_diag_csi_greater_1u_is_handled() {
         // CSI > 1 u  = Kitty keyboard enable
-        // '>' (0x3E) is an intermediate byte
+        // '>' (0x3E) is an intermediate byte — now handled by the intermediate guard
         let seq = b"\x1b[>1u";
         let events = vec![make_output_event("test-session", 100, seq)];
         let tmp = create_db_with_events(&events);
         let report = collect_report(tmp.path(), "test-session").unwrap();
         assert_eq!(report.events_processed, 1);
-        // Should produce at least one unhandled csi sequence entry.
-        let found = report.sequences.iter().any(|s| s.message.contains("unhandled"));
-        assert!(found, "Expected at least one unhandled sequence, got: {:#?}", report.sequences);
+        // The intermediate byte guard now handles this, so it should be logged
+        // but via the guard path. Check that it appears as an intermediate guard entry.
+        // (The guard logs "CSI with intermediate byte(s)" which record_unhandled captures.)
+        let found = report.sequences.iter().any(|s| s.message.contains("intermediate"));
+        assert!(found, "Expected intermediate byte guard log entry, got: {:#?}", report.sequences);
     }
 
     // -----------------------------------------------------------------------
@@ -269,20 +271,20 @@ mod tests {
     #[test]
     fn test_diag_count_deduplication() {
         // Send the same unhandled sequence 5 times.
-        let seq = b"\x1b[?2026h";
+        let seq = b"\x1b[?9999h";
         let events: Vec<LogEvent> = (0..5)
             .map(|i| make_output_event("test-session", i * 100, seq))
             .collect();
         let tmp = create_db_with_events(&events);
         let report = collect_report(tmp.path(), "test-session").unwrap();
 
-        // Find the entry for mode 2026.
-        let stat = report.sequences.iter().find(|s| s.message.contains("2026"));
-        assert!(stat.is_some(), "Expected DECSET 2026 entry");
+        // Find the entry for mode 9999.
+        let stat = report.sequences.iter().find(|s| s.message.contains("9999"));
+        assert!(stat.is_some(), "Expected DECSET 9999 entry");
         let stat = stat.unwrap();
         assert_eq!(
             stat.count, 5,
-            "Expected count of 5 for DECSET 2026, got {}",
+            "Expected count of 5 for DECSET 9999, got {}",
             stat.count
         );
     }
@@ -299,7 +301,7 @@ mod tests {
                 100,
                 "test-session".to_string(),
                 Direction::Input,
-                b"\x1b[?2026h".to_vec(),
+                b"\x1b[?9999h".to_vec(),
             ),
         ];
         let tmp = create_db_with_events(&events);
@@ -319,13 +321,13 @@ mod tests {
         // First event: 5 bytes of plain text, then second event: the unhandled sequence.
         let events = vec![
             make_output_event("test-session", 100, b"hello"),         // 5 bytes
-            make_output_event("test-session", 200, b"\x1b[?2026h"),   // unhandled
+            make_output_event("test-session", 200, b"\x1b[?9999h"),   // unhandled
         ];
         let tmp = create_db_with_events(&events);
         let report = collect_report(tmp.path(), "test-session").unwrap();
 
-        let stat = report.sequences.iter().find(|s| s.message.contains("2026"));
-        assert!(stat.is_some(), "Expected DECSET 2026 in report");
+        let stat = report.sequences.iter().find(|s| s.message.contains("9999"));
+        assert!(stat.is_some(), "Expected DECSET 9999 in report");
         let stat = stat.unwrap();
         // The unhandled sequence is in the second chunk starting at byte offset 5.
         assert_eq!(stat.first_offset, 5, "Expected first occurrence at byte 5");
