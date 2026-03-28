@@ -119,10 +119,12 @@ impl Grid {
     pub fn visible_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
         let scrollback_len = self.scrollback.len();
         let rows_len = self.rows.len();
+        // Clamp offset to both scrollback and rows length to prevent underflow
+        let offset = self.scrollback_offset.min(scrollback_len).min(rows_len);
         self.scrollback
             .iter()
-            .skip(scrollback_len - self.scrollback_offset)
-            .chain(self.rows.iter().take(rows_len - self.scrollback_offset))
+            .skip(scrollback_len - offset)
+            .chain(self.rows.iter().take(rows_len - offset))
     }
 
     pub fn drawing_rows(&self) -> impl Iterator<Item = &crate::row::Row> {

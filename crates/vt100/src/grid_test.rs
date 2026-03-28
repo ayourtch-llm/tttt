@@ -75,4 +75,29 @@ mod tests {
             );
         }
     }
+
+    /// Reproduces panic: visible_rows() underflows when scrollback_offset > rows.len().
+    /// This happens when scrollback has more lines than the screen height and the
+    /// user scrolls back far enough that the offset exceeds the visible row count.
+    #[test]
+    fn test_scrollback_offset_exceeding_rows_does_not_panic() {
+        // 5-row screen with 100-line scrollback capacity
+        let mut parser = crate::Parser::new(5, 40, 100);
+
+        // Generate enough output to fill scrollback: 30 lines on a 5-row screen
+        for i in 0..30 {
+            parser.process(format!("line {}\r\n", i).as_bytes());
+        }
+
+        // Scroll back further than the screen height (5 rows)
+        // This should not panic even though offset > rows.len()
+        parser.set_scrollback(10);
+        // Accessing cells should work without panic
+        let _cell = parser.screen().cell(0, 0);
+
+        // Scroll to maximum available scrollback
+        let max = parser.screen().scrollback_count();
+        parser.set_scrollback(max);
+        let _cell = parser.screen().cell(0, 0);
+    }
 }
