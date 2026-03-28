@@ -81,6 +81,8 @@ enum InputAction {
     MouseRelease { col: u16, row: u16 },
     ScrollUp { col: u16, row: u16 },
     ScrollDown { col: u16, row: u16 },
+    /// Show the Ctrl+C escape hint in the status line.
+    ShowCtrlCHint,
 }
 
 fn decide_input_action(event: tttt_tui::InputEvent) -> InputAction {
@@ -99,6 +101,7 @@ fn decide_input_action(event: tttt_tui::InputEvent) -> InputAction {
         tttt_tui::InputEvent::MouseRelease { col, row } => InputAction::MouseRelease { col, row },
         tttt_tui::InputEvent::ScrollUp { col, row } => InputAction::ScrollUp { col, row },
         tttt_tui::InputEvent::ScrollDown { col, row } => InputAction::ScrollDown { col, row },
+        tttt_tui::InputEvent::ShowCtrlCHint => InputAction::ShowCtrlCHint,
     }
 }
 
@@ -304,6 +307,8 @@ pub struct App {
     scroll_offset: usize,
     /// Scrollback count when selection started — used to compensate for new output
     selection_scroll_base: usize,
+    /// When Some(deadline), show the Ctrl+C escape hint until that instant.
+    ctrl_c_hint_until: Option<Instant>,
 }
 
 impl App {
@@ -352,6 +357,7 @@ impl App {
             selection: None,
             scroll_offset: 0,
             selection_scroll_base: 0,
+            ctrl_c_hint_until: None,
             config,
         }
     }
@@ -1157,6 +1163,11 @@ impl App {
                     self.server_render_dirty = true;
                 }
             }
+            InputAction::ShowCtrlCHint => {
+                use std::time::Duration;
+                self.ctrl_c_hint_until = Some(Instant::now() + Duration::from_secs(3));
+                self.server_render_dirty = true;
+            }
         }
         Ok(true)
     }
@@ -1247,6 +1258,18 @@ impl App {
         };
         let selection_ref = self.selection.as_ref();
 
+        // Check Ctrl+C hint expiry before borrowing self in the closure.
+        let now = Instant::now();
+        let show_ctrl_c_hint = match self.ctrl_c_hint_until {
+            Some(deadline) if deadline > now => true,
+            Some(_) => {
+                // Expired — clear it.
+                self.ctrl_c_hint_until = None;
+                false
+            }
+            None => false,
+        };
+
         self.terminal.draw(|frame| {
             let area = frame.area();
             let chunks = Layout::default()
@@ -1273,6 +1296,19 @@ impl App {
                 &reminders,
             ).build_info(&uptime);
             frame.render_widget(widget, chunks[1]);
+
+            // Ctrl+C escape hint in the bottom status row of the PTY pane.
+            if show_ctrl_c_hint && chunks[0].height > 0 {
+                let hint_area = Rect::new(
+                    chunks[0].x,
+                    chunks[0].y + chunks[0].height.saturating_sub(1),
+                    chunks[0].width,
+                    1,
+                );
+                let hint_widget = Paragraph::new("Press Ctrl+\\ then q to detach from tttt")
+                    .style(Style::default().fg(Color::Yellow).bg(Color::Black));
+                frame.render_widget(hint_widget, hint_area);
+            }
 
             // Help overlay popup
             if showing_help {
@@ -1848,6 +1884,14 @@ mod tests {
     #[test]
     fn test_decide_input_action_prefix_escape() {
         assert_eq!(decide_input_action(InputEvent::PrefixEscape), InputAction::PrefixEscape);
+    }
+
+    #[test]
+    fn test_decide_input_action_show_ctrl_c_hint() {
+        assert_eq!(
+            decide_input_action(InputEvent::ShowCtrlCHint),
+            InputAction::ShowCtrlCHint
+        );
     }
 
     // ── Chunk 6: compute_exit_action ─────────────────────────────────────────
