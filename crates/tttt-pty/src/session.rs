@@ -17,7 +17,7 @@ pub enum SessionStatus {
 }
 
 /// Metadata about a terminal session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMetadata {
     pub id: SessionId,
     pub command: String,
@@ -654,5 +654,67 @@ mod tests {
         assert!(!scrollback.is_empty(), "should have scrollback after overflow");
         let joined = scrollback.join("\n");
         assert!(joined.contains("line 0"), "scrollback should contain earliest line");
+    }
+
+    // === SessionMetadata PartialEq tests ===
+
+    fn make_metadata(id: &str, name: Option<&str>, status: SessionStatus) -> SessionMetadata {
+        SessionMetadata {
+            id: id.to_string(),
+            command: "bash".to_string(),
+            status,
+            cols: 80,
+            rows: 24,
+            name: name.map(|s| s.to_string()),
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn test_metadata_equal_when_identical() {
+        let a = make_metadata("s1", Some("main"), SessionStatus::Running);
+        let b = make_metadata("s1", Some("main"), SessionStatus::Running);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_metadata_different_name() {
+        let a = make_metadata("s1", Some("main"), SessionStatus::Running);
+        let b = make_metadata("s1", Some("worker"), SessionStatus::Running);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_metadata_name_added() {
+        let a = make_metadata("s1", None, SessionStatus::Running);
+        let b = make_metadata("s1", Some("named"), SessionStatus::Running);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_metadata_status_changed() {
+        let a = make_metadata("s1", Some("main"), SessionStatus::Running);
+        let b = make_metadata("s1", Some("main"), SessionStatus::Exited(0));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_metadata_different_count_detected_via_vec() {
+        let v1 = vec![make_metadata("s1", None, SessionStatus::Running)];
+        let v2 = vec![
+            make_metadata("s1", None, SessionStatus::Running),
+            make_metadata("s2", None, SessionStatus::Running),
+        ];
+        assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn test_metadata_vec_equal_when_same() {
+        let v1 = vec![
+            make_metadata("s1", Some("a"), SessionStatus::Running),
+            make_metadata("s2", None, SessionStatus::Exited(1)),
+        ];
+        let v2 = v1.clone();
+        assert_eq!(v1, v2);
     }
 }

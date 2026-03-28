@@ -267,6 +267,7 @@ pub struct App {
     notifications: SharedNotificationRegistry,
     scratchpad: SharedScratchpad,
     sidebar_messages: SharedSidebarMessages,
+    sidebar_dirty: tttt_mcp::SidebarDirtyFlag,
     active_session: Option<String>,
     session_order: Vec<String>,
     screen_cols: u16,
@@ -309,6 +310,8 @@ pub struct App {
     selection_scroll_base: usize,
     /// When Some(deadline), show the Ctrl+C escape hint until that instant.
     ctrl_c_hint_until: Option<Instant>,
+    /// Last session metadata snapshot — compared each tick to detect changes.
+    last_session_snapshot: Vec<tttt_pty::SessionMetadata>,
 }
 
 impl App {
@@ -335,6 +338,7 @@ impl App {
             notifications: Arc::new(Mutex::new(NotificationRegistry::new())),
             scratchpad: Arc::new(Mutex::new(std::collections::HashMap::new())),
             sidebar_messages: Arc::new(Mutex::new(Vec::new())),
+            sidebar_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_session: None,
             session_order: Vec::new(),
             screen_cols: cols,
@@ -358,6 +362,7 @@ impl App {
             scroll_offset: 0,
             selection_scroll_base: 0,
             ctrl_c_hint_until: None,
+            last_session_snapshot: Vec::new(),
             config,
         }
     }
@@ -853,6 +858,31 @@ impl App {
                                 _ => {}
                             }
                         }
+                    }
+                }
+            }
+
+            // Check for sidebar-level changes that should trigger an immediate render
+            // (not debounced — these aren't PTY output bursts).
+            {
+                // 1. MCP sidebar messages changed
+                if self.sidebar_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    self.server_render_dirty = true;
+                    if self.first_dirty_time.is_none() {
+                        self.first_dirty_time = Some(Instant::now());
+                    }
+                }
+
+                // 2. Session metadata changed (name, status, count)
+                let current_snapshot = {
+                    let mgr = self.sessions.lock().unwrap();
+                    mgr.list()
+                };
+                if current_snapshot != self.last_session_snapshot {
+                    self.last_session_snapshot = current_snapshot;
+                    self.server_render_dirty = true;
+                    if self.first_dirty_time.is_none() {
+                        self.first_dirty_time = Some(Instant::now());
                     }
                 }
             }
@@ -1480,6 +1510,7 @@ impl App {
                         let scheduler = self.scheduler.clone();
                         let scratchpad = self.scratchpad.clone();
                         let sidebar_messages = self.sidebar_messages.clone();
+                        let sidebar_dirty = self.sidebar_dirty.clone();
                         let work_dir = self.config.work_dir.clone();
                         let db_path = self.config.db_path.clone();
                         let sqlite_logger = self.sqlite_logger.clone();
@@ -1495,7 +1526,7 @@ impl App {
                             let scheduler_handler = SchedulerToolHandler::new(scheduler);
                             let notif_handler = NotificationToolHandler::new(notifications, sessions);
                             let scratchpad_handler = ScratchpadToolHandler::new_shared(scratchpad);
-                            let sidebar_handler = SidebarMessageToolHandler::new(sidebar_messages);
+                            let sidebar_handler = SidebarMessageToolHandler::new(sidebar_messages, sidebar_dirty);
                             let replay_handler = ReplayToolHandler::new(db_path);
                             let mut composite = CompositeToolHandler::new();
                             composite.add_handler(Box::new(pty_handler));

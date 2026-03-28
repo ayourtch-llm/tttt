@@ -1048,14 +1048,18 @@ impl<B: PtyBackend + 'static> ToolHandler for NotificationToolHandler<B> {
 /// Shared sidebar messages type.
 pub type SharedSidebarMessages = Arc<Mutex<Vec<String>>>;
 
+/// Shared flag to signal the main render loop that sidebar content has changed.
+pub type SidebarDirtyFlag = Arc<std::sync::atomic::AtomicBool>;
+
 /// Handles sidebar message tool calls, writing messages into the sidebar REMINDERS section.
 pub struct SidebarMessageToolHandler {
     messages: SharedSidebarMessages,
+    dirty: SidebarDirtyFlag,
 }
 
 impl SidebarMessageToolHandler {
-    pub fn new(messages: SharedSidebarMessages) -> Self {
-        Self { messages }
+    pub fn new(messages: SharedSidebarMessages, dirty: SidebarDirtyFlag) -> Self {
+        Self { messages, dirty }
     }
 
     fn handle_sidebar_list(&self) -> Result<Value> {
@@ -1068,6 +1072,7 @@ impl SidebarMessageToolHandler {
         let mut msgs = self.messages.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
         if clear {
             msgs.clear();
+            self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             return Ok(json!({"status": "ok", "count": 0}));
         }
         let message = args["message"]
@@ -1078,6 +1083,7 @@ impl SidebarMessageToolHandler {
             msgs.remove(0);
         }
         msgs.push(message);
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(json!({"status": "ok", "count": msgs.len()}))
     }
 }
@@ -2315,7 +2321,10 @@ mod tests {
     // === SidebarMessageToolHandler tests ===
 
     fn make_sidebar_handler() -> SidebarMessageToolHandler {
-        SidebarMessageToolHandler::new(Arc::new(Mutex::new(Vec::new())))
+        SidebarMessageToolHandler::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
     }
 
     #[test]
@@ -2388,6 +2397,56 @@ mod tests {
         handler.handle_tool_call("tttt_sidebar_message", &json!({"clear": true})).unwrap();
         let result = handler.handle_tool_call("tttt_sidebar_list", &json!({})).unwrap();
         assert_eq!(result["messages"], json!([]));
+    }
+
+    // === Sidebar dirty flag tests ===
+
+    fn make_sidebar_handler_with_flag() -> (SidebarMessageToolHandler, Arc<std::sync::atomic::AtomicBool>) {
+        let dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler = SidebarMessageToolHandler::new(
+            Arc::new(Mutex::new(Vec::new())),
+            dirty.clone(),
+        );
+        (handler, dirty)
+    }
+
+    #[test]
+    fn test_sidebar_dirty_flag_set_on_add() {
+        let (mut handler, dirty) = make_sidebar_handler_with_flag();
+        assert!(!dirty.load(std::sync::atomic::Ordering::Relaxed));
+        handler.handle_tool_call("tttt_sidebar_message", &json!({"message": "hello"})).unwrap();
+        assert!(dirty.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_sidebar_dirty_flag_set_on_clear() {
+        let (mut handler, dirty) = make_sidebar_handler_with_flag();
+        handler.handle_tool_call("tttt_sidebar_message", &json!({"message": "hello"})).unwrap();
+        dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+        handler.handle_tool_call("tttt_sidebar_message", &json!({"clear": true})).unwrap();
+        assert!(dirty.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_sidebar_dirty_flag_not_set_on_list() {
+        let (mut handler, dirty) = make_sidebar_handler_with_flag();
+        handler.handle_tool_call("tttt_sidebar_message", &json!({"message": "hello"})).unwrap();
+        dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+        handler.handle_tool_call("tttt_sidebar_list", &json!({})).unwrap();
+        assert!(!dirty.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_sidebar_dirty_flag_resettable() {
+        let (mut handler, dirty) = make_sidebar_handler_with_flag();
+        handler.handle_tool_call("tttt_sidebar_message", &json!({"message": "a"})).unwrap();
+        assert!(dirty.load(std::sync::atomic::Ordering::Relaxed));
+        // Simulate main loop consuming the flag
+        dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!dirty.load(std::sync::atomic::Ordering::Relaxed));
+        // Second message sets it again
+        handler.handle_tool_call("tttt_sidebar_message", &json!({"message": "b"})).unwrap();
+        assert!(dirty.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     // === parse_rate_limit_reset tests ===

@@ -10,7 +10,8 @@ pub use error::{McpError, Result};
 pub use handler::{
     CancelToken, CompositeToolHandler, NotificationToolHandler, PtyToolHandler, ReplayToolHandler,
     SchedulerToolHandler, ScratchpadToolHandler, SharedNotificationRegistry, SharedScheduler,
-    SharedScratchpad, SharedSessionManager, SharedSidebarMessages, SidebarMessageToolHandler,
+    SharedScratchpad, SharedSessionManager, SharedSidebarMessages, SidebarDirtyFlag,
+    SidebarMessageToolHandler,
     ToolHandler,
 };
 pub use protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
