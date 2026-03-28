@@ -157,6 +157,54 @@ impl PtyBackend for RestoredPty {
         }
     }
 
+    fn kill_with_escalation(&mut self) -> Result<()> {
+        use nix::sys::signal::{kill as nix_kill, Signal};
+        use nix::unistd::Pid;
+        use std::time::Duration;
+
+        // Determine process group PID to kill.
+        let pgid = if let Some(pid) = self.child_pid {
+            pid.as_raw()
+        } else if let Some(pgid) = self.discover_foreground_pgid() {
+            pgid
+        } else {
+            return Err(PtyError::Io(std::io::Error::other(
+                "cannot kill: child PID unknown",
+            )));
+        };
+
+        // Step 1: SIGTERM to the entire process group.
+        let _ = nix_kill(Pid::from_raw(-pgid), Signal::SIGTERM);
+
+        // Step 2: Poll 3 × 50ms (150ms) for graceful exit.
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(50));
+            if self.try_wait()?.is_some() {
+                return Ok(());
+            }
+        }
+
+        // Step 3: SIGKILL + close master_fd (macOS: unblocks kernel read).
+        let _ = nix_kill(Pid::from_raw(-pgid), Signal::SIGKILL);
+        if self.master_fd >= 0 {
+            let fd = self.master_fd;
+            // Set to -1 before closing to prevent double-close in Drop.
+            self.master_fd = -1;
+            let _ = nix::unistd::close(fd);
+        }
+
+        // Step 4: Poll 10 × 50ms (500ms) for SIGKILL to take effect.
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(50));
+            if self.try_wait()?.is_some() {
+                return Ok(());
+            }
+        }
+
+        // Step 5: Give up — total worst case 650ms, never blocks indefinitely.
+        Ok(())
+    }
+
     fn try_wait(&mut self) -> Result<Option<i32>> {
         if let Some(pid) = self.child_pid {
             match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
@@ -165,8 +213,12 @@ impl PtyBackend for RestoredPty {
                 Ok(nix::sys::wait::WaitStatus::StillAlive) => Ok(None),
                 Ok(_) => Ok(None),
                 Err(nix::errno::Errno::ECHILD) => {
-                    // Child was already reaped or doesn't exist — check if PTY is still alive
-                    // by trying a zero-byte read
+                    // Child was already reaped or doesn't exist.
+                    if self.master_fd < 0 {
+                        // master_fd was closed (e.g. by kill_with_escalation) — treat as exited.
+                        return Ok(Some(0));
+                    }
+                    // Check if PTY is still alive by trying a zero-byte read.
                     let mut probe = [0u8; 0];
                     match nix::unistd::read(self.master_fd, &mut probe) {
                         Err(nix::errno::Errno::EIO) => Ok(Some(0)), // PTY closed
@@ -176,7 +228,10 @@ impl PtyBackend for RestoredPty {
                 Err(e) => Err(PtyError::Io(std::io::Error::from(e))),
             }
         } else {
-            // No PID — probe the PTY
+            // No PID — probe the PTY (if fd is still open).
+            if self.master_fd < 0 {
+                return Ok(Some(0));
+            }
             let mut probe = [0u8; 1];
             match nix::unistd::read(self.master_fd, &mut probe) {
                 Err(nix::errno::Errno::EIO) => Ok(Some(0)), // PTY slave closed
@@ -188,7 +243,10 @@ impl PtyBackend for RestoredPty {
 
 impl Drop for RestoredPty {
     fn drop(&mut self) {
-        let _ = nix::unistd::close(self.master_fd);
+        // master_fd is set to -1 if already closed (e.g. by kill_with_escalation).
+        if self.master_fd >= 0 {
+            let _ = nix::unistd::close(self.master_fd);
+        }
     }
 }
 
