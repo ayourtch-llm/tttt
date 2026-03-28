@@ -316,12 +316,13 @@ fn run_restored(restore_file: &str) {
     }
 
     // If root was skipped, remove it from session_order and relaunch fresh
-    // (gets new MCP config + tool discovery)
+    // (gets new MCP config + tool discovery). Insert new root at position 0
+    // to preserve the sidebar ordering (root is always first).
     if restart_root {
         if let Some(root_id) = state.session_order.first() {
             app.remove_from_session_order(root_id);
         }
-        match app.launch_root() {
+        match app.launch_root_at_front() {
             Ok(new_root_id) => {
                 // Auto-inject "Continue" when Claude shows its prompt,
                 // so it resumes without waiting for human input.

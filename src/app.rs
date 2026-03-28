@@ -656,6 +656,16 @@ impl App {
         Ok(id)
     }
 
+    /// Launch root session and insert it at the front of session_order.
+    /// Used during SIGUSR2 restart to preserve sidebar ordering.
+    pub fn launch_root_at_front(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+        let id = self.launch_root()?;
+        // launch_root pushed it to the end — move it to the front
+        self.session_order.retain(|s| s != &id);
+        self.session_order.insert(0, id.clone());
+        Ok(id)
+    }
+
     /// Create a new PTY session with the default shell.
     pub fn create_session(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let (pty_cols, pty_rows) = calculate_pane_dimensions(
@@ -1100,10 +1110,10 @@ impl App {
             }
             InputAction::MousePress { button, col, row } => {
                 if matches!(button, tttt_tui::MouseButton::Left) {
-                    // Only start selection if click is in PTY pane (not sidebar)
                     let sidebar_width = self.config.sidebar_width;
                     let pane_width = self.screen_cols.saturating_sub(sidebar_width);
                     if col < pane_width {
+                        // Click in PTY pane — start text selection
                         self.selection = Some(tttt_tui::Selection::new(row, col));
                         self.scroll_offset = 0; // Start from live view
                         // Snapshot scrollback count to detect new output during selection
@@ -1114,6 +1124,14 @@ impl App {
                             })
                             .unwrap_or(0);
                         self.server_render_dirty = true;
+                    } else if row >= 2 {
+                        // Click in sidebar — switch to the clicked session
+                        // Sessions start at row 2 (after header + separator)
+                        let session_idx = (row - 2) as usize;
+                        if session_idx < self.session_order.len() {
+                            self.active_session = Some(self.session_order[session_idx].clone());
+                            self.server_render_dirty = true;
+                        }
                     }
                 }
             }
