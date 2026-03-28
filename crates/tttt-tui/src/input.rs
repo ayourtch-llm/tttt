@@ -1,3 +1,47 @@
+use std::time::{Duration, Instant};
+
+/// Tracks rapid Ctrl+C presses and fires when 4 occur within 2 seconds.
+pub struct CtrlCTracker {
+    /// Ring buffer of the last 4 press timestamps.
+    timestamps: [Option<Instant>; 4],
+    /// Index of the next slot to write.
+    head: usize,
+}
+
+impl CtrlCTracker {
+    pub fn new() -> Self {
+        Self {
+            timestamps: [None; 4],
+            head: 0,
+        }
+    }
+
+    /// Record a Ctrl+C press. Returns `true` when 4 presses have occurred
+    /// within a 2-second window.
+    pub fn record(&mut self) -> bool {
+        let now = Instant::now();
+        self.timestamps[self.head] = Some(now);
+        self.head = (self.head + 1) % 4;
+
+        // After recording, check whether all 4 slots are set and within 2s of
+        // the oldest.
+        let times: [Option<Instant>; 4] = self.timestamps;
+        let all_set = times.iter().all(|t| t.is_some());
+        if !all_set {
+            return false;
+        }
+        let oldest = times.iter().filter_map(|t| *t).min().unwrap();
+        let newest = times.iter().filter_map(|t| *t).max().unwrap();
+        newest.duration_since(oldest) <= Duration::from_secs(2)
+    }
+}
+
+impl Default for CtrlCTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Mouse button identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseButton {
@@ -64,6 +108,8 @@ pub enum InputEvent {
     ScrollUp { col: u16, row: u16 },
     /// Scroll wheel down at (col, row) — 0-indexed.
     ScrollDown { col: u16, row: u16 },
+    /// Show the "press Ctrl+\\ then q to detach" hint in the status line.
+    ShowCtrlCHint,
 }
 
 /// Try to parse an SGR mouse sequence from a byte slice.
@@ -134,6 +180,8 @@ pub struct InputParser {
     prefix_armed: bool,
     /// Buffer for incomplete mouse sequences split across read() calls.
     mouse_buf: Vec<u8>,
+    /// Tracks rapid Ctrl+C presses to fire the escape hint.
+    ctrl_c_tracker: CtrlCTracker,
 }
 
 impl InputParser {
@@ -142,6 +190,7 @@ impl InputParser {
             config,
             prefix_armed: false,
             mouse_buf: Vec::new(),
+            ctrl_c_tracker: CtrlCTracker::new(),
         }
     }
 
@@ -298,7 +347,18 @@ impl InputParser {
             } else if byte == self.config.prefix_key {
                 self.prefix_armed = true;
             } else {
-                passthrough.push(byte);
+                // Intercept Ctrl+C (0x03) for the escape-hint tracker, but still
+                // pass it through to the PTY so the child receives it normally.
+                if byte == 0x03 && self.ctrl_c_tracker.record() {
+                    // Flush accumulated passthrough first so ordering is clean.
+                    if !passthrough.is_empty() {
+                        events.push(InputEvent::PassThrough(std::mem::take(&mut passthrough)));
+                    }
+                    events.push(InputEvent::PassThrough(vec![0x03]));
+                    events.push(InputEvent::ShowCtrlCHint);
+                } else {
+                    passthrough.push(byte);
+                }
             }
         }
 
@@ -728,5 +788,122 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // --- CtrlCTracker tests ---
+
+    #[test]
+    fn test_ctrl_c_tracker_four_rapid_presses_fires() {
+        let mut t = CtrlCTracker::new();
+        assert!(!t.record(), "1st press should not fire");
+        assert!(!t.record(), "2nd press should not fire");
+        assert!(!t.record(), "3rd press should not fire");
+        assert!(t.record(), "4th rapid press should fire");
+    }
+
+    #[test]
+    fn test_ctrl_c_tracker_three_presses_no_fire() {
+        let mut t = CtrlCTracker::new();
+        t.record();
+        t.record();
+        assert!(!t.record(), "only 3 presses — must not fire");
+    }
+
+    #[test]
+    fn test_ctrl_c_tracker_four_presses_spread_over_2s_no_fire() {
+        use std::time::Duration;
+        let mut t = CtrlCTracker::new();
+        // Manually set three old timestamps (> 2 seconds ago) and record one now.
+        let old = Instant::now() - Duration::from_secs(3);
+        t.timestamps[0] = Some(old);
+        t.timestamps[1] = Some(old);
+        t.timestamps[2] = Some(old);
+        t.head = 3;
+        // Fourth press now — oldest is 3 s ago, so window > 2 s
+        assert!(!t.record(), "window > 2s should not fire");
+    }
+
+    #[test]
+    fn test_ctrl_c_tracker_default_is_same_as_new() {
+        let mut t: CtrlCTracker = CtrlCTracker::default();
+        // Should behave identically to ::new()
+        assert!(!t.record());
+        assert!(!t.record());
+        assert!(!t.record());
+        assert!(t.record());
+    }
+
+    #[test]
+    fn test_ctrl_c_tracker_continues_firing_during_rapid_sequence() {
+        let mut t = CtrlCTracker::new();
+        // First burst fires on the 4th press
+        t.record(); t.record(); t.record();
+        assert!(t.record(), "4th rapid press fires");
+        // Subsequent rapid presses keep firing because all 4 ring-buffer slots
+        // are still within the 2-second window.
+        assert!(t.record(), "5th rapid press still fires");
+        assert!(t.record(), "6th rapid press still fires");
+    }
+
+    // --- InputParser Ctrl+C integration tests ---
+
+    #[test]
+    fn test_ctrl_c_passthrough_without_hint() {
+        // Three Ctrl+C presses → all PassThrough, no hint
+        let mut p = parser();
+        for _ in 0..3 {
+            let events = p.process(&input(&[0x03]));
+            assert!(
+                events.iter().all(|e| matches!(e, InputEvent::PassThrough(_))),
+                "fewer than 4 presses must only emit PassThrough"
+            );
+            assert!(
+                !events.iter().any(|e| *e == InputEvent::ShowCtrlCHint),
+                "no hint before 4 presses"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ctrl_c_fourth_press_emits_passthrough_and_hint() {
+        let mut p = parser();
+        // Consume first three presses
+        for _ in 0..3 {
+            p.process(&input(&[0x03]));
+        }
+        // Fourth press
+        let events = p.process(&input(&[0x03]));
+        assert!(
+            events.contains(&InputEvent::PassThrough(vec![0x03])),
+            "0x03 must still be passed through to the PTY"
+        );
+        assert!(
+            events.contains(&InputEvent::ShowCtrlCHint),
+            "ShowCtrlCHint must be emitted on the 4th rapid press"
+        );
+    }
+
+    #[test]
+    fn test_ctrl_c_hint_does_not_suppress_passthrough() {
+        // Verify normal text before and after Ctrl+C still flows through.
+        let mut p = parser();
+        for _ in 0..3 {
+            p.process(&input(&[0x03]));
+        }
+        // Fourth press mixed with surrounding text
+        let bytes = [b'a', 0x03, b'b'];
+        let events = p.process(&input(&bytes));
+
+        // "a" should be in a PassThrough before the hint
+        let has_a = events.iter().any(|e| matches!(e, InputEvent::PassThrough(v) if v.contains(&b'a')));
+        assert!(has_a, "'a' must pass through");
+        // The 0x03 itself must pass through
+        let has_ctrl_c = events.iter().any(|e| matches!(e, InputEvent::PassThrough(v) if v.contains(&0x03)));
+        assert!(has_ctrl_c, "Ctrl+C must pass through");
+        // "b" must pass through
+        let has_b = events.iter().any(|e| matches!(e, InputEvent::PassThrough(v) if v.contains(&b'b')));
+        assert!(has_b, "'b' must pass through");
+        // Hint must be emitted
+        assert!(events.contains(&InputEvent::ShowCtrlCHint), "hint must fire");
     }
 }
