@@ -113,9 +113,9 @@ impl ScreenBuffer {
         self.parser.screen().scrollback()
     }
 
-    /// Get the maximum scroll offset (number of lines in scrollback buffer).
+    /// Get the maximum scroll offset (actual lines stored in scrollback, not capacity).
     pub fn max_scroll_offset(&self) -> usize {
-        self.parser.screen().scrollback_len()
+        self.parser.screen().scrollback_count()
     }
 }
 

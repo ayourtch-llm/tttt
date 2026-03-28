@@ -148,10 +148,16 @@ impl Screen {
         self.grid().scrollback_contents(max_lines)
     }
 
-    /// Returns the total number of lines in the scrollback buffer.
+    /// Returns the configured scrollback buffer capacity.
     #[must_use]
     pub fn scrollback_len(&self) -> usize {
         self.grid().scrollback_len()
+    }
+
+    /// Returns the number of lines actually stored in the scrollback buffer.
+    #[must_use]
+    pub fn scrollback_count(&self) -> usize {
+        self.grid().scrollback_count()
     }
 
     /// Returns the text contents of the terminal.

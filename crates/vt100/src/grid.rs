@@ -176,6 +176,11 @@ impl Grid {
         self.scrollback_len
     }
 
+    /// Number of lines actually stored in the scrollback buffer.
+    pub fn scrollback_count(&self) -> usize {
+        self.scrollback.len()
+    }
+
     pub fn scrollback(&self) -> usize {
         self.scrollback_offset
     }
