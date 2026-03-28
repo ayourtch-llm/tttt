@@ -1675,6 +1675,44 @@ fn compute_selection_scroll_compensation(
 
 /// Copy text to the system clipboard via OSC 52 escape sequence.
 fn copy_to_clipboard(text: &str) {
+    // Try platform-native clipboard first (works in all terminals)
+    if copy_to_clipboard_native(text) {
+        return;
+    }
+    // Fall back to OSC 52 (works in iTerm2, kitty, alacritty, etc.)
+    copy_to_clipboard_osc52(text);
+}
+
+/// Copy via platform-native command (pbcopy on macOS, xclip/xsel on Linux).
+fn copy_to_clipboard_native(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    #[cfg(target_os = "macos")]
+    let cmd = "pbcopy";
+    #[cfg(target_os = "linux")]
+    let cmd = "xclip";
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return false;
+
+    let mut child = match Command::new(cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    if let Some(ref mut stdin) = child.stdin {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Copy via OSC 52 escape sequence (terminal must support it).
+fn copy_to_clipboard_osc52(text: &str) {
     use base64::Engine;
     use std::io::Write;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
