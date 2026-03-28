@@ -80,6 +80,11 @@ pub struct Screen {
     visual_bell_count: usize,
 
     errors: usize,
+
+    /// Collected unhandled escape/control sequences (message string).
+    /// Populated when diagnostic tracking is enabled via
+    /// `enable_diagnostic_tracking()`.
+    unhandled: Option<Vec<String>>,
 }
 
 impl Screen {
@@ -107,6 +112,28 @@ impl Screen {
             visual_bell_count: 0,
 
             errors: 0,
+
+            unhandled: None,
+        }
+    }
+
+    /// Enable collection of unhandled escape sequences for diagnostic use.
+    /// After calling this, `take_unhandled()` will return the collected messages.
+    pub fn enable_diagnostic_tracking(&mut self) {
+        self.unhandled = Some(Vec::new());
+    }
+
+    /// Drain and return all unhandled-sequence messages collected since the
+    /// last call (or since `enable_diagnostic_tracking()`).
+    /// Returns `None` if diagnostic tracking was never enabled.
+    pub fn take_unhandled(&mut self) -> Option<Vec<String>> {
+        self.unhandled.as_mut().map(|v| std::mem::take(v))
+    }
+
+    /// Record an unhandled sequence message (internal helper).
+    fn record_unhandled(&mut self, msg: String) {
+        if let Some(ref mut v) = self.unhandled {
+            v.push(msg);
         }
     }
 
@@ -1189,7 +1216,9 @@ impl Screen {
             1 => self.grid_mut().erase_all_backward(attrs),
             2 => self.grid_mut().erase_all(attrs),
             n => {
-                log::debug!("unhandled ED mode: {n}");
+                let msg = format!("unhandled ED mode: {n}");
+                log::debug!("{msg}");
+                self.record_unhandled(msg);
             }
         }
     }
@@ -1207,7 +1236,9 @@ impl Screen {
             1 => self.grid_mut().erase_row_backward(attrs),
             2 => self.grid_mut().erase_row(attrs),
             n => {
-                log::debug!("unhandled EL mode: {n}");
+                let msg = format!("unhandled EL mode: {n}");
+                log::debug!("{msg}");
+                self.record_unhandled(msg);
             }
         }
     }
@@ -1254,12 +1285,11 @@ impl Screen {
     }
 
     // CSI h
-    #[allow(clippy::unused_self)]
     fn sm(&mut self, params: &vte::Params) {
         // nothing, i think?
-        if log::log_enabled!(log::Level::Debug) {
-            log::debug!("unhandled SM mode: {}", param_str(params));
-        }
+        let msg = format!("unhandled SM mode: {}", param_str(params));
+        log::debug!("{msg}");
+        self.record_unhandled(msg);
     }
 
     // CSI ? h
@@ -1291,31 +1321,30 @@ impl Screen {
                 }
                 &[2004] => self.set_mode(MODE_BRACKETED_PASTE),
                 ns => {
-                    if log::log_enabled!(log::Level::Debug) {
-                        let n = if ns.len() == 1 {
-                            format!(
-                                "{}",
-                                // we just checked that ns.len() == 1, so 0
-                                // must be valid
-                                ns[0]
-                            )
-                        } else {
-                            format!("{ns:?}")
-                        };
-                        log::debug!("unhandled DECSET mode: {n}");
-                    }
+                    let n = if ns.len() == 1 {
+                        format!(
+                            "{}",
+                            // we just checked that ns.len() == 1, so 0
+                            // must be valid
+                            ns[0]
+                        )
+                    } else {
+                        format!("{ns:?}")
+                    };
+                    let msg = format!("unhandled DECSET mode: {n}");
+                    log::debug!("{msg}");
+                    self.record_unhandled(msg);
                 }
             }
         }
     }
 
     // CSI l
-    #[allow(clippy::unused_self)]
     fn rm(&mut self, params: &vte::Params) {
         // nothing, i think?
-        if log::log_enabled!(log::Level::Debug) {
-            log::debug!("unhandled RM mode: {}", param_str(params));
-        }
+        let msg = format!("unhandled RM mode: {}", param_str(params));
+        log::debug!("{msg}");
+        self.record_unhandled(msg);
     }
 
     // CSI ? l
@@ -1350,19 +1379,19 @@ impl Screen {
                 }
                 &[2004] => self.clear_mode(MODE_BRACKETED_PASTE),
                 ns => {
-                    if log::log_enabled!(log::Level::Debug) {
-                        let n = if ns.len() == 1 {
-                            format!(
-                                "{}",
-                                // we just checked that ns.len() == 1, so 0
-                                // must be valid
-                                ns[0]
-                            )
-                        } else {
-                            format!("{ns:?}")
-                        };
-                        log::debug!("unhandled DECRST mode: {n}");
-                    }
+                    let n = if ns.len() == 1 {
+                        format!(
+                            "{}",
+                            // we just checked that ns.len() == 1, so 0
+                            // must be valid
+                            ns[0]
+                        )
+                    } else {
+                        format!("{ns:?}")
+                    };
+                    let msg = format!("unhandled DECRST mode: {n}");
+                    log::debug!("{msg}");
+                    self.record_unhandled(msg);
                 }
             }
         }
@@ -1447,19 +1476,19 @@ impl Screen {
                             crate::attrs::Color::Idx(next_param_u8!());
                     }
                     ns => {
-                        if log::log_enabled!(log::Level::Debug) {
-                            let n = if ns.len() == 1 {
-                                format!(
-                                    "{}",
-                                    // we just checked that ns.len() == 1, so
-                                    // 0 must be valid
-                                    ns[0]
-                                )
-                            } else {
-                                format!("{ns:?}")
-                            };
-                            log::debug!("unhandled SGR mode: 38 {n}");
-                        }
+                        let n = if ns.len() == 1 {
+                            format!(
+                                "{}",
+                                // we just checked that ns.len() == 1, so
+                                // 0 must be valid
+                                ns[0]
+                            )
+                        } else {
+                            format!("{ns:?}")
+                        };
+                        let msg = format!("unhandled SGR mode: 38 {n}");
+                        log::debug!("{msg}");
+                        self.record_unhandled(msg);
                         return;
                     }
                 },
@@ -1493,19 +1522,19 @@ impl Screen {
                             crate::attrs::Color::Idx(next_param_u8!());
                     }
                     ns => {
-                        if log::log_enabled!(log::Level::Debug) {
-                            let n = if ns.len() == 1 {
-                                format!(
-                                    "{}",
-                                    // we just checked that ns.len() == 1, so
-                                    // 0 must be valid
-                                    ns[0]
-                                )
-                            } else {
-                                format!("{ns:?}")
-                            };
-                            log::debug!("unhandled SGR mode: 48 {n}");
-                        }
+                        let n = if ns.len() == 1 {
+                            format!(
+                                "{}",
+                                // we just checked that ns.len() == 1, so
+                                // 0 must be valid
+                                ns[0]
+                            )
+                        } else {
+                            format!("{ns:?}")
+                        };
+                        let msg = format!("unhandled SGR mode: 48 {n}");
+                        log::debug!("{msg}");
+                        self.record_unhandled(msg);
                         return;
                     }
                 },
@@ -1521,19 +1550,19 @@ impl Screen {
                         crate::attrs::Color::Idx(to_u8!(n) - 92);
                 }
                 ns => {
-                    if log::log_enabled!(log::Level::Debug) {
-                        let n = if ns.len() == 1 {
-                            format!(
-                                "{}",
-                                // we just checked that ns.len() == 1, so 0
-                                // must be valid
-                                ns[0]
-                            )
-                        } else {
-                            format!("{ns:?}")
-                        };
-                        log::debug!("unhandled SGR mode: {n}");
-                    }
+                    let n = if ns.len() == 1 {
+                        format!(
+                            "{}",
+                            // we just checked that ns.len() == 1, so 0
+                            // must be valid
+                            ns[0]
+                        )
+                    } else {
+                        format!("{ns:?}")
+                    };
+                    let msg = format!("unhandled SGR mode: {n}");
+                    log::debug!("{msg}");
+                    self.record_unhandled(msg);
                 }
             }
         }
@@ -1586,14 +1615,16 @@ impl vte::Perform for Screen {
             14 | 15 => {}
             _ => {
                 self.errors = self.errors.saturating_add(1);
-                log::debug!("unhandled control character: {b}");
+                let msg = format!("unhandled control character: {b}");
+                log::debug!("{msg}");
+                self.record_unhandled(msg);
             }
         }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, b: u8) {
-        intermediates.first().map_or_else(
-            || match b {
+        match intermediates.first() {
+            None => match b {
                 b'7' => self.decsc(),
                 b'8' => self.decrc(),
                 b'=' => self.deckpam(),
@@ -1602,13 +1633,17 @@ impl vte::Perform for Screen {
                 b'c' => self.ris(),
                 b'g' => self.vb(),
                 _ => {
-                    log::debug!("unhandled escape code: ESC {b}");
+                    let msg = format!("unhandled escape code: ESC {b}");
+                    log::debug!("{msg}");
+                    self.record_unhandled(msg);
                 }
             },
-            |i| {
-                log::debug!("unhandled escape code: ESC {i} {b}");
-            },
-        );
+            Some(i) => {
+                let msg = format!("unhandled escape code: ESC {i} {b}");
+                log::debug!("{msg}");
+                self.record_unhandled(msg);
+            }
+        }
     }
 
     fn csi_dispatch(
@@ -1647,13 +1682,13 @@ impl vte::Perform for Screen {
                 's' => self.save_cursor(),
                 'u' => self.restore_cursor(),
                 _ => {
-                    if log::log_enabled!(log::Level::Debug) {
-                        log::debug!(
-                            "unhandled csi sequence: CSI {} {}",
-                            param_str(params),
-                            c
-                        );
-                    }
+                    let msg = format!(
+                        "unhandled csi sequence: CSI {} {}",
+                        param_str(params),
+                        c
+                    );
+                    log::debug!("{msg}");
+                    self.record_unhandled(msg);
                 }
             },
             Some(b'?') => match c {
@@ -1662,24 +1697,24 @@ impl vte::Perform for Screen {
                 'h' => self.decset(params),
                 'l' => self.decrst(params),
                 _ => {
-                    if log::log_enabled!(log::Level::Debug) {
-                        log::debug!(
-                            "unhandled csi sequence: CSI ? {} {}",
-                            param_str(params),
-                            c
-                        );
-                    }
-                }
-            },
-            Some(i) => {
-                if log::log_enabled!(log::Level::Debug) {
-                    log::debug!(
-                        "unhandled csi sequence: CSI {} {} {}",
-                        i,
+                    let msg = format!(
+                        "unhandled csi sequence: CSI ? {} {}",
                         param_str(params),
                         c
                     );
+                    log::debug!("{msg}");
+                    self.record_unhandled(msg);
                 }
+            },
+            Some(i) => {
+                let msg = format!(
+                    "unhandled csi sequence: CSI {} {} {}",
+                    i,
+                    param_str(params),
+                    c
+                );
+                log::debug!("{msg}");
+                self.record_unhandled(msg);
             }
         }
     }
@@ -1690,12 +1725,12 @@ impl vte::Perform for Screen {
             (Some(&b"1"), Some(s)) => self.osc1(s),
             (Some(&b"2"), Some(s)) => self.osc2(s),
             _ => {
-                if log::log_enabled!(log::Level::Debug) {
-                    log::debug!(
-                        "unhandled osc sequence: OSC {}",
-                        osc_param_str(params),
-                    );
-                }
+                let msg = format!(
+                    "unhandled osc sequence: OSC {}",
+                    osc_param_str(params),
+                );
+                log::debug!("{msg}");
+                self.record_unhandled(msg);
             }
         }
     }
@@ -1707,25 +1742,21 @@ impl vte::Perform for Screen {
         _ignore: bool,
         action: char,
     ) {
-        if log::log_enabled!(log::Level::Debug) {
-            intermediates.first().map_or_else(
-                || {
-                    log::debug!(
-                        "unhandled dcs sequence: DCS {} {}",
-                        param_str(params),
-                        action,
-                    );
-                },
-                |i| {
-                    log::debug!(
-                        "unhandled dcs sequence: DCS {} {} {}",
-                        i,
-                        param_str(params),
-                        action,
-                    );
-                },
-            );
-        }
+        let msg = match intermediates.first() {
+            None => format!(
+                "unhandled dcs sequence: DCS {} {}",
+                param_str(params),
+                action,
+            ),
+            Some(i) => format!(
+                "unhandled dcs sequence: DCS {} {} {}",
+                i,
+                param_str(params),
+                action,
+            ),
+        };
+        log::debug!("{msg}");
+        self.record_unhandled(msg);
     }
 }
 

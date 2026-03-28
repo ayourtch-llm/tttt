@@ -2,6 +2,7 @@ mod app;
 mod attach;
 mod config;
 pub mod ctl;
+mod diag;
 mod reload;
 mod replay_tui;
 
@@ -73,6 +74,17 @@ enum Commands {
         session: Option<String>,
     },
 
+    /// Replay a recorded session and report unhandled VT100/escape sequences
+    Diag {
+        /// Path to the SQLite database (default: from config)
+        #[arg(short, long)]
+        database: Option<std::path::PathBuf>,
+
+        /// Session ID to analyse
+        #[arg(short, long)]
+        session: String,
+    },
+
     /// CLI bridge for controlling a running tttt instance via MCP socket
     Ctl {
         #[command(subcommand)]
@@ -119,6 +131,15 @@ fn main() {
             });
             if let Err(e) = replay_tui::run_replay(&db_path, session.as_deref()) {
                 eprintln!("Replay error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Diag { database, session }) => {
+            let db_path = database.unwrap_or_else(|| {
+                config::Config::load_default().db_path
+            });
+            if let Err(e) = diag::run(&db_path, &session) {
+                eprintln!("Diag error: {}", e);
                 std::process::exit(1);
             }
         }
