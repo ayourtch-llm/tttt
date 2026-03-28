@@ -24,8 +24,8 @@ use tttt_pty::{AnyPty, PtySession, RealPty, SessionManager, SessionStatus};
 use tttt_scheduler::{Scheduler, SchedulerEvent};
 use std::os::unix::net::UnixListener;
 use tttt_tui::{
-    clear_screen, cursor_goto, protocol, InputEvent, InputParser, PaneRenderer, RawInput,
-    SidebarRenderer, ViewerClient, PtyWidget, SidebarWidget,
+    protocol, InputEvent, InputParser, RawInput,
+    ViewerClient, PtyWidget, SidebarWidget,
 };
 
 /// Minimum time between renders to the server terminal (ms).
@@ -55,19 +55,6 @@ fn terminal_size() -> (u16, u16) {
             (80, 24)
         }
     }
-}
-
-fn write_all(fd: i32, data: &[u8]) -> nix::Result<()> {
-    let mut offset = 0;
-    while offset < data.len() {
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        match nix::unistd::write(borrowed, &data[offset..]) {
-            Ok(n) => offset += n,
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
 }
 
 /// Pure mapping of a parsed `InputEvent` to the action that should be taken.
@@ -162,69 +149,6 @@ fn calculate_min_dimensions(
     (min_cols, min_rows)
 }
 
-/// Build the escape-sequence string that fills the right-margin gap (between
-/// the PTY right edge and the sidebar) with gray dots.
-///
-/// * `min_cols`     — current PTY width (columns used by the PTY)
-/// * `max_pty_cols` — maximum usable columns (screen width minus sidebar)
-/// * `screen_rows`  — full terminal height (the loop covers the whole height,
-///                    not just the PTY height, so rows below the PTY are also
-///                    filled)
-///
-/// Returns an empty string when `min_cols >= max_pty_cols` (no gap).
-#[cfg_attr(not(test), allow(dead_code))]
-fn build_width_gap_output(min_cols: u16, max_pty_cols: u16, screen_rows: u16) -> String {
-    if min_cols >= max_pty_cols {
-        return String::new();
-    }
-    let dot_attr = "\x1b[2;90m";
-    let reset = "\x1b[0m";
-    let dots: String = ".".repeat((max_pty_cols - min_cols) as usize);
-    let mut out = String::new();
-    for row in 0..screen_rows {
-        out.push_str(&format!(
-            "\x1b[{};{}H{}{}{}",
-            row + 1,
-            min_cols + 1,
-            dot_attr,
-            dots,
-            reset,
-        ));
-    }
-    out
-}
-
-/// Build the escape-sequence string that fills rows below the PTY area
-/// (from `min_rows` up to `max_pty_rows`) with gray dots across the full
-/// pane width.
-///
-/// * `min_rows`     — current PTY height
-/// * `max_pty_rows` — maximum usable rows for the PTY (screen rows minus
-///                    one for the status bar, i.e. `screen_rows - 1`)
-/// * `max_pty_cols` — full pane width (columns to fill with dots)
-///
-/// Returns an empty string when `min_rows >= max_pty_rows` (no gap).
-#[cfg_attr(not(test), allow(dead_code))]
-fn build_height_gap_output(min_rows: u16, max_pty_rows: u16, max_pty_cols: u16) -> String {
-    if min_rows >= max_pty_rows {
-        return String::new();
-    }
-    let dot_attr = "\x1b[2;90m";
-    let reset = "\x1b[0m";
-    let pane_dots: String = ".".repeat(max_pty_cols as usize);
-    let mut out = String::new();
-    for row in min_rows..max_pty_rows {
-        out.push_str(&format!(
-            "\x1b[{};{}H{}{}{}",
-            row + 1,
-            1,
-            dot_attr,
-            pane_dots,
-            reset,
-        ));
-    }
-    out
-}
 
 /// Decide whether to render now given the current debounce state.
 ///
@@ -301,6 +225,7 @@ fn prefix_key_name(key: u8) -> String {
 
 /// Compute a centered Rect for the help popup within the given terminal area.
 /// Returns `(x, y, width, height)` values for [`ratatui::layout::Rect::new`].
+#[cfg(test)]
 fn help_popup_area(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
     let popup_width: u16 = 45;
     let popup_height: u16 = 14;
@@ -318,8 +243,8 @@ pub struct App {
     config: Config,
     sessions: Arc<Mutex<SessionManager<AnyPty>>>,
     input_parser: InputParser,
-    sidebar: SidebarRenderer,
-    pane_renderer: PaneRenderer,
+    /// Current PTY dimensions (cols, rows) — tracked separately from screen size.
+    pty_dims: (u16, u16),
     terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
     logger: MultiLogger,
     sqlite_logger: Option<Arc<Mutex<SqliteLogger>>>,
@@ -379,8 +304,7 @@ impl App {
         Self {
             sessions: Arc::new(Mutex::new(SessionManager::with_max_sessions(config.max_sessions))),
             input_parser: InputParser::new(display_config),
-            sidebar: SidebarRenderer::new(config.sidebar_width),
-            pane_renderer: PaneRenderer::new(pty_cols, pty_rows, 1, 1),
+            pty_dims: (pty_cols, pty_rows),
             terminal,
             logger: MultiLogger::new(),
             sqlite_logger: None,
@@ -1137,24 +1061,6 @@ impl App {
         Ok(())
     }
 
-    fn render_sidebar(&self, stdout_fd: i32) -> Result<(), Box<dyn std::error::Error>> {
-        let mgr = self.sessions.lock().unwrap();
-        let sessions = mgr.list();
-        drop(mgr);
-        let reminders: Vec<String> = self.sidebar_messages.lock().unwrap().clone();
-        let uptime_secs = self.server_start_time.elapsed().as_secs();
-        let uptime = format!("Uptime: {}s", uptime_secs);
-        let lines = self.sidebar.render_with_build_info(
-            &sessions, self.active_session.as_deref(),
-            self.screen_cols, self.screen_rows, &reminders,
-            Some(&uptime),
-        );
-        for line in &lines {
-            write_all(stdout_fd, line.content.as_bytes())?;
-        }
-        Ok(())
-    }
-
     /// Render the full frame using ratatui widgets.
     fn render_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Collect all data needed for rendering before entering the draw closure,
@@ -1260,7 +1166,7 @@ impl App {
         self.screen_cols = cols;
         self.screen_rows = rows;
         let (pty_cols, pty_rows) = calculate_pane_dimensions(cols, rows, self.config.sidebar_width);
-        self.pane_renderer.resize(pty_cols, pty_rows);
+        self.pty_dims = (pty_cols, pty_rows);
         let resized_ids: Vec<String> = {
             let mut mgr = self.sessions.lock().unwrap();
             let ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
@@ -1533,7 +1439,7 @@ impl App {
             calculate_min_dimensions(&viewer_dims, max_pty_cols, max_pty_rows);
 
         // Check if dimensions actually changed
-        let (old_cols, old_rows) = self.pane_renderer.dimensions();
+        let (old_cols, old_rows) = self.pty_dims;
         let changed = min_cols != old_cols || min_rows != old_rows;
 
         if changed {
@@ -1547,8 +1453,8 @@ impl App {
             }
             drop(mgr);
 
-            // Resize main pane renderer
-            self.pane_renderer.resize(min_cols, min_rows);
+            // Update tracked PTY dimensions
+            self.pty_dims = (min_cols, min_rows);
 
             // Redraw the full frame via ratatui (handles gap fill and sidebar)
             let _ = self.render_frame();
@@ -1946,124 +1852,6 @@ mod tests {
         let line = format!("  {prefix}{prefix}  Send literal prefix");
         let count = line.matches("XX").count();
         assert!(count >= 2, "prefix should appear at least twice in literal-prefix entry");
-    }
-
-    // ── Gap-fill helpers: build_width_gap_output / build_height_gap_output ───
-
-    #[test]
-    fn test_build_width_gap_output_no_gap_returns_empty() {
-        // min_cols == max_pty_cols → no gap
-        assert_eq!(build_width_gap_output(80, 80, 24), "");
-    }
-
-    #[test]
-    fn test_build_width_gap_output_min_exceeds_max_returns_empty() {
-        // min_cols > max_pty_cols (degenerate) → no gap
-        assert_eq!(build_width_gap_output(100, 80, 24), "");
-    }
-
-    #[test]
-    fn test_build_width_gap_output_covers_full_screen_rows() {
-        // BUG: previously the loop was `0..min_rows` (only PTY height).
-        // After the fix the loop must be `0..screen_rows`.
-        // Verify that the output contains a move-to-cursor for the last
-        // screen row (row 24 when screen_rows=24).
-        let out = build_width_gap_output(60, 80, 24);
-        // The last row escape: \x1b[24;61H
-        assert!(
-            out.contains("\x1b[24;61H"),
-            "width gap must cover the full terminal height (last row = screen_rows)"
-        );
-    }
-
-    #[test]
-    fn test_build_width_gap_output_does_not_exceed_screen_rows() {
-        // The output must NOT contain a row beyond screen_rows.
-        let out = build_width_gap_output(60, 80, 24);
-        // Row 25 would be beyond screen_rows=24
-        assert!(
-            !out.contains("\x1b[25;"),
-            "width gap must not write beyond screen_rows"
-        );
-    }
-
-    #[test]
-    fn test_build_width_gap_output_correct_column_and_dot_count() {
-        // min_cols=60, max_pty_cols=80 → gap of 20 dots starting at col 61
-        let out = build_width_gap_output(60, 80, 5);
-        let dots = ".".repeat(20);
-        // Each row line should contain the dot string
-        assert!(out.contains(&dots), "gap dots count should match max_pty_cols - min_cols");
-        // Column start should be min_cols + 1 = 61
-        assert!(out.contains("\x1b[1;61H"), "first row should start at column 61");
-    }
-
-    #[test]
-    fn test_build_width_gap_output_contains_dim_gray_attribute() {
-        let out = build_width_gap_output(40, 80, 5);
-        assert!(out.contains("\x1b[2;90m"), "must use dim+gray attribute");
-        assert!(out.contains("\x1b[0m"), "must reset attribute after dots");
-    }
-
-    #[test]
-    fn test_build_height_gap_output_no_gap_returns_empty() {
-        // min_rows == max_pty_rows → no height gap
-        assert_eq!(build_height_gap_output(23, 23, 80), "");
-    }
-
-    #[test]
-    fn test_build_height_gap_output_min_exceeds_max_returns_empty() {
-        // degenerate: min_rows > max_pty_rows
-        assert_eq!(build_height_gap_output(25, 23, 80), "");
-    }
-
-    #[test]
-    fn test_build_height_gap_output_fills_rows_from_min_to_max() {
-        // min_rows=10, max_pty_rows=23, max_pty_cols=80
-        // Should produce rows 11..23 (1-indexed)
-        let out = build_height_gap_output(10, 23, 80);
-        // First gap row (1-indexed = 11)
-        assert!(
-            out.contains("\x1b[11;1H"),
-            "height gap must start at row min_rows+1"
-        );
-        // Last gap row (1-indexed = 23)
-        assert!(
-            out.contains("\x1b[23;1H"),
-            "height gap must end at row max_pty_rows"
-        );
-        // Must not contain a row that is below min_rows (row 10 or earlier)
-        assert!(
-            !out.contains("\x1b[10;1H"),
-            "height gap must not include PTY rows"
-        );
-        // Must not exceed max_pty_rows
-        assert!(
-            !out.contains("\x1b[24;1H"),
-            "height gap must not exceed max_pty_rows"
-        );
-    }
-
-    #[test]
-    fn test_build_height_gap_output_full_pane_width_dots() {
-        // max_pty_cols=80 → each row filled with 80 dots
-        let out = build_height_gap_output(10, 12, 80);
-        let dots = ".".repeat(80);
-        assert!(out.contains(&dots), "height gap dots must span full pane width");
-    }
-
-    #[test]
-    fn test_build_height_gap_output_contains_dim_gray_attribute() {
-        let out = build_height_gap_output(5, 10, 40);
-        assert!(out.contains("\x1b[2;90m"), "must use dim+gray attribute");
-        assert!(out.contains("\x1b[0m"), "must reset attribute after dots");
-    }
-
-    #[test]
-    fn test_build_height_gap_output_column_starts_at_one() {
-        // Height gap always fills from column 1
-        let out = build_height_gap_output(5, 8, 40);
-        assert!(out.contains(";1H"), "height gap rows must start at column 1");
     }
 
     // ── Ratatui layout calculations ───────────────────────────────────────────
