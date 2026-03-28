@@ -53,6 +53,20 @@ impl Parser {
     pub fn screen(&self) -> &crate::screen::Screen {
         &self.screen
     }
+
+    /// Enable collection of unhandled escape sequences for diagnostic use.
+    /// Must be called before `process()` to capture sequences.
+    /// Afterwards call `take_unhandled()` to retrieve collected messages.
+    pub fn enable_diagnostic_tracking(&mut self) {
+        self.screen.enable_diagnostic_tracking();
+    }
+
+    /// Drain and return all unhandled-sequence messages collected since the
+    /// last call (or since `enable_diagnostic_tracking()`).
+    /// Returns `None` if diagnostic tracking was never enabled.
+    pub fn take_unhandled(&mut self) -> Option<Vec<String>> {
+        self.screen.take_unhandled()
+    }
 }
 
 impl Default for Parser {
