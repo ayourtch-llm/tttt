@@ -234,6 +234,21 @@ impl<B: PtyBackend> PtySession<B> {
         self.screen.set_scrollback(lines);
     }
 
+    /// Set scroll viewing offset for the screen (0 = live, N = scrolled back).
+    pub fn set_scroll_offset(&mut self, offset: usize) {
+        self.screen.set_scroll_offset(offset);
+    }
+
+    /// Get current scroll offset.
+    pub fn scroll_offset(&self) -> usize {
+        self.screen.scroll_offset()
+    }
+
+    /// Get max scroll offset (scrollback line count).
+    pub fn max_scroll_offset(&self) -> usize {
+        self.screen.max_scroll_offset()
+    }
+
     /// Seconds since the session last produced any output.
     pub fn idle_seconds(&self) -> f64 {
         self.last_output_time.elapsed().as_secs_f64()
@@ -430,6 +445,29 @@ mod tests {
         let mut session = make_session();
         session.set_scrollback(5000);
         assert_eq!(session.screen().scrollback_lines(), 5000);
+    }
+
+    #[test]
+    fn test_session_scroll_offset_default_zero() {
+        let session = make_session();
+        assert_eq!(session.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn test_session_scroll_offset_passthrough() {
+        let mut mock = MockPty::new(80, 5);
+        let mut output = String::new();
+        for i in 0..20 {
+            output.push_str(&format!("line {}\r\n", i));
+        }
+        mock.queue_output(output.as_bytes());
+        let mut session = PtySession::new("t1".to_string(), mock, "bash".to_string(), 80, 5);
+        session.pump().unwrap();
+        assert!(session.max_scroll_offset() > 0, "should have scrollback");
+        session.set_scroll_offset(3);
+        assert_eq!(session.scroll_offset(), 3);
+        session.set_scroll_offset(0);
+        assert_eq!(session.scroll_offset(), 0);
     }
 
     #[test]

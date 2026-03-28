@@ -300,6 +300,8 @@ pub struct App {
     showing_help: bool,
     /// Active text selection (None when not selecting)
     selection: Option<tttt_tui::Selection>,
+    /// Current scroll offset during selection drag or manual scroll (0 = live view)
+    scroll_offset: usize,
 }
 
 impl App {
@@ -346,6 +348,7 @@ impl App {
             server_start_time: Instant::now(),
             showing_help: false,
             selection: None,
+            scroll_offset: 0,
             config,
         }
     }
@@ -1046,6 +1049,7 @@ impl App {
                     let pane_width = self.screen_cols.saturating_sub(sidebar_width);
                     if col < pane_width {
                         self.selection = Some(tttt_tui::Selection::new(row, col));
+                        self.scroll_offset = 0; // Start from live view
                         self.server_render_dirty = true;
                     }
                 }
@@ -1058,6 +1062,28 @@ impl App {
                         let pane_width = self.screen_cols.saturating_sub(sidebar_width);
                         let clamped_col = col.min(pane_width.saturating_sub(1));
                         sel.update(row, clamped_col);
+
+                        // Auto-scroll when dragging at top or bottom edge
+                        let (_pty_cols, pty_rows) = self.pty_dims;
+                        if row == 0 {
+                            // Scroll up (into history) — only update local offset,
+                            // render_frame() applies it on a cloned screen
+                            let max = self.active_session.as_ref().and_then(|id| {
+                                let mgr = self.sessions.lock().unwrap();
+                                mgr.get(id).ok().map(|s| s.max_scroll_offset())
+                            }).unwrap_or(0);
+                            if self.scroll_offset < max {
+                                self.scroll_offset += 1;
+                                // Shift anchor down to keep it pointing at the same content
+                                sel.anchor.0 = sel.anchor.0.saturating_add(1);
+                            }
+                        } else if row >= pty_rows.saturating_sub(1) && self.scroll_offset > 0 {
+                            // Scroll down (toward live view)
+                            self.scroll_offset -= 1;
+                            // Shift anchor up
+                            sel.anchor.0 = sel.anchor.0.saturating_sub(1);
+                        }
+
                         self.server_render_dirty = true;
                     }
                 }
@@ -1070,12 +1096,16 @@ impl App {
                     let clamped_col = col.min(pane_width.saturating_sub(1));
                     sel.update(row, clamped_col);
 
-                    // Extract text from active session's screen
+                    // Extract text from active session's screen (with scroll offset applied)
                     if !sel.is_empty() {
                         if let Some(ref id) = self.active_session {
                             let mgr = self.sessions.lock().unwrap();
                             if let Ok(session) = mgr.get(id) {
-                                let text = sel.extract_text(session.screen().screen());
+                                let mut screen = session.screen().screen().clone();
+                                if self.scroll_offset > 0 {
+                                    screen.set_scrollback(self.scroll_offset);
+                                }
+                                let text = sel.extract_text(&screen);
                                 drop(mgr);
                                 if !text.is_empty() {
                                     copy_to_clipboard(&text);
@@ -1084,13 +1114,31 @@ impl App {
                         }
                     }
 
+                    // Reset scroll offset to live view
+                    self.scroll_offset = 0;
+
                     // Clear selection
                     self.selection = None;
                     self.server_render_dirty = true;
                 }
             }
-            InputAction::ScrollUp { .. } | InputAction::ScrollDown { .. } => {
-                // Future: scrollback support
+            InputAction::ScrollUp { .. } => {
+                // Scroll into history — local offset only, applied at render time
+                let max = self.active_session.as_ref().and_then(|id| {
+                    let mgr = self.sessions.lock().unwrap();
+                    mgr.get(id).ok().map(|s| s.max_scroll_offset())
+                }).unwrap_or(0);
+                if self.scroll_offset < max {
+                    self.scroll_offset = (self.scroll_offset + 3).min(max);
+                    self.server_render_dirty = true;
+                }
+            }
+            InputAction::ScrollDown { .. } => {
+                // Scroll toward live view — local offset only
+                if self.scroll_offset > 0 {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                    self.server_render_dirty = true;
+                }
             }
         }
         Ok(true)
@@ -1133,12 +1181,22 @@ impl App {
     fn render_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Collect all data needed for rendering before entering the draw closure,
         // because we cannot hold the mutex lock across the closure.
+        let scroll_offset = self.scroll_offset;
         let screen_data: Option<(vt100::Screen, u16, u16)> = self.active_session.as_ref()
             .and_then(|id| {
                 let mgr = self.sessions.lock().unwrap();
                 mgr.get(id).ok().map(|session| {
-                    let screen = session.screen().screen().clone();
-                    let (row, col) = session.cursor_position();
+                    // Clone screen first, then apply scroll offset on the clone
+                    // so we don't affect the shared session state (viewers see live view)
+                    let mut screen = session.screen().screen().clone();
+                    if scroll_offset > 0 {
+                        screen.set_scrollback(scroll_offset);
+                    }
+                    let (row, col) = if scroll_offset > 0 {
+                        (0, 0) // Hide cursor when scrolled back
+                    } else {
+                        session.cursor_position()
+                    };
                     (screen, row, col)
                 })
             });

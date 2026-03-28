@@ -134,7 +134,9 @@ impl Screen {
         self.grid().scrollback()
     }
 
-    pub(crate) fn set_scrollback(&mut self, rows: usize) {
+    /// Set the scrollback viewing offset. This affects what `cell()` returns.
+    /// Use on a cloned screen to avoid affecting shared state.
+    pub fn set_scrollback(&mut self, rows: usize) {
         self.grid_mut().set_scrollback(rows);
     }
 

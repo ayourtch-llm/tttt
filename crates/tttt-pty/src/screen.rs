@@ -101,6 +101,22 @@ impl ScreenBuffer {
     pub fn get_scrollback(&self, max_lines: usize) -> Vec<String> {
         self.parser.screen().scrollback_contents(max_lines)
     }
+
+    /// Set the scroll viewing position (0 = live view, N = scrolled back N lines).
+    /// This affects what screen.cell() returns — it shifts the visible window.
+    pub fn set_scroll_offset(&mut self, offset: usize) {
+        self.parser.set_scrollback(offset);
+    }
+
+    /// Get the current scroll position.
+    pub fn scroll_offset(&self) -> usize {
+        self.parser.screen().scrollback()
+    }
+
+    /// Get the maximum scroll offset (number of lines in scrollback buffer).
+    pub fn max_scroll_offset(&self) -> usize {
+        self.parser.screen().scrollback_len()
+    }
 }
 
 #[cfg(test)]
@@ -248,6 +264,26 @@ mod tests {
         // The earliest scrollback lines should contain "line 0", "line 1", etc.
         let joined = scrollback.join("\n");
         assert!(joined.contains("line 0"), "scrollback should contain earliest line, got: {}", joined);
+    }
+
+    #[test]
+    fn test_scroll_offset_default_zero() {
+        let buf = ScreenBuffer::new(80, 24);
+        assert_eq!(buf.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn test_scroll_offset_set_and_get() {
+        let mut buf = ScreenBuffer::with_scrollback(80, 5, 100);
+        // Fill enough to create scrollback
+        for i in 0..20 {
+            buf.process(format!("line {}\r\n", i).as_bytes());
+        }
+        assert!(buf.max_scroll_offset() > 0, "should have scrollback");
+        buf.set_scroll_offset(5);
+        assert_eq!(buf.scroll_offset(), 5);
+        buf.set_scroll_offset(0);
+        assert_eq!(buf.scroll_offset(), 0);
     }
 
     #[test]
