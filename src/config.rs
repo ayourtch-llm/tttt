@@ -40,6 +40,10 @@ pub struct Config {
     /// input may contain passwords and other sensitive data.
     #[serde(default)]
     pub log_input: bool,
+
+    /// Enable TUI control MCP tools (tui_switch, tui_get_info, tui_highlight).
+    #[serde(default)]
+    pub tui_tools: bool,
 }
 
 impl Default for Config {
@@ -59,6 +63,7 @@ impl Default for Config {
             default_cols: 80,
             default_rows: 24,
             log_input: false,
+            tui_tools: false,
         }
     }
 }

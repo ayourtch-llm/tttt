@@ -268,6 +268,7 @@ pub struct App {
     scratchpad: SharedScratchpad,
     sidebar_messages: SharedSidebarMessages,
     sidebar_dirty: tttt_mcp::SidebarDirtyFlag,
+    tui_state: tttt_mcp::SharedTuiState,
     active_session: Option<String>,
     session_order: Vec<String>,
     screen_cols: u16,
@@ -339,6 +340,7 @@ impl App {
             scratchpad: Arc::new(Mutex::new(std::collections::HashMap::new())),
             sidebar_messages: Arc::new(Mutex::new(Vec::new())),
             sidebar_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_state: Arc::new(tttt_mcp::TuiState::new()),
             active_session: None,
             session_order: Vec::new(),
             screen_cols: cols,
@@ -924,6 +926,18 @@ impl App {
                         self.first_dirty_time = Some(Instant::now());
                     }
                 }
+
+                // 3. TUI tools: pending switch or highlight changes
+                if self.tui_state.dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    // Drain pending session switch
+                    if let Some(target_id) = self.tui_state.pending_switch.lock().unwrap().take() {
+                        self.active_session = Some(target_id);
+                    }
+                    self.server_render_dirty = true;
+                    if self.first_dirty_time.is_none() {
+                        self.first_dirty_time = Some(Instant::now());
+                    }
+                }
             }
 
             // Debounced render: only render to server terminal when
@@ -1333,6 +1347,14 @@ impl App {
                 })
             });
 
+        // Collect highlights for the active session
+        let active_highlights: Vec<tttt_mcp::TuiHighlight> = self.active_session.as_ref()
+            .and_then(|id| {
+                let highlights = self.tui_state.highlights.lock().unwrap();
+                highlights.get(id).cloned()
+            })
+            .unwrap_or_default();
+
         let reminders: Vec<String> = self.sidebar_messages.lock().unwrap().clone();
         let uptime_secs = self.server_start_time.elapsed().as_secs();
         let uptime = format!("Uptime: {}s", uptime_secs);
@@ -1379,6 +1401,38 @@ impl App {
                     widget = widget.with_selection(sel);
                 }
                 frame.render_widget(widget, chunks[0]);
+            }
+
+            // Highlight overlays on the PTY pane
+            for hl in &active_highlights {
+                let color = match hl.color.as_str() {
+                    "red" => Color::Red,
+                    "green" => Color::Green,
+                    "blue" => Color::Blue,
+                    "yellow" => Color::Yellow,
+                    "cyan" => Color::Cyan,
+                    "magenta" => Color::Magenta,
+                    "white" => Color::White,
+                    "black" => Color::Black,
+                    "dark_gray" | "darkgray" => Color::DarkGray,
+                    "light_red" | "lightred" => Color::LightRed,
+                    "light_green" | "lightgreen" => Color::LightGreen,
+                    "light_blue" | "lightblue" => Color::LightBlue,
+                    "light_yellow" | "lightyellow" => Color::LightYellow,
+                    "light_cyan" | "lightcyan" => Color::LightCyan,
+                    "light_magenta" | "lightmagenta" => Color::LightMagenta,
+                    _ => Color::Yellow, // fallback
+                };
+                let pane = chunks[0];
+                for row in hl.y..hl.y.saturating_add(hl.height) {
+                    for col in hl.x..hl.x.saturating_add(hl.width) {
+                        let abs_x = pane.x + col;
+                        let abs_y = pane.y + row;
+                        if abs_x < pane.x + pane.width && abs_y < pane.y + pane.height {
+                            frame.buffer_mut()[(abs_x, abs_y)].set_bg(color);
+                        }
+                    }
+                }
             }
 
             // Sidebar
@@ -1558,12 +1612,16 @@ impl App {
                         let scratchpad = self.scratchpad.clone();
                         let sidebar_messages = self.sidebar_messages.clone();
                         let sidebar_dirty = self.sidebar_dirty.clone();
+                        let tui_state = self.tui_state.clone();
+                        let tui_tools_enabled = self.config.tui_tools;
+                        let screen_cols = self.screen_cols;
+                        let screen_rows = self.screen_rows;
                         let work_dir = self.config.work_dir.clone();
                         let db_path = self.config.db_path.clone();
                         let sqlite_logger = self.sqlite_logger.clone();
                         std::thread::spawn(move || {
                             use tttt_mcp::proxy::handle_proxy_client;
-                            use tttt_mcp::{PtyToolHandler, ReplayToolHandler, SchedulerToolHandler, NotificationToolHandler, ScratchpadToolHandler, SidebarMessageToolHandler, CompositeToolHandler};
+                            use tttt_mcp::{PtyToolHandler, ReplayToolHandler, SchedulerToolHandler, NotificationToolHandler, ScratchpadToolHandler, SidebarMessageToolHandler, TuiToolHandler, CompositeToolHandler};
 
                             // Set the stream to blocking mode for the handler
                             let _ = stream.set_nonblocking(false);
@@ -1571,7 +1629,7 @@ impl App {
                             let pty_handler = PtyToolHandler::new(sessions.clone(), work_dir)
                                 .with_sqlite_logger(sqlite_logger);
                             let scheduler_handler = SchedulerToolHandler::new(scheduler);
-                            let notif_handler = NotificationToolHandler::new(notifications, sessions);
+                            let notif_handler = NotificationToolHandler::new(notifications, sessions.clone());
                             let scratchpad_handler = ScratchpadToolHandler::new_shared(scratchpad);
                             let sidebar_handler = SidebarMessageToolHandler::new(sidebar_messages, sidebar_dirty);
                             let replay_handler = ReplayToolHandler::new(db_path);
@@ -1582,6 +1640,11 @@ impl App {
                             composite.add_handler(Box::new(scratchpad_handler));
                             composite.add_handler(Box::new(sidebar_handler));
                             composite.add_handler(Box::new(replay_handler));
+
+                            if tui_tools_enabled {
+                                let tui_handler = TuiToolHandler::new(tui_state, sessions, screen_cols, screen_rows);
+                                composite.add_handler(Box::new(tui_handler));
+                            }
 
                             if let Err(e) = handle_proxy_client(stream, &mut composite, "tttt") {
                                 // Client disconnected or error — normal

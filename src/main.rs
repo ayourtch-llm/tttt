@@ -33,6 +33,10 @@ struct Cli {
     #[arg(long)]
     danger_log_user_input_including_passwords: bool,
 
+    /// Enable TUI control MCP tools (tui_switch, tui_get_info, tui_highlight)
+    #[arg(long)]
+    tui_tools: bool,
+
     /// Arguments to pass to the root command (after --)
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     root_args: Vec<String>,
@@ -194,6 +198,9 @@ fn run_tui(cli: Cli) {
     }
     if cli.danger_log_user_input_including_passwords {
         config.log_input = true;
+    }
+    if cli.tui_tools {
+        config.tui_tools = true;
     }
 
     let mut app = app::App::new(config);

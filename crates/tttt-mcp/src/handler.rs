@@ -1272,6 +1272,174 @@ impl ToolHandler for ReplayToolHandler {
     }
 }
 
+// === TUI control tool handler ===
+
+/// A single highlight rectangle on a pane.
+#[derive(Debug, Clone)]
+pub struct TuiHighlight {
+    pub id: String,
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub color: String,
+}
+
+/// Shared TUI state for the tui_switch / tui_get_info / tui_highlight tools.
+#[derive(Debug)]
+pub struct TuiState {
+    /// Pending session switch request (consumed by main loop each tick).
+    pub pending_switch: Mutex<Option<String>>,
+    /// Active highlights per session: session_id → list of highlights.
+    pub highlights: Mutex<HashMap<String, Vec<TuiHighlight>>>,
+    /// Dirty flag — set when highlights or switch changes, consumed by render loop.
+    pub dirty: AtomicBool,
+}
+
+impl TuiState {
+    pub fn new() -> Self {
+        Self {
+            pending_switch: Mutex::new(None),
+            highlights: Mutex::new(HashMap::new()),
+            dirty: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Shared TUI state type.
+pub type SharedTuiState = Arc<TuiState>;
+
+/// Handles TUI control tool calls.
+pub struct TuiToolHandler<B: PtyBackend> {
+    tui_state: SharedTuiState,
+    sessions: SharedSessionManager<B>,
+    screen_cols: u16,
+    screen_rows: u16,
+}
+
+impl<B: PtyBackend> TuiToolHandler<B> {
+    pub fn new(
+        tui_state: SharedTuiState,
+        sessions: SharedSessionManager<B>,
+        screen_cols: u16,
+        screen_rows: u16,
+    ) -> Self {
+        Self { tui_state, sessions, screen_cols, screen_rows }
+    }
+
+    fn handle_tui_switch(&self, args: &Value) -> Result<Value> {
+        let session_id = args["session_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("session_id required".into()))?;
+
+        // Verify the session exists
+        let mgr = self.sessions.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        mgr.get(session_id).map_err(|_| {
+            McpError::InvalidParams(format!("session '{}' not found", session_id))
+        })?;
+        drop(mgr);
+
+        *self.tui_state.pending_switch.lock().unwrap() = Some(session_id.to_string());
+        self.tui_state.dirty.store(true, Ordering::Relaxed);
+        Ok(json!({"status": "ok", "switched_to": session_id}))
+    }
+
+    fn handle_tui_get_info(&self) -> Result<Value> {
+        let mgr = self.sessions.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let sessions: Vec<Value> = mgr.list().iter().map(|m| {
+            json!({
+                "id": m.id,
+                "name": m.name,
+                "command": m.command,
+                "status": format!("{:?}", m.status),
+                "cols": m.cols,
+                "rows": m.rows,
+                "root": m.root,
+            })
+        }).collect();
+        drop(mgr);
+
+        // Read active session from pending switch or current state is not available here,
+        // but we can report screen dimensions and session list.
+        let highlights = self.tui_state.highlights.lock().unwrap();
+        let highlight_count: usize = highlights.values().map(|v| v.len()).sum();
+
+        Ok(json!({
+            "screen_cols": self.screen_cols,
+            "screen_rows": self.screen_rows,
+            "sessions": sessions,
+            "highlight_count": highlight_count,
+        }))
+    }
+
+    fn handle_tui_highlight(&self, args: &Value) -> Result<Value> {
+        let session_id = args["session_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("session_id required".into()))?
+            .to_string();
+        let highlight_id = args["id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("id required".into()))?
+            .to_string();
+        let color = args["color"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("color required".into()))?
+            .to_string();
+
+        let mut highlights = self.tui_state.highlights.lock().unwrap();
+
+        if color.is_empty() {
+            // Remove highlight by id
+            if let Some(list) = highlights.get_mut(&session_id) {
+                list.retain(|h| h.id != highlight_id);
+                if list.is_empty() {
+                    highlights.remove(&session_id);
+                }
+            }
+            self.tui_state.dirty.store(true, Ordering::Relaxed);
+            return Ok(json!({"status": "ok", "action": "removed", "id": highlight_id}));
+        }
+
+        let x = args["x"].as_u64().unwrap_or(0) as u16;
+        let y = args["y"].as_u64().unwrap_or(0) as u16;
+        let width = args["width"].as_u64().unwrap_or(1) as u16;
+        let height = args["height"].as_u64().unwrap_or(1) as u16;
+
+        let entry = highlights.entry(session_id.clone()).or_default();
+        // Update existing highlight with same id, or add new one
+        if let Some(existing) = entry.iter_mut().find(|h| h.id == highlight_id) {
+            existing.x = x;
+            existing.y = y;
+            existing.width = width;
+            existing.height = height;
+            existing.color = color;
+        } else {
+            entry.push(TuiHighlight {
+                id: highlight_id.clone(),
+                x, y, width, height, color,
+            });
+        }
+
+        self.tui_state.dirty.store(true, Ordering::Relaxed);
+        Ok(json!({"status": "ok", "action": "set", "id": highlight_id}))
+    }
+}
+
+impl<B: PtyBackend + 'static> ToolHandler for TuiToolHandler<B> {
+    fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
+        match name {
+            "tttt_tui_switch" => self.handle_tui_switch(args),
+            "tttt_tui_get_info" => self.handle_tui_get_info(),
+            "tttt_tui_highlight" => self.handle_tui_highlight(args),
+            _ => Err(McpError::ToolNotFound(name.to_string())),
+        }
+    }
+
+    fn tool_definitions(&self) -> Vec<Value> {
+        crate::tools::tui_tool_definitions()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2741,6 +2909,154 @@ mod tests {
         let handler = make_handler();
         let result = handler.handle_pty_launch_mock(&json!({})).unwrap();
         assert!(result["session_id"].is_string());
+    }
+
+    // === TuiToolHandler tests ===
+
+    fn make_tui_handler() -> TuiToolHandler<MockPty> {
+        let sessions: SharedSessionManager<MockPty> = Arc::new(Mutex::new(SessionManager::new()));
+        // Add a test session
+        let session = tttt_pty::PtySession::new(
+            "pty-1".to_string(),
+            MockPty::new(80, 24),
+            "bash".to_string(),
+            80, 24,
+        );
+        sessions.lock().unwrap().add_session(session).unwrap();
+        TuiToolHandler::new(
+            Arc::new(TuiState::new()),
+            sessions,
+            120, 40,
+        )
+    }
+
+    #[test]
+    fn test_tui_switch_valid_session() {
+        let mut handler = make_tui_handler();
+        let result = handler.handle_tool_call("tttt_tui_switch", &json!({"session_id": "pty-1"})).unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["switched_to"], "pty-1");
+        let pending = handler.tui_state.pending_switch.lock().unwrap().clone();
+        assert_eq!(pending, Some("pty-1".to_string()));
+        assert!(handler.tui_state.dirty.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_tui_switch_invalid_session() {
+        let mut handler = make_tui_handler();
+        let result = handler.handle_tool_call("tttt_tui_switch", &json!({"session_id": "pty-999"}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tui_get_info() {
+        let mut handler = make_tui_handler();
+        let result = handler.handle_tool_call("tttt_tui_get_info", &json!({})).unwrap();
+        assert_eq!(result["screen_cols"], 120);
+        assert_eq!(result["screen_rows"], 40);
+        assert_eq!(result["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(result["highlight_count"], 0);
+    }
+
+    #[test]
+    fn test_tui_highlight_add() {
+        let mut handler = make_tui_handler();
+        let result = handler.handle_tool_call("tttt_tui_highlight", &json!({
+            "session_id": "pty-1", "id": "h1",
+            "x": 5, "y": 2, "width": 10, "height": 3, "color": "red"
+        })).unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["action"], "set");
+
+        let highlights = handler.tui_state.highlights.lock().unwrap();
+        let list = highlights.get("pty-1").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].color, "red");
+        assert_eq!(list[0].x, 5);
+    }
+
+    #[test]
+    fn test_tui_highlight_multiple_per_pane() {
+        let mut handler = make_tui_handler();
+        handler.handle_tool_call("tttt_tui_highlight", &json!({
+            "session_id": "pty-1", "id": "h1",
+            "x": 0, "y": 0, "width": 5, "height": 1, "color": "red"
+        })).unwrap();
+        handler.handle_tool_call("tttt_tui_highlight", &json!({
+            "session_id": "pty-1", "id": "h2",
+            "x": 10, "y": 5, "width": 20, "height": 2, "color": "blue"
+        })).unwrap();
+
+        let highlights = handler.tui_state.highlights.lock().unwrap();
+        let list = highlights.get("pty-1").unwrap();
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn test_tui_highlight_update_existing() {
+        let mut handler = make_tui_handler();
+        handler.handle_tool_call("tttt_tui_highlight", &json!({
+            "session_id": "pty-1", "id": "h1",
+            "x": 0, "y": 0, "width": 5, "height": 1, "color": "red"
+        })).unwrap();
+        handler.handle_tool_call("tttt_tui_highlight", &json!({
+            "session_id": "pty-1", "id": "h1",
+            "x": 10, "y": 10, "width": 20, "height": 5, "color": "green"
+        })).unwrap();
+
+        let highlights = handler.tui_state.highlights.lock().unwrap();
+        let list = highlights.get("pty-1").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].color, "green");
+        assert_eq!(list[0].x, 10);
+    }
+
+    #[test]
+    fn test_tui_highlight_remove() {
+        let mut handler = make_tui_handler();
+        handler.handle_tool_call("tttt_tui_highlight", &json!({
+            "session_id": "pty-1", "id": "h1",
+            "x": 0, "y": 0, "width": 5, "height": 1, "color": "red"
+        })).unwrap();
+        let result = handler.handle_tool_call("tttt_tui_highlight", &json!({
+            "session_id": "pty-1", "id": "h1", "color": ""
+        })).unwrap();
+        assert_eq!(result["action"], "removed");
+
+        let highlights = handler.tui_state.highlights.lock().unwrap();
+        assert!(highlights.get("pty-1").is_none());
+    }
+
+    #[test]
+    fn test_tui_highlight_remove_one_of_many() {
+        let mut handler = make_tui_handler();
+        handler.handle_tool_call("tttt_tui_highlight", &json!({
+            "session_id": "pty-1", "id": "h1",
+            "x": 0, "y": 0, "width": 5, "height": 1, "color": "red"
+        })).unwrap();
+        handler.handle_tool_call("tttt_tui_highlight", &json!({
+            "session_id": "pty-1", "id": "h2",
+            "x": 10, "y": 0, "width": 5, "height": 1, "color": "blue"
+        })).unwrap();
+        handler.handle_tool_call("tttt_tui_highlight", &json!({
+            "session_id": "pty-1", "id": "h1", "color": ""
+        })).unwrap();
+
+        let highlights = handler.tui_state.highlights.lock().unwrap();
+        let list = highlights.get("pty-1").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "h2");
+    }
+
+    #[test]
+    fn test_tui_highlight_sets_dirty() {
+        let mut handler = make_tui_handler();
+        assert!(!handler.tui_state.dirty.load(Ordering::Relaxed));
+        handler.handle_tool_call("tttt_tui_highlight", &json!({
+            "session_id": "pty-1", "id": "h1",
+            "x": 0, "y": 0, "width": 1, "height": 1, "color": "red"
+        })).unwrap();
+        assert!(handler.tui_state.dirty.load(Ordering::Relaxed));
     }
 
 }

@@ -397,6 +397,48 @@ pub fn scratchpad_tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// Tool definitions for TUI control (gated by --tui-tools).
+pub fn tui_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "tttt_tui_switch",
+            "description": "Switch the active (visible) terminal session in the TUI",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session ID to switch to" }
+                },
+                "required": ["session_id"]
+            }
+        }),
+        json!({
+            "name": "tttt_tui_get_info",
+            "description": "Get TUI state: active session, terminal dimensions, session list",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "tttt_tui_highlight",
+            "description": "Add or remove a colored highlight rectangle on a terminal pane. Multiple highlights per pane are supported. Send an empty color string to remove a specific highlight by its id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session ID of the pane to highlight" },
+                    "id": { "type": "string", "description": "Unique identifier for this highlight (for updating/removing)" },
+                    "x": { "type": "integer", "description": "Column offset (0-based) of the highlight rectangle" },
+                    "y": { "type": "integer", "description": "Row offset (0-based) of the highlight rectangle" },
+                    "width": { "type": "integer", "description": "Width of the highlight rectangle in columns" },
+                    "height": { "type": "integer", "description": "Height of the highlight rectangle in rows" },
+                    "color": { "type": "string", "description": "Background color name (red, green, blue, yellow, cyan, magenta, white, black) or empty string to remove this highlight" }
+                },
+                "required": ["session_id", "id", "color"]
+            }
+        }),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
