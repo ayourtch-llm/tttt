@@ -6,12 +6,17 @@
 //! - This means rapid redraws (e.g., Claude Code redrawing history) are absorbed
 //!   into the virtual screen, and only the final state is rendered
 
+use crossterm::{
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use tttt_tui::protocol::{decode_message, encode_message, ClientMsg, ServerMsg};
-use tttt_tui::{clear_screen, cursor_goto, PaneRenderer};
+use tttt_tui::PtyWidget;
 
 /// Maximum number of reconnect attempts for the attach client.
 const ATTACH_MAX_RECONNECT_ATTEMPTS: u32 = 30;
@@ -468,12 +473,23 @@ enum AttachLoopExit {
     Disconnected,
 }
 
+fn cleanup_terminal() {
+    let _ = std::io::stdout().write_all(b"\x1b[?2004l");
+    let _ = std::io::stdout().flush();
+    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+}
+
 /// Run the attach client.
 pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Enter raw terminal mode BEFORE any output
-    let _raw = RawMode::enter();
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    // Enable bracketed paste mode
+    stdout.write_all(b"\x1b[?2004h")?;
+    stdout.flush()?;
 
-    let stdout_fd = std::io::stdout().as_raw_fd();
     let stdin_fd = std::io::stdin().as_raw_fd();
 
     // Register SIGWINCH handler for terminal resize
@@ -482,26 +498,35 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut paste_mode = PasteMode::None;
 
+    // Create the ratatui terminal once; pass it into the loop so it persists across reconnects.
+    let backend = CrosstermBackend::new(std::io::stdout());
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(e) => {
+            cleanup_terminal();
+            return Err(e.into());
+        }
+    };
+
     loop {
         let stream = match attach_connect_with_retry(socket_path, ATTACH_MAX_RECONNECT_ATTEMPTS) {
             Ok(s) => s,
             Err(_) => {
-                write_fd(stdout_fd, b"\r\n[tttt attach] Could not connect.\r\n");
+                cleanup_terminal();
+                eprintln!("\r\n[tttt attach] Could not connect.");
                 return Ok(());
             }
         };
 
-        let result = run_attach_loop(
-            stream, stdout_fd, stdin_fd, &winch, &mut paste_mode,
-        );
+        let result = run_attach_loop(stream, stdin_fd, &winch, &mut paste_mode, &mut terminal);
 
         match result {
-            AttachLoopExit::Detach => return Ok(()),
+            AttachLoopExit::Detach => {
+                cleanup_terminal();
+                return Ok(());
+            }
             AttachLoopExit::Disconnected => {
-                write_fd(
-                    stdout_fd,
-                    b"\r\n[tttt attach] Disconnected. Reconnecting...\r\n",
-                );
+                eprintln!("\r\n[tttt attach] Disconnected. Reconnecting...");
                 // Loop back to reconnect
                 continue;
             }
@@ -512,19 +537,19 @@ pub fn run_attach(socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// Inner event loop for the attach client. Returns the reason it exited.
 fn run_attach_loop(
     mut stream: UnixStream,
-    stdout_fd: i32,
     stdin_fd: i32,
     winch: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     paste_mode: &mut PasteMode,
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
 ) -> AttachLoopExit {
     let _ = stream.set_nonblocking(true);
     let stream_fd = stream.as_raw_fd();
 
     // Get our terminal size
-    let (term_cols, term_rows) = terminal_size();
+    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
     // Clear screen
-    write_fd(stdout_fd, clear_screen().as_bytes());
+    let _ = terminal.clear();
 
     // Tell server our terminal size immediately so PTY can be resized
     {
@@ -543,7 +568,6 @@ fn run_attach_loop(
     // Virtual screen: absorbs all server updates instantly.
     // Only flushed to real terminal when socket is idle.
     let mut virtual_screen = vt100::Parser::new(cur_rows, cur_cols, 0);
-    let mut renderer = PaneRenderer::new(cur_cols, cur_rows, 1, 1);
     let mut last_cursor = (0u16, 0u16);
     let mut virtual_dirty = false;
 
@@ -560,14 +584,12 @@ fn run_attach_loop(
         // Handle terminal resize
         if winch.load(std::sync::atomic::Ordering::Relaxed) {
             winch.store(false, std::sync::atomic::Ordering::Relaxed);
-            let (new_cols, new_rows) = terminal_size();
+            let (new_cols, new_rows) = crossterm::terminal::size().unwrap_or((80, 24));
             if new_cols != cur_cols || new_rows != cur_rows {
                 cur_cols = new_cols;
                 cur_rows = new_rows;
-                // Resize virtual screen and renderer
+                // Resize virtual screen
                 virtual_screen = vt100::Parser::new(cur_rows, cur_cols, 0);
-                renderer = PaneRenderer::new(cur_cols, cur_rows, 1, 1);
-                renderer.invalidate();
                 virtual_dirty = true;
                 // Tell server about new size
                 let msg = ClientMsg::Resize {
@@ -578,7 +600,7 @@ fn run_attach_loop(
                 let _ = stream.write_all(&encode_message(&msg));
                 let _ = stream.set_nonblocking(true);
                 // Clear screen
-                write_fd(stdout_fd, clear_screen().as_bytes());
+                let _ = terminal.clear();
             }
         }
         let stdin_pfd = PollFd::new(
@@ -680,8 +702,6 @@ fn run_attach_loop(
                     tracing::trace!("[CLIENT] WindowSize: cols={}, rows={}", cols, rows);
                     // Resize virtual screen to match the server's PTY dimensions
                     virtual_screen = vt100::Parser::new(rows, cols, 0);
-                    renderer = PaneRenderer::new(cols, rows, 1, 1);
-                    renderer.invalidate();
                     virtual_dirty = true;
                 }
                 ServerMsg::Goodbye => return AttachLoopExit::Disconnected,
@@ -703,117 +723,15 @@ fn run_attach_loop(
 
         if virtual_dirty && (!got_server_data || should_force_render) {
             tracing::trace!("[CLIENT] Rendering: got_server_data={}, should_force={}", got_server_data, should_force_render);
-            // Render PTY cells via PaneRenderer (minimal diff).
-            let output = renderer.render(virtual_screen.screen());
-            if !output.is_empty() {
-                tracing::trace!("[CLIENT] Render output len={}", output.len());
-                write_fd(stdout_fd, &output);
-            }
-
-            // Fill right margin with gray dots if PTY is narrower than terminal
-            let (_vrows, vcols) = virtual_screen.screen().size();
-            if vcols < cur_cols {
-                // Gray foreground (dim), dot character
-                let dot_attr = "\x1b[2;90m"; // dim + bright black (gray)
-                let reset = "\x1b[0m";
-                let dots: String = ".".repeat((cur_cols - vcols) as usize);
-                // Fill the entire right margin for all visible rows of the client terminal
-                for row in 0..cur_rows {
-                    write_fd(
-                        stdout_fd,
-                        format!(
-                            "\x1b[{};{}H{}{}{}",
-                            row + 1,
-                            vcols + 1,
-                            dot_attr,
-                            dots,
-                            reset
-                        )
-                        .as_bytes(),
-                    );
-                }
-            }
-
-            let new_cursor = (last_cursor.0 + 1, last_cursor.1 + 1);
-            write_fd(
-                stdout_fd,
-                cursor_goto(new_cursor.0, new_cursor.1).as_bytes(),
-            );
+            let screen = virtual_screen.screen();
+            let _ = terminal.draw(|frame| {
+                frame.render_widget(PtyWidget::new(screen), frame.area());
+            });
+            let (cursor_row, cursor_col) = last_cursor;
+            let _ = terminal.set_cursor_position((cursor_col, cursor_row));
+            let _ = terminal.show_cursor();
             virtual_dirty = false;
             last_render_time = std::time::Instant::now();
-        }
-    }
-}
-
-fn terminal_size() -> (u16, u16) {
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
-            (ws.ws_col, ws.ws_row)
-        } else {
-            (80, 24)
-        }
-    }
-}
-
-fn write_fd(fd: i32, data: &[u8]) {
-    let mut offset = 0;
-    while offset < data.len() {
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        match nix::unistd::write(borrowed, &data[offset..]) {
-            Ok(n) => offset += n,
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(_) => break,
-        }
-    }
-}
-
-struct RawMode {
-    original: Option<nix::sys::termios::Termios>,
-}
-
-impl RawMode {
-    fn enter() -> Self {
-        use nix::sys::termios::*;
-        let stdin = std::io::stdin();
-        let original = tcgetattr(&stdin).ok();
-        if let Some(ref orig) = original {
-            let mut raw: Termios = orig.clone();
-            raw.local_flags.remove(LocalFlags::ICANON);
-            raw.local_flags.remove(LocalFlags::ECHO);
-            raw.local_flags.remove(LocalFlags::ISIG);
-            raw.local_flags.remove(LocalFlags::IEXTEN);
-            raw.input_flags.remove(InputFlags::IXON);
-            raw.input_flags.remove(InputFlags::ICRNL);
-            raw.input_flags.remove(InputFlags::BRKINT);
-            raw.input_flags.remove(InputFlags::INPCK);
-            raw.input_flags.remove(InputFlags::ISTRIP);
-            raw.output_flags.remove(OutputFlags::OPOST);
-            raw.control_flags.remove(ControlFlags::CSIZE);
-            raw.control_flags.insert(ControlFlags::CS8);
-            raw.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
-            raw.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
-            let _ = tcsetattr(&stdin, SetArg::TCSAFLUSH, &raw);
-        }
-        // Enable bracketed paste mode (xterm DEC private mode 2004)
-        // This causes the terminal to wrap pasted content in \x1b[200~ markers
-        // so we can distinguish paste events from regular keystrokes
-        let _ = std::io::stdout().write_all(b"\x1b[?2004h");
-        let _ = std::io::stdout().flush();
-        Self { original }
-    }
-}
-
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        // Disable bracketed paste mode before restoring original settings
-        let _ = std::io::stdout().write_all(b"\x1b[?2004l");
-        let _ = std::io::stdout().flush();
-
-        if let Some(ref orig) = self.original {
-            let stdin = std::io::stdin();
-            let _ =
-                nix::sys::termios::tcsetattr(&stdin, nix::sys::termios::SetArg::TCSAFLUSH, orig);
         }
     }
 }
