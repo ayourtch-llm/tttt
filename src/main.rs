@@ -1,6 +1,7 @@
 mod app;
 mod attach;
 mod config;
+pub mod ctl;
 mod reload;
 mod replay_tui;
 
@@ -71,6 +72,12 @@ enum Commands {
         #[arg(short, long)]
         session: Option<String>,
     },
+
+    /// CLI bridge for controlling a running tttt instance via MCP socket
+    Ctl {
+        #[command(subcommand)]
+        command: ctl::CtlCommand,
+    },
 }
 
 fn main() {
@@ -79,6 +86,18 @@ fn main() {
         std::env::remove_var(reload::RESTORE_ENV_VAR);
         run_restored(&restore_file);
         return;
+    }
+
+    // argv[0] dispatch: if invoked as "tttt-ctl" (e.g. via symlink), run ctl mode
+    if let Some(bin_name) = std::env::args()
+        .next()
+        .as_ref()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|n| n.to_str())
+    {
+        if bin_name == "tttt-ctl" {
+            ctl::main();
+        }
     }
 
     let cli = Cli::parse();
@@ -102,6 +121,9 @@ fn main() {
                 eprintln!("Replay error: {}", e);
                 std::process::exit(1);
             }
+        }
+        Some(Commands::Ctl { command }) => {
+            ctl::run_command(command);
         }
         None => {
             run_tui(cli);
