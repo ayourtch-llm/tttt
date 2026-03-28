@@ -302,6 +302,8 @@ pub struct App {
     selection: Option<tttt_tui::Selection>,
     /// Current scroll offset during selection drag or manual scroll (0 = live view)
     scroll_offset: usize,
+    /// Scrollback count when selection started — used to compensate for new output
+    selection_scroll_base: usize,
 }
 
 impl App {
@@ -349,6 +351,7 @@ impl App {
             showing_help: false,
             selection: None,
             scroll_offset: 0,
+            selection_scroll_base: 0,
             config,
         }
     }
@@ -1050,6 +1053,13 @@ impl App {
                     if col < pane_width {
                         self.selection = Some(tttt_tui::Selection::new(row, col));
                         self.scroll_offset = 0; // Start from live view
+                        // Snapshot scrollback count to detect new output during selection
+                        self.selection_scroll_base = self.active_session.as_ref()
+                            .and_then(|id| {
+                                let mgr = self.sessions.lock().unwrap();
+                                mgr.get(id).ok().map(|s| s.max_scroll_offset())
+                            })
+                            .unwrap_or(0);
                         self.server_render_dirty = true;
                     }
                 }
@@ -1096,14 +1106,19 @@ impl App {
                     let clamped_col = col.min(pane_width.saturating_sub(1));
                     sel.update(row, clamped_col);
 
-                    // Extract text from active session's screen (with scroll offset applied)
+                    // Extract text from active session's screen (with scroll compensation)
                     if !sel.is_empty() {
                         if let Some(ref id) = self.active_session {
                             let mgr = self.sessions.lock().unwrap();
                             if let Ok(session) = mgr.get(id) {
                                 let mut screen = session.screen().screen().clone();
-                                if self.scroll_offset > 0 {
-                                    screen.set_scrollback(self.scroll_offset);
+                                let effective_scroll = compute_selection_scroll_compensation(
+                                    self.selection_scroll_base,
+                                    session.max_scroll_offset(),
+                                    self.scroll_offset,
+                                );
+                                if effective_scroll > 0 {
+                                    screen.set_scrollback(effective_scroll);
                                 }
                                 let text = sel.extract_text(&screen);
                                 drop(mgr);
@@ -1181,7 +1196,9 @@ impl App {
     fn render_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Collect all data needed for rendering before entering the draw closure,
         // because we cannot hold the mutex lock across the closure.
-        let scroll_offset = self.scroll_offset;
+        let manual_scroll = self.scroll_offset;
+        let selection_base = self.selection_scroll_base;
+        let has_selection = self.selection.is_some();
         let screen_data: Option<(vt100::Screen, u16, u16)> = self.active_session.as_ref()
             .and_then(|id| {
                 let mgr = self.sessions.lock().unwrap();
@@ -1189,10 +1206,20 @@ impl App {
                     // Clone screen first, then apply scroll offset on the clone
                     // so we don't affect the shared session state (viewers see live view)
                     let mut screen = session.screen().screen().clone();
-                    if scroll_offset > 0 {
-                        screen.set_scrollback(scroll_offset);
+                    let effective_scroll = if has_selection {
+                        // Compensate for new output that arrived during selection
+                        compute_selection_scroll_compensation(
+                            selection_base,
+                            session.max_scroll_offset(),
+                            manual_scroll,
+                        )
+                    } else {
+                        manual_scroll
+                    };
+                    if effective_scroll > 0 {
+                        screen.set_scrollback(effective_scroll);
                     }
-                    let (row, col) = if scroll_offset > 0 {
+                    let (row, col) = if effective_scroll > 0 {
                         (0, 0) // Hide cursor when scrolled back
                     } else {
                         session.cursor_position()
@@ -1630,6 +1657,20 @@ impl App {
             }
         }
     }
+}
+
+/// Compute the effective scroll offset needed to keep selected content stable.
+///
+/// When a selection is active and new PTY output pushes lines into scrollback,
+/// the content moves under the selection. This function computes the total
+/// scroll offset needed: the drift from new output plus any manual scroll.
+fn compute_selection_scroll_compensation(
+    base_scrollback_count: usize,
+    current_scrollback_count: usize,
+    manual_scroll_offset: usize,
+) -> usize {
+    let drift = current_scrollback_count.saturating_sub(base_scrollback_count);
+    drift + manual_scroll_offset
 }
 
 /// Copy text to the system clipboard via OSC 52 escape sequence.
@@ -2094,5 +2135,31 @@ mod tests {
         // Just verify it doesn't panic and produces valid base64
         assert!(expected.starts_with("\x1b]52;c;"));
         assert!(expected.ends_with("\x07"));
+    }
+
+    // ── Selection scroll compensation ────────────────────────────────────────
+
+    #[test]
+    fn test_selection_scroll_compensation_no_new_output() {
+        // Scrollback count unchanged → no compensation
+        assert_eq!(compute_selection_scroll_compensation(10, 10, 0), 0);
+    }
+
+    #[test]
+    fn test_selection_scroll_compensation_new_output() {
+        // 5 new lines arrived since selection started → scroll back 5 to compensate
+        assert_eq!(compute_selection_scroll_compensation(10, 15, 0), 5);
+    }
+
+    #[test]
+    fn test_selection_scroll_compensation_with_manual_scroll() {
+        // User manually scrolled 3 lines + 5 new lines → total offset 8
+        assert_eq!(compute_selection_scroll_compensation(10, 15, 3), 8);
+    }
+
+    #[test]
+    fn test_selection_scroll_compensation_no_selection_base() {
+        // No selection active (base same as current) → just manual scroll
+        assert_eq!(compute_selection_scroll_compensation(20, 20, 5), 5);
     }
 }
