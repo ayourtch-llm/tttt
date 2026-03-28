@@ -18,6 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tttt_log::{SessionInfo, SessionReplay, SqliteLogger};
+use tttt_tui::vt100_style;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -600,7 +601,7 @@ fn screen_to_lines(screen: &vt100::Screen) -> Vec<Line<'static>> {
                 continue;
             }
 
-            let cell_style = vt100_style_to_ratatui(cell);
+            let cell_style = vt100_style::cell_style(cell);
             let contents = cell.contents();
             let text = if contents.is_empty() {
                 " ".to_string()
@@ -627,41 +628,6 @@ fn screen_to_lines(screen: &vt100::Screen) -> Vec<Line<'static>> {
     }
 
     lines
-}
-
-fn vt100_style_to_ratatui(cell: &vt100::Cell) -> Style {
-    let fg = vt100_color_to_ratatui(cell.fgcolor());
-    let bg = vt100_color_to_ratatui(cell.bgcolor());
-
-    let mut style = Style::default();
-    if let Some(c) = fg {
-        style = style.fg(c);
-    }
-    if let Some(c) = bg {
-        style = style.bg(c);
-    }
-    if cell.bold() {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    if cell.italic() {
-        style = style.add_modifier(Modifier::ITALIC);
-    }
-    if cell.underline() {
-        style = style.add_modifier(Modifier::UNDERLINED);
-    }
-    if cell.inverse() {
-        style = style.add_modifier(Modifier::REVERSED);
-    }
-
-    style
-}
-
-fn vt100_color_to_ratatui(color: vt100::Color) -> Option<Color> {
-    match color {
-        vt100::Color::Default => None,
-        vt100::Color::Idx(i) => Some(Color::Indexed(i)),
-        vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
-    }
 }
 
 fn format_timestamp_ms(ms: u64) -> String {
@@ -739,13 +705,13 @@ mod tests {
 
     #[test]
     fn test_color_conversion_default() {
-        assert_eq!(vt100_color_to_ratatui(vt100::Color::Default), None);
+        assert_eq!(vt100_style::convert_color(vt100::Color::Default), None);
     }
 
     #[test]
     fn test_color_conversion_indexed() {
         assert_eq!(
-            vt100_color_to_ratatui(vt100::Color::Idx(3)),
+            vt100_style::convert_color(vt100::Color::Idx(3)),
             Some(Color::Indexed(3))
         );
     }
@@ -753,7 +719,7 @@ mod tests {
     #[test]
     fn test_color_conversion_rgb() {
         assert_eq!(
-            vt100_color_to_ratatui(vt100::Color::Rgb(255, 128, 0)),
+            vt100_style::convert_color(vt100::Color::Rgb(255, 128, 0)),
             Some(Color::Rgb(255, 128, 0))
         );
     }

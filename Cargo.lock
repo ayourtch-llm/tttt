@@ -1433,6 +1433,7 @@ name = "tttt-tui"
 version = "0.1.0"
 dependencies = [
  "nix 0.29.0",
+ "ratatui",
  "serde",
  "serde_json",
  "signal-hook",

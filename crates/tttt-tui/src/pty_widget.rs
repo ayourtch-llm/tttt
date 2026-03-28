@@ -1,0 +1,211 @@
+use crate::vt100_style;
+use ratatui::prelude::*;
+use ratatui::widgets::Widget;
+
+/// Widget that renders a vt100::Screen into a ratatui Buffer.
+/// Cells beyond the PTY dimensions are filled with dim gray dots.
+pub struct PtyWidget<'a> {
+    screen: &'a vt100::Screen,
+}
+
+impl<'a> PtyWidget<'a> {
+    pub fn new(screen: &'a vt100::Screen) -> Self {
+        Self { screen }
+    }
+}
+
+impl<'a> Widget for PtyWidget<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let (pty_rows, pty_cols) = self.screen.size();
+        let gap_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+
+        for row in 0..area.height {
+            for col in 0..area.width {
+                let x = area.x + col;
+                let y = area.y + row;
+
+                if row < pty_rows && col < pty_cols {
+                    if let Some(cell) = self.screen.cell(row, col) {
+                        if cell.is_wide_continuation() {
+                            continue; // skip continuation cells
+                        }
+                        let contents = cell.contents();
+                        let symbol = if contents.is_empty() { " " } else { &contents };
+                        let style = vt100_style::cell_style(cell);
+                        buf[(x, y)].set_symbol(symbol).set_style(style);
+                    }
+                } else {
+                    // Gap fill: dim gray dot
+                    buf[(x, y)].set_symbol(".").set_style(gap_style);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    fn make_screen(input: &[u8], cols: u16, rows: u16) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(input);
+        parser
+    }
+
+    #[test]
+    fn test_renders_plain_text() {
+        let parser = make_screen(b"Hello", 10, 2);
+        let widget = PtyWidget::new(parser.screen());
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "H");
+        assert_eq!(buf[(1, 0)].symbol(), "e");
+        assert_eq!(buf[(2, 0)].symbol(), "l");
+        assert_eq!(buf[(3, 0)].symbol(), "l");
+        assert_eq!(buf[(4, 0)].symbol(), "o");
+    }
+
+    #[test]
+    fn test_renders_bold_text() {
+        // ESC[1m sets bold
+        let parser = make_screen(b"\x1b[1mBold", 10, 2);
+        let widget = PtyWidget::new(parser.screen());
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "B");
+        assert!(
+            buf[(0, 0)].style().add_modifier.contains(Modifier::BOLD),
+            "Expected BOLD modifier on 'B'"
+        );
+    }
+
+    #[test]
+    fn test_renders_colored_text() {
+        // ESC[31m sets red foreground (index 1)
+        let parser = make_screen(b"\x1b[31mRed", 10, 2);
+        let widget = PtyWidget::new(parser.screen());
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "R");
+        // ANSI 31 maps to Indexed(1) in vt100
+        assert_eq!(buf[(0, 0)].style().fg, Some(Color::Indexed(1)));
+    }
+
+    #[test]
+    fn test_gap_fill_width() {
+        // PTY 5 cols, area 10 cols → columns 5-9 filled with gray dots
+        let parser = make_screen(b"Hello", 5, 2);
+        let widget = PtyWidget::new(parser.screen());
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        // Inside PTY area
+        assert_eq!(buf[(4, 0)].symbol(), "o");
+        // Gap fill: columns 5-9 in row 0
+        for col in 5..10u16 {
+            assert_eq!(
+                buf[(col, 0)].symbol(),
+                ".",
+                "Expected '.' at col {col} (gap fill)"
+            );
+            assert_eq!(
+                buf[(col, 0)].style().fg,
+                Some(Color::DarkGray),
+                "Expected DarkGray fg at col {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gap_fill_height() {
+        // PTY 2 rows, area 5 rows → rows 2-4 filled with gray dots
+        let parser = make_screen(b"AB", 5, 2);
+        let widget = PtyWidget::new(parser.screen());
+        let area = Rect::new(0, 0, 5, 5);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        // Row 0 should have content
+        assert_eq!(buf[(0, 0)].symbol(), "A");
+        // Rows 2-4 should be gap fill
+        for row in 2..5u16 {
+            assert_eq!(
+                buf[(0, row)].symbol(),
+                ".",
+                "Expected '.' at row {row} (gap fill)"
+            );
+            assert_eq!(
+                buf[(0, row)].style().fg,
+                Some(Color::DarkGray),
+                "Expected DarkGray fg at row {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_area_smaller_than_pty() {
+        // Area 3x2, PTY 10x5 — should clip to area, no panic
+        let parser = make_screen(b"Hello World", 10, 5);
+        let widget = PtyWidget::new(parser.screen());
+        let area = Rect::new(0, 0, 3, 2);
+        let mut buf = Buffer::empty(area);
+        // Should not panic
+        widget.render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "H");
+        assert_eq!(buf[(1, 0)].symbol(), "e");
+        assert_eq!(buf[(2, 0)].symbol(), "l");
+    }
+
+    #[test]
+    fn test_empty_screen() {
+        // Empty screen (no input) should render spaces for PTY cells
+        let parser = make_screen(b"", 5, 2);
+        let widget = PtyWidget::new(parser.screen());
+        let area = Rect::new(0, 0, 5, 2);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        // All PTY cells should be spaces (empty cell contents → " ")
+        for col in 0..5u16 {
+            assert_eq!(
+                buf[(col, 0)].symbol(),
+                " ",
+                "Expected space at col {col} for empty screen"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wide_character() {
+        // "中" is a wide character spanning 2 columns; continuation cell is skipped
+        let parser = make_screen("中".as_bytes(), 10, 2);
+        let widget = PtyWidget::new(parser.screen());
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        // Column 0 should have the wide character
+        assert_eq!(buf[(0, 0)].symbol(), "中");
+        // Column 1 is the wide continuation — it should remain as initialized (space)
+        // since we skip it with `continue`
+        assert_eq!(buf[(1, 0)].symbol(), " ");
+    }
+
+    #[test]
+    fn test_renders_with_offset_area() {
+        // Area starting at (5, 3) should still render correctly
+        let parser = make_screen(b"Hi", 10, 2);
+        let widget = PtyWidget::new(parser.screen());
+        let area = Rect::new(5, 3, 10, 2);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        // Buffer coordinates are offset: x=5, y=3 for the first cell
+        assert_eq!(buf[(5, 3)].symbol(), "H");
+        assert_eq!(buf[(6, 3)].symbol(), "i");
+    }
+}

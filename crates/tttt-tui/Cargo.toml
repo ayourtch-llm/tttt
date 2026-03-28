@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 tttt-pty = { path = "../tttt-pty" }
 vt100 = { workspace = true }
+ratatui = { workspace = true }
 nix = { workspace = true }
 signal-hook = { workspace = true }
 thiserror = { workspace = true }
