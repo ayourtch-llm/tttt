@@ -824,9 +824,11 @@ impl App {
                 break;
             }
 
-            // Read PTY output — pump into screen buffer but defer rendering
+            // Read PTY output — pump into screen buffer but defer rendering.
+            // We must handle POLLHUP (child exited / slave closed) in addition to POLLIN,
+            // otherwise poll() returns immediately in a busy loop on macOS.
             if let Some(flags) = poll_result.0 {
-                if flags.contains(PollFlags::POLLIN) {
+                if flags.contains(PollFlags::POLLIN) || flags.contains(PollFlags::POLLHUP) {
                     if let Some(id) = self.active_session.clone() {
                         let mut mgr = self.sessions.lock().unwrap();
                         if let Ok(session) = mgr.get_mut(&id) {
