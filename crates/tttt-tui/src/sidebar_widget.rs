@@ -111,45 +111,37 @@ impl<'a> Widget for SidebarWidget<'a> {
             row += 1;
         }
 
-        // --- Blank line before reminders (if space allows) ---
-        let reminders_section_height = if self.reminders.is_empty() {
-            0u16
-        } else {
-            1 + self.reminders.len() as u16 // "REMINDERS" header + lines
-        };
-        let filler_start = row;
-        let reminders_start = area.height.saturating_sub(reminders_section_height);
-
-        // Fill rows between sessions and reminders with empty padded lines.
-        let fill_end = if self.reminders.is_empty() {
-            area.height
-        } else {
-            reminders_start
-        };
-        let mut r = filler_start;
-        while r < fill_end {
+        // --- Blank line before reminders ---
+        if !self.reminders.is_empty() && row < area.height {
+            // One blank spacer line
             let empty = format!("{:width$}", "", width = usable_width);
-            render_line(r, &empty, inactive_style, buf);
-            r += 1;
-        }
+            render_line(row, &empty, inactive_style, buf);
+            row += 1;
 
-        // --- Reminders section ---
-        if !self.reminders.is_empty() {
-            row = reminders_start;
+            // "REMINDERS" header
             if row < area.height {
                 let rem_header = format!("{:width$}", "REMINDERS", width = usable_width);
                 render_line(row, &rem_header, inactive_style, buf);
                 row += 1;
-                for reminder in self.reminders {
-                    if row >= area.height {
-                        break;
-                    }
-                    let text = truncate(reminder, usable_width);
-                    let padded = format!("{:width$}", text, width = usable_width);
-                    render_line(row, &padded, inactive_style, buf);
-                    row += 1;
-                }
             }
+
+            // Reminder lines
+            for reminder in self.reminders {
+                if row >= area.height {
+                    break;
+                }
+                let text = truncate(reminder, usable_width);
+                let padded = format!("{:width$}", text, width = usable_width);
+                render_line(row, &padded, inactive_style, buf);
+                row += 1;
+            }
+        }
+
+        // Fill remaining rows with empty sidebar
+        while row < area.height {
+            let empty = format!("{:width$}", "", width = usable_width);
+            render_line(row, &empty, inactive_style, buf);
+            row += 1;
         }
     }
 }
@@ -482,7 +474,7 @@ mod tests {
     // ------------------------------------------------------------------
     #[test]
     fn test_filler_rows() {
-        // 1 session in a 10-row area → rows 4..10 should be filler (non-empty "| " lines).
+        // 1 session in a 10-row area → rows 3..10 should be filler (non-empty "| " lines).
         let area = Rect::new(0, 0, 20, 10);
         let mut buf = Buffer::empty(area);
         let sessions = vec![make_meta("pty-1", SessionStatus::Running)];
@@ -498,5 +490,32 @@ mod tests {
                 "filler row {r} should start with '| ', got: {prefix:?}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // test_reminders_appear_below_sessions_not_at_bottom
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_reminders_appear_below_sessions_not_at_bottom() {
+        let area = Rect::new(0, 0, 30, 20); // tall area
+        let mut buf = Buffer::empty(area);
+        let sessions = vec![
+            make_meta("pty-1", SessionStatus::Running),
+        ];
+        let reminders = vec!["Check tests".to_string()];
+
+        SidebarWidget::new(&sessions, None, &reminders).render(area, &mut buf);
+
+        // Session is at row 2 (after header row 0, separator row 1)
+        // Blank line at row 3
+        // "REMINDERS" should be at row 4, NOT at bottom (row 18)
+        let row4 = full_row(&buf, area, 4);
+        assert!(row4.contains("REMINDERS"),
+            "REMINDERS should be at row 4 (below sessions + blank line), got: {row4:?}");
+
+        // Should NOT be at the bottom
+        let row18 = full_row(&buf, area, 18);
+        assert!(!row18.contains("REMINDERS"),
+            "REMINDERS should NOT be at the bottom");
     }
 }
