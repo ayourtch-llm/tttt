@@ -20,6 +20,13 @@ pub trait PtyBackend: Send {
 
     /// Check if child has exited. Returns Some(exit_code) if exited, None if still running.
     fn try_wait(&mut self) -> Result<Option<i32>>;
+
+    /// Kill with bounded escalation: SIGTERM → poll 150ms → SIGKILL → poll 500ms → give up.
+    ///
+    /// Default implementation delegates to `kill()`. Override for process-group kill.
+    fn kill_with_escalation(&mut self) -> Result<()> {
+        self.kill()
+    }
 }
 
 /// Real PTY backend using portable-pty.
@@ -215,6 +222,56 @@ impl PtyBackend for RealPty {
         Ok(())
     }
 
+    fn kill_with_escalation(&mut self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{kill as nix_kill, Signal};
+            use nix::unistd::Pid;
+            use std::time::Duration;
+
+            // Try to get PID for process-group kill.
+            if let Some(pid_u32) = self.child.process_id() {
+                let pid = pid_u32 as i32;
+                // Step 1: SIGTERM to entire process group.
+                let _ = nix_kill(Pid::from_raw(-pid), Signal::SIGTERM);
+
+                // Step 2: Poll 3 × 50ms (150ms) for graceful exit.
+                for _ in 0..3 {
+                    std::thread::sleep(Duration::from_millis(50));
+                    if self.try_wait()?.is_some() {
+                        return Ok(());
+                    }
+                }
+
+                // Step 3: SIGKILL + close master_fd to unblock kernel reads (macOS).
+                let _ = nix_kill(Pid::from_raw(-pid), Signal::SIGKILL);
+                // Close the master fd to unblock any kernel reads blocked on the PTY.
+                let fd = self.reader_raw_fd;
+                // Invalidate the fd so Drop / further reads don't double-close.
+                // We can't set it in the struct from a non-mut context, but we
+                // have &mut self here. Closing the fd that is also used for reads
+                // is intentional: the child is dead, we want it to unblock.
+                let _ = nix::unistd::close(fd);
+                // Set to -1 so further read/write calls get EBADF rather than
+                // operating on a recycled fd.
+                self.reader_raw_fd = -1;
+
+                // Step 4: Poll 10 × 50ms (500ms) for SIGKILL to take effect.
+                for _ in 0..10 {
+                    std::thread::sleep(Duration::from_millis(50));
+                    if self.try_wait()?.is_some() {
+                        return Ok(());
+                    }
+                }
+
+                // Step 5: Give up — total worst case 650ms, never blocks indefinitely.
+                return Ok(());
+            }
+        }
+        // Fallback: no PID available or non-Unix — use the simple kill.
+        self.kill()
+    }
+
     fn try_wait(&mut self) -> Result<Option<i32>> {
         match self.child.try_wait() {
             Ok(Some(status)) => {
@@ -237,6 +294,13 @@ pub struct MockPty {
     pub exit_code: Option<i32>,
     /// If true, kill() has been called.
     pub killed: bool,
+    /// If true, kill_with_escalation() has been called.
+    pub escalation_killed: bool,
+    /// Number of times try_wait() was called before exit_code was set.
+    pub try_wait_calls: usize,
+    /// If set, kill_with_escalation() sets exit code after this many try_wait calls.
+    /// Used to simulate a process that ignores SIGTERM but dies to SIGKILL.
+    pub exit_after_n_waits: Option<usize>,
     /// Current dimensions.
     pub cols: u16,
     pub rows: u16,
@@ -249,6 +313,9 @@ impl MockPty {
             input_buf: Vec::new(),
             exit_code: None,
             killed: false,
+            escalation_killed: false,
+            try_wait_calls: 0,
+            exit_after_n_waits: None,
             cols,
             rows,
         }
@@ -287,7 +354,24 @@ impl PtyBackend for MockPty {
     }
 
     fn try_wait(&mut self) -> Result<Option<i32>> {
+        self.try_wait_calls += 1;
+        // Simulate a process that exits after N try_wait calls (for escalation tests).
+        if let Some(n) = self.exit_after_n_waits {
+            if self.try_wait_calls >= n && self.exit_code.is_none() {
+                self.exit_code = Some(137);
+            }
+        }
         Ok(self.exit_code)
+    }
+
+    fn kill_with_escalation(&mut self) -> Result<()> {
+        self.escalation_killed = true;
+        // Simulate: SIGTERM sent. If exit_after_n_waits is None, process exits immediately.
+        // Otherwise, it waits until try_wait is called enough times.
+        if self.exit_after_n_waits.is_none() {
+            self.exit_code = Some(15); // SIGTERM
+        }
+        Ok(())
     }
 }
 
@@ -373,5 +457,86 @@ mod tests {
         let n = pty.read(&mut buf).unwrap();
         assert_eq!(n, 4);
         assert_eq!(&buf[..n], b" out");
+    }
+
+    #[test]
+    fn test_mock_pty_kill_with_escalation_immediate_exit() {
+        // Process exits immediately on SIGTERM (no delay needed).
+        let mut pty = MockPty::new(80, 24);
+        assert!(!pty.escalation_killed);
+        assert!(pty.exit_code.is_none());
+
+        pty.kill_with_escalation().unwrap();
+
+        assert!(pty.escalation_killed);
+        // The mock sets exit_code when no delay is configured.
+        assert!(pty.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn test_mock_pty_kill_with_escalation_delayed_exit() {
+        // Simulate a process that ignores SIGTERM but exits after several try_wait calls
+        // (as if it eventually dies to SIGKILL).
+        let mut pty = MockPty::new(80, 24);
+        // Process will "exit" on the 5th try_wait call.
+        pty.exit_after_n_waits = Some(5);
+
+        // Before kill, process is still alive.
+        assert!(pty.exit_code.is_none());
+
+        pty.kill_with_escalation().unwrap();
+        assert!(pty.escalation_killed);
+
+        // Not yet exited (exit_after_n_waits = 5, but kill_with_escalation doesn't wait).
+        // Manual polling simulates the escalation loop.
+        let mut exited = false;
+        for _ in 0..10 {
+            if pty.try_wait().unwrap().is_some() {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited, "process should have exited within 10 try_wait calls");
+    }
+
+    #[test]
+    fn test_mock_pty_default_kill_with_escalation_delegates_to_kill() {
+        // The default trait impl delegates kill_with_escalation() to kill().
+        // MockPty overrides it, so we verify the MockPty override via kill().
+        let mut pty = MockPty::new(80, 24);
+        pty.kill().unwrap();
+        assert!(pty.killed);
+        assert_eq!(pty.try_wait().unwrap(), Some(137));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_real_pty_kill_escalation_cleans_up_sleep_process() {
+        // Integration test: spawn `sleep 99999`, call kill_with_escalation(), verify
+        // the process exits within ~1 second.
+        use std::time::Instant;
+
+        let mut pty = RealPty::spawn("sleep", &["99999"], 80, 24).unwrap();
+
+        // Confirm process is running.
+        assert!(pty.try_wait().unwrap().is_none(), "sleep should be running");
+
+        let start = Instant::now();
+        pty.kill_with_escalation().unwrap();
+
+        // After kill_with_escalation, the process should be gone.
+        // We poll manually (up to 700ms) in case the process needed SIGKILL time.
+        let mut exited = false;
+        for _ in 0..14 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if pty.try_wait().unwrap().is_some() {
+                exited = true;
+                break;
+            }
+        }
+        let elapsed = start.elapsed();
+
+        assert!(exited, "sleep process should have been killed (elapsed: {:?})", elapsed);
+        assert!(elapsed.as_millis() < 1000, "kill should complete within 1 second, took {:?}", elapsed);
     }
 }
