@@ -6,6 +6,7 @@ const MODE_APPLICATION_CURSOR: u8 = 0b0000_0010;
 const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
 const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
 const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
+const MODE_SYNCHRONIZED_OUTPUT: u8 = 0b0010_0000;
 
 /// The xterm mouse handling mode currently in use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -701,6 +702,15 @@ impl Screen {
         self.mode(MODE_BRACKETED_PASTE)
     }
 
+    /// Returns whether synchronized output mode (DEC mode 2026) is active.
+    ///
+    /// When active, the render loop should suppress rendering until the mode
+    /// is cleared.
+    #[must_use]
+    pub fn synchronized_output(&self) -> bool {
+        self.mode(MODE_SYNCHRONIZED_OUTPUT)
+    }
+
     /// Returns the currently active `MouseProtocolMode`
     #[must_use]
     pub fn mouse_protocol_mode(&self) -> MouseProtocolMode {
@@ -1290,6 +1300,7 @@ impl Screen {
                     self.enter_alternate_grid();
                 }
                 &[2004] => self.set_mode(MODE_BRACKETED_PASTE),
+                &[2026] => self.set_mode(MODE_SYNCHRONIZED_OUTPUT),
                 ns => {
                     if log::log_enabled!(log::Level::Debug) {
                         let n = if ns.len() == 1 {
@@ -1349,6 +1360,7 @@ impl Screen {
                     self.decrc();
                 }
                 &[2004] => self.clear_mode(MODE_BRACKETED_PASTE),
+                &[2026] => self.clear_mode(MODE_SYNCHRONIZED_OUTPUT),
                 ns => {
                     if log::log_enabled!(log::Level::Debug) {
                         let n = if ns.len() == 1 {
@@ -1618,6 +1630,16 @@ impl vte::Perform for Screen {
         _ignore: bool,
         c: char,
     ) {
+        // Guard: CSI sequences with intermediate bytes other than '?' (e.g. '>', '=', '!')
+        // must not be misinterpreted as standard CSI. Kitty keyboard protocol uses
+        // CSI > 1 u and CSI > 4 m which would otherwise match 'u' (restore cursor) etc.
+        if intermediates
+            .first()
+            .is_some_and(|b| !matches!(b, b'?'))
+        {
+            log::debug!("CSI with intermediate byte(s) {intermediates:?}, ignoring");
+            return;
+        }
         match intermediates.first() {
             None => match c {
                 '@' => self.ich(canonicalize_params_1(params, 1)),
@@ -1671,16 +1693,9 @@ impl vte::Perform for Screen {
                     }
                 }
             },
-            Some(i) => {
-                if log::log_enabled!(log::Level::Debug) {
-                    log::debug!(
-                        "unhandled csi sequence: CSI {} {} {}",
-                        i,
-                        param_str(params),
-                        c
-                    );
-                }
-            }
+            // Non-'?' intermediates are caught by the guard above and
+            // will never reach here; this arm is kept for exhaustiveness.
+            Some(_) => {}
         }
     }
 
@@ -1796,4 +1811,102 @@ fn osc_param_str(params: &[&[u8]]) -> String {
         .map(|b| format!("\"{}\"", std::string::String::from_utf8_lossy(b)))
         .collect();
     strs.join(" ; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Parser;
+
+    // F2: CSI sequences with intermediate bytes like '>' must not be
+    // misinterpreted as standard CSI.
+
+    /// CSI > 1 u (Kitty keyboard protocol) must not move the cursor.
+    #[test]
+    fn test_csi_gt_intermediate_does_not_restore_cursor() {
+        let mut parser = Parser::new(24, 80, 0);
+        // Move cursor to a known position
+        parser.process(b"\x1b[5;10H");
+        let (row, col) = parser.screen().cursor_position();
+        assert_eq!((row, col), (4, 9), "cursor should be at (4,9) after CUP");
+
+        // CSI > 1 u — Kitty keyboard progressive enhancement query.
+        // Without the guard this would be parsed as SCORC (restore cursor)
+        // and move the cursor to (0,0).
+        parser.process(b"\x1b[>1u");
+        let (row2, col2) = parser.screen().cursor_position();
+        assert_eq!(
+            (row2, col2),
+            (4, 9),
+            "CSI > 1 u must not restore cursor (cursor must stay at (4,9))"
+        );
+    }
+
+    /// CSI > 4 m (Kitty keyboard protocol) must not alter SGR attributes.
+    #[test]
+    fn test_csi_gt_intermediate_does_not_change_attrs() {
+        let mut parser = Parser::new(24, 80, 0);
+        // Set bold via normal SGR
+        parser.process(b"\x1b[1mA");
+        let cell_before = parser.screen().cell(0, 0).unwrap().clone();
+        assert!(cell_before.bold(), "cell should be bold after CSI 1 m");
+
+        // CSI > 4 m — Kitty keyboard modifyOtherKeys query.
+        // Must not alter SGR / clear bold.
+        parser.process(b"\x1b[>4m");
+        let cell_after = parser.screen().cell(0, 0).unwrap().clone();
+        assert!(
+            cell_after.bold(),
+            "CSI > 4 m must not clear bold attribute"
+        );
+    }
+
+    // F3a: DEC mode 2026 — synchronized output state tracking.
+
+    /// Synchronized output is false by default.
+    #[test]
+    fn test_synchronized_output_default_false() {
+        let parser = Parser::new(24, 80, 0);
+        assert!(
+            !parser.screen().synchronized_output(),
+            "synchronized_output must be false by default"
+        );
+    }
+
+    /// CSI ? 2026 h sets synchronized output mode.
+    #[test]
+    fn test_synchronized_output_set_by_decset_2026() {
+        let mut parser = Parser::new(24, 80, 0);
+        parser.process(b"\x1b[?2026h");
+        assert!(
+            parser.screen().synchronized_output(),
+            "synchronized_output must be true after CSI ? 2026 h"
+        );
+    }
+
+    /// CSI ? 2026 l clears synchronized output mode.
+    #[test]
+    fn test_synchronized_output_cleared_by_decrst_2026() {
+        let mut parser = Parser::new(24, 80, 0);
+        parser.process(b"\x1b[?2026h");
+        assert!(
+            parser.screen().synchronized_output(),
+            "synchronized_output must be true after CSI ? 2026 h"
+        );
+        parser.process(b"\x1b[?2026l");
+        assert!(
+            !parser.screen().synchronized_output(),
+            "synchronized_output must be false after CSI ? 2026 l"
+        );
+    }
+
+    /// Round-trip: set then clear leaves mode false.
+    #[test]
+    fn test_synchronized_output_round_trip() {
+        let mut parser = Parser::new(24, 80, 0);
+        assert!(!parser.screen().synchronized_output());
+        parser.process(b"\x1b[?2026h");
+        assert!(parser.screen().synchronized_output());
+        parser.process(b"\x1b[?2026l");
+        assert!(!parser.screen().synchronized_output());
+    }
 }
