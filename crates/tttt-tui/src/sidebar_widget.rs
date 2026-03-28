@@ -173,6 +173,7 @@ mod tests {
             rows: 24,
             name: None,
             created_at: None,
+            root: false,
         }
     }
 
@@ -185,6 +186,7 @@ mod tests {
             rows: 24,
             name: Some(name.to_string()),
             created_at: None,
+            root: false,
         }
     }
 

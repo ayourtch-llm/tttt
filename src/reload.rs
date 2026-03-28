@@ -70,6 +70,9 @@ pub struct SavedSession {
     /// Full screen contents with ANSI formatting, for replaying into a fresh vt100 parser.
     #[serde(with = "base64_bytes")]
     pub screen_contents_formatted: Vec<u8>,
+    /// True if this is the root session (launched by tttt, not by MCP).
+    #[serde(default)]
+    pub root: bool,
 }
 
 /// Saved cron job.
@@ -179,6 +182,7 @@ mod tests {
                 master_fd: 5,
                 child_pid: Some(12345),
                 screen_contents_formatted: b"\x1b[1mhello\x1b[0m world".to_vec(),
+                root: true,
             }],
             active_session: Some("pty-1".to_string()),
             session_order: vec!["pty-1".to_string()],

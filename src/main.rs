@@ -290,20 +290,13 @@ fn run_restored(restore_file: &str) {
         eprintln!("Warning: failed to initialize loggers: {}", e);
     }
 
-    // Restore sessions from inherited FDs.
-    // If root has --resume, skip the root session (pty-1) so we can relaunch it fresh
-    // with updated MCP tool definitions.
-    if let Err(e) = app.restore_sessions_filtered(&state, |saved| {
-        if restart_root && state.session_order.first().map(|s| s.as_str()) == Some(&saved.id) {
-            // Kill the old root process so it doesn't linger
-            if let Some(pid) = saved.child_pid {
-                unsafe { libc::kill(pid, libc::SIGTERM); }
-            }
-            false // skip restoring this session
-        } else {
-            true // restore normally
-        }
-    }) {
+    // Restore all sessions from inherited FDs (including root).
+    // This preserves session_order exactly as it was.
+    let root_session_id = state.sessions.iter()
+        .find(|s| s.root)
+        .map(|s| s.id.clone());
+
+    if let Err(e) = app.restore_sessions(&state) {
         eprintln!("Warning: failed to restore some sessions: {}", e);
     }
 
@@ -315,23 +308,15 @@ fn run_restored(restore_file: &str) {
         eprintln!("Warning: failed to start viewer listener: {}", e);
     }
 
-    // If root was skipped, remove it from session_order and relaunch fresh
-    // (gets new MCP config + tool discovery). Insert new root at position 0
-    // to preserve the sidebar ordering (root is always first).
+    // For SIGUSR2: kill the old root child and respawn a fresh one in the same
+    // session slot. This preserves the session ID, position, and sidebar order.
     if restart_root {
-        if let Some(root_id) = state.session_order.first() {
-            app.remove_from_session_order(root_id);
-        }
-        match app.launch_root_at_front() {
-            Ok(new_root_id) => {
-                // Auto-inject "Continue" when Claude shows its prompt,
-                // so it resumes without waiting for human input.
-                app.setup_auto_continue(&new_root_id);
-            }
-            Err(e) => {
-                eprintln!("Failed to relaunch root session: {}", e);
+        if let Some(ref root_id) = root_session_id {
+            if let Err(e) = app.respawn_root_session(root_id) {
+                eprintln!("Failed to respawn root session: {}", e);
                 std::process::exit(1);
             }
+            app.setup_auto_continue(root_id);
         }
     }
 
@@ -339,7 +324,7 @@ fn run_restored(restore_file: &str) {
     // may go quiet. Queue a "Continue" injection into the root session so it gets
     // kicked automatically after the event loop starts.
     if !restart_root {
-        if let Some(root_id) = state.session_order.first() {
+        if let Some(ref root_id) = root_session_id {
             app.queue_injection(root_id, "Continue from where you left off.");
         }
     }

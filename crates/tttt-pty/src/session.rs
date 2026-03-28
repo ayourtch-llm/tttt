@@ -28,6 +28,9 @@ pub struct SessionMetadata {
     pub name: Option<String>,
     #[serde(skip)]
     pub created_at: Option<Instant>,
+    /// True if this is the root session.
+    #[serde(default)]
+    pub root: bool,
 }
 
 /// A terminal session combining a PTY backend with a VT100 screen buffer.
@@ -47,6 +50,8 @@ pub struct PtySession<B: PtyBackend> {
     capture_file: Option<std::fs::File>,
     capture_path: Option<String>,
     capture_bytes: u64,
+    /// True if this is the root session (the first session launched by tttt).
+    root: bool,
 }
 
 impl<B: PtyBackend> PtySession<B> {
@@ -65,7 +70,18 @@ impl<B: PtyBackend> PtySession<B> {
             capture_file: None,
             capture_path: None,
             capture_bytes: 0,
+            root: false,
         }
+    }
+
+    /// Mark this session as the root session.
+    pub fn set_root(&mut self, root: bool) {
+        self.root = root;
+    }
+
+    /// Check if this is the root session.
+    pub fn is_root(&self) -> bool {
+        self.root
     }
 
     /// Set the optional name for this session.
@@ -200,6 +216,7 @@ impl<B: PtyBackend> PtySession<B> {
             rows: self.screen.size().1,
             name: self.name.clone(),
             created_at: Some(self.created_at),
+            root: self.root,
         }
     }
 
@@ -222,6 +239,14 @@ impl<B: PtyBackend> PtySession<B> {
     /// Access the PTY backend (for getting raw fd, etc.).
     pub fn backend(&self) -> &B {
         &self.backend
+    }
+
+    /// Replace the PTY backend (for respawning the child process in place).
+    /// Resets session status to Running and clears the screen.
+    pub fn replace_backend(&mut self, backend: B, cols: u16, rows: u16) {
+        self.backend = backend;
+        self.status = SessionStatus::Running;
+        self.screen = ScreenBuffer::new(cols, rows);
     }
 
     /// Access the PTY backend mutably (for testing and live-reload state injection).
@@ -667,6 +692,7 @@ mod tests {
             rows: 24,
             name: name.map(|s| s.to_string()),
             created_at: None,
+            root: false,
         }
     }
 

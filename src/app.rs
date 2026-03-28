@@ -412,6 +412,9 @@ impl App {
                         saved.rows,
                     );
 
+                    // Restore root flag
+                    session.set_root(saved.root);
+
                     // Replay formatted screen contents to restore visual state
                     if !saved.screen_contents_formatted.is_empty() {
                         session.inject_screen_data(&saved.screen_contents_formatted);
@@ -588,18 +591,13 @@ impl App {
         }
     }
 
-    pub fn launch_root(&mut self) -> Result<String, Box<dyn std::error::Error>> {
-        let (pty_cols, pty_rows) = calculate_pane_dimensions(
-            self.screen_cols, self.screen_rows, self.config.sidebar_width,
-        );
-
+    /// Build args and spawn a new root PTY backend.
+    fn spawn_root_backend(&mut self, pty_cols: u16, pty_rows: u16) -> Result<AnyPty, Box<dyn std::error::Error>> {
         // If MCP socket is available, generate config and inject --mcp-config
         // for agents that support it (e.g., claude)
         let mut args: Vec<String> = self.config.root_args.clone();
-        let mut mcp_config_path: Option<String> = None;
         if self.mcp_socket_path.is_some() {
             if let Ok(config_path) = self.generate_mcp_config() {
-                mcp_config_path = Some(config_path.clone());
                 let cmd = &self.config.root_command;
                 if cmd.contains("claude") && !args.iter().any(|a| a.contains("mcp-config")) {
                     // Claude uses --mcp-config with a JSON file
@@ -640,10 +638,19 @@ impl App {
             &self.config.root_command, &args_refs, Some(&self.config.work_dir), pty_cols, pty_rows,
             [("TTTT_PID".to_string(), tttt_pid.to_string())],
         )?;
-        let backend = AnyPty::Real(real_backend);
+        Ok(AnyPty::Real(real_backend))
+    }
+
+    pub fn launch_root(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+        let (pty_cols, pty_rows) = calculate_pane_dimensions(
+            self.screen_cols, self.screen_rows, self.config.sidebar_width,
+        );
+
+        let backend = self.spawn_root_backend(pty_cols, pty_rows)?;
         let mut mgr = self.sessions.lock().unwrap();
         let id = mgr.generate_id();
-        let session = PtySession::new(id.clone(), backend, self.config.root_command.clone(), pty_cols, pty_rows);
+        let mut session = PtySession::new(id.clone(), backend, self.config.root_command.clone(), pty_cols, pty_rows);
+        session.set_root(true);
         mgr.add_session(session)?;
         drop(mgr);
         self.session_order.push(id.clone());
@@ -656,14 +663,35 @@ impl App {
         Ok(id)
     }
 
-    /// Launch root session and insert it at the front of session_order.
-    /// Used during SIGUSR2 restart to preserve sidebar ordering.
-    pub fn launch_root_at_front(&mut self) -> Result<String, Box<dyn std::error::Error>> {
-        let id = self.launch_root()?;
-        // launch_root pushed it to the end — move it to the front
-        self.session_order.retain(|s| s != &id);
-        self.session_order.insert(0, id.clone());
-        Ok(id)
+    /// Respawn the root session's child process in place.
+    /// Kills the old child, spawns a new one with updated MCP config,
+    /// and swaps the backend. Preserves session ID, position, and sidebar order.
+    pub fn respawn_root_session(&mut self, root_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let (pty_cols, pty_rows) = calculate_pane_dimensions(
+            self.screen_cols, self.screen_rows, self.config.sidebar_width,
+        );
+
+        // Kill the old child process
+        {
+            let mut mgr = self.sessions.lock().unwrap();
+            if let Ok(session) = mgr.get_mut(root_id) {
+                let _ = session.kill();
+            }
+        }
+
+        // Spawn new backend using the same arg-building logic as launch_root
+        let backend = self.spawn_root_backend(pty_cols, pty_rows)?;
+
+        // Swap the backend on the existing session
+        {
+            let mut mgr = self.sessions.lock().unwrap();
+            if let Ok(session) = mgr.get_mut(root_id) {
+                session.replace_backend(backend, pty_cols, pty_rows);
+            }
+        }
+
+        self.active_session = Some(root_id.to_string());
+        Ok(())
     }
 
     /// Create a new PTY session with the default shell.
@@ -715,6 +743,7 @@ impl App {
                     master_fd,
                     child_pid,
                     screen_contents_formatted,
+                    root: session.is_root(),
                 });
             }
         }
