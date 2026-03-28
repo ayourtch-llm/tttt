@@ -1,9 +1,8 @@
 //! Server-side viewer client management.
 //!
 //! Each connected viewer gets a `ViewerClient` that tracks its state
-//! and renders screen updates independently.
+//! and detects screen changes via content hashing.
 
-use crate::pane_renderer::PaneRenderer;
 use crate::protocol::{encode_message, ServerMsg, SessionInfo};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -16,21 +15,18 @@ pub struct ViewerClient {
     /// Client's terminal dimensions.
     pub cols: u16,
     pub rows: u16,
-    /// Per-client pane renderer for dirty tracking.
-    pub renderer: PaneRenderer,
+    /// Hash of the last screen content sent, for change detection.
+    pub last_content_hash: u64,
+    /// Hash of the last cursor position sent.
+    pub last_cursor: (u16, u16),
     /// Read buffer for incoming messages.
     pub read_buf: Vec<u8>,
     /// Whether this client is still connected.
     pub connected: bool,
-    /// Last cursor position sent (to avoid redundant updates).
-    last_cursor_row: u16,
-    last_cursor_col: u16,
 }
 
 impl ViewerClient {
-    pub fn new(stream: UnixStream, cols: u16, rows: u16, sidebar_width: u16) -> Self {
-        let pty_cols = cols.saturating_sub(sidebar_width);
-        let pty_rows = rows.saturating_sub(1);
+    pub fn new(stream: UnixStream, cols: u16, rows: u16, _sidebar_width: u16) -> Self {
         // Set non-blocking for poll integration
         stream.set_nonblocking(true).ok();
         Self {
@@ -38,18 +34,27 @@ impl ViewerClient {
             active_session: None,
             cols,
             rows,
-            renderer: PaneRenderer::new(pty_cols, pty_rows, 1, 1),
+            last_content_hash: 0,
+            last_cursor: (0, 0),
             read_buf: Vec::new(),
             connected: true,
-            last_cursor_row: 0,
-            last_cursor_col: 0,
         }
+    }
+
+    /// FNV-1a 64-bit hash for change detection.
+    fn hash_bytes(data: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+        for byte in data {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+        }
+        hash
     }
 
     /// Send a screen update to the client.
     /// Returns true if data was sent, false if no changes or error.
     ///
-    /// Uses the PaneRenderer to detect if anything changed. If so,
+    /// Uses a content hash to detect if anything changed. If so,
     /// sends the vt100 contents_formatted() which the client can
     /// feed into its own vt100 parser for clean state reproduction.
     pub fn send_screen_update(
@@ -58,27 +63,28 @@ impl ViewerClient {
         cursor_row: u16,
         cursor_col: u16,
     ) -> bool {
-        // Use PaneRenderer just for dirty detection
-        let pane_diff = self.renderer.render(screen);
-
-        // Skip if nothing changed
-        if pane_diff.is_empty()
-            && cursor_row == self.last_cursor_row
-            && cursor_col == self.last_cursor_col
-        {
-            return true; // SKIPPED - no changes
+        if !self.connected {
+            return false;
         }
-        self.last_cursor_row = cursor_row;
-        self.last_cursor_col = cursor_col;
+
+        // Hash the screen content for change detection
+        let content = screen.contents_formatted();
+        let hash = Self::hash_bytes(&content);
+        let cursor = (cursor_row, cursor_col);
+
+        if hash == self.last_content_hash && cursor == self.last_cursor {
+            return false; // Nothing changed
+        }
+
+        self.last_content_hash = hash;
+        self.last_cursor = cursor;
 
         // Send the full screen as contents_formatted() — this is a
         // replayable ANSI sequence that reproduces the exact screen state
         // when fed to a vt100 parser. The client will then use its own
-        // PaneRenderer for minimal rendering to the real terminal.
-        let screen_data = screen.contents_formatted();
-
+        // renderer for minimal rendering to the real terminal.
         let msg = ServerMsg::ScreenUpdate {
-            screen_data,
+            screen_data: content,
             cursor_row,
             cursor_col,
         };
@@ -137,9 +143,10 @@ impl ViewerClient {
         }
     }
 
-    /// Invalidate the renderer (force full redraw).
+    /// Invalidate the hash state (forces a full resend on next update).
     pub fn invalidate(&mut self) {
-        self.renderer.invalidate();
+        self.last_content_hash = 0;
+        self.last_cursor = (0, 0);
     }
 
     fn send_msg(&mut self, msg: &ServerMsg) -> bool {
@@ -178,6 +185,186 @@ mod tests {
         (viewer, client_stream)
     }
 
+    // --- hash_bytes tests (TDD: written before implementation) ---
+
+    #[test]
+    fn test_hash_bytes_same_input_same_output() {
+        let data = b"hello world";
+        let h1 = ViewerClient::hash_bytes(data);
+        let h2 = ViewerClient::hash_bytes(data);
+        assert_eq!(h1, h2, "same input must produce same hash");
+    }
+
+    #[test]
+    fn test_hash_bytes_different_inputs_different_hashes() {
+        let h1 = ViewerClient::hash_bytes(b"screen content A");
+        let h2 = ViewerClient::hash_bytes(b"screen content B");
+        assert_ne!(h1, h2, "different inputs must produce different hashes");
+    }
+
+    #[test]
+    fn test_hash_bytes_empty_input() {
+        let h = ViewerClient::hash_bytes(b"");
+        // Should not panic, and should equal the FNV offset basis
+        assert_eq!(h, 0xcbf29ce484222325u64);
+    }
+
+    #[test]
+    fn test_hash_bytes_single_byte_difference() {
+        let h1 = ViewerClient::hash_bytes(b"abc");
+        let h2 = ViewerClient::hash_bytes(b"abd");
+        assert_ne!(h1, h2);
+    }
+
+    // --- change detection tests ---
+
+    #[test]
+    fn test_send_screen_update_same_screen_returns_false() {
+        let (mut viewer, mut client) = make_pair();
+        client.set_nonblocking(false).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+
+        let mut parser = vt100::Parser::new(3, 20, 0);
+        parser.process(b"hi");
+
+        // First send: should transmit (hash was 0)
+        // We must consume the data on client side to avoid blocking
+        let handle = {
+            let mut client2 = client.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                let _ = client2.read(&mut buf);
+            })
+        };
+        let first = viewer.send_screen_update(parser.screen(), 0, 2);
+        handle.join().unwrap();
+        assert!(first, "first send should transmit");
+
+        // Second send with identical screen: should return false (no change)
+        let second = viewer.send_screen_update(parser.screen(), 0, 2);
+        assert!(!second, "second send with same screen should return false (no change)");
+    }
+
+    #[test]
+    fn test_send_screen_update_changed_screen_returns_true() {
+        let (mut viewer, mut client) = make_pair();
+        client.set_nonblocking(false).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+
+        let mut parser = vt100::Parser::new(3, 20, 0);
+        parser.process(b"hi");
+
+        // Drain first send
+        {
+            let mut client2 = client.try_clone().unwrap();
+            let handle = std::thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                let _ = client2.read(&mut buf);
+            });
+            viewer.send_screen_update(parser.screen(), 0, 2);
+            handle.join().unwrap();
+        }
+
+        // Now change the screen content
+        parser.process(b" world");
+
+        // Drain second send
+        let handle = {
+            let mut client2 = client.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                let _ = client2.read(&mut buf);
+            })
+        };
+        let second = viewer.send_screen_update(parser.screen(), 0, 7);
+        handle.join().unwrap();
+        assert!(second, "second send with changed screen should return true");
+    }
+
+    #[test]
+    fn test_send_screen_update_cursor_change_triggers_send() {
+        let (mut viewer, mut client) = make_pair();
+        client.set_nonblocking(false).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+
+        let mut parser = vt100::Parser::new(3, 20, 0);
+        parser.process(b"hi");
+
+        // Drain first send
+        {
+            let mut client2 = client.try_clone().unwrap();
+            let handle = std::thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                let _ = client2.read(&mut buf);
+            });
+            viewer.send_screen_update(parser.screen(), 0, 2);
+            handle.join().unwrap();
+        }
+
+        // Same screen, different cursor position
+        let handle = {
+            let mut client2 = client.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                let _ = client2.read(&mut buf);
+            })
+        };
+        let second = viewer.send_screen_update(parser.screen(), 1, 0);
+        handle.join().unwrap();
+        assert!(second, "cursor position change should trigger a send");
+    }
+
+    #[test]
+    fn test_invalidate_forces_resend() {
+        let (mut viewer, mut client) = make_pair();
+        client.set_nonblocking(false).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+
+        let mut parser = vt100::Parser::new(3, 20, 0);
+        parser.process(b"hi");
+
+        // First send
+        {
+            let mut client2 = client.try_clone().unwrap();
+            let handle = std::thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                let _ = client2.read(&mut buf);
+            });
+            viewer.send_screen_update(parser.screen(), 0, 2);
+            handle.join().unwrap();
+        }
+
+        // Verify second send with same content returns false
+        let no_change = viewer.send_screen_update(parser.screen(), 0, 2);
+        assert!(!no_change, "same content should not send");
+
+        // Invalidate, then same content should send again
+        viewer.invalidate();
+        assert_eq!(viewer.last_content_hash, 0, "invalidate should reset hash to 0");
+        assert_eq!(viewer.last_cursor, (0, 0), "invalidate should reset cursor");
+
+        let handle = {
+            let mut client2 = client.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                let _ = client2.read(&mut buf);
+            })
+        };
+        let after_invalidate = viewer.send_screen_update(parser.screen(), 0, 2);
+        handle.join().unwrap();
+        assert!(after_invalidate, "after invalidate, same content should resend");
+    }
+
+    // --- existing tests (updated to remove renderer references) ---
+
     #[test]
     fn test_viewer_client_new() {
         let (viewer, _client) = make_pair();
@@ -185,6 +372,8 @@ mod tests {
         assert_eq!(viewer.cols, 120);
         assert_eq!(viewer.rows, 40);
         assert!(viewer.active_session.is_none());
+        assert_eq!(viewer.last_content_hash, 0);
+        assert_eq!(viewer.last_cursor, (0, 0));
     }
 
     #[test]
@@ -194,9 +383,6 @@ mod tests {
         // Use a small screen to avoid filling the socket buffer
         let mut parser = vt100::Parser::new(3, 20, 0);
         parser.process(b"hi");
-
-        // Resize the viewer's renderer to match
-        viewer.renderer = PaneRenderer::new(20, 3, 1, 1);
 
         // Send in a thread to avoid blocking
         let handle = std::thread::spawn(move || {

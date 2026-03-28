@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 extern crate tempfile;
 use tttt_tui::protocol::{decode_message, encode_message, ClientMsg, ServerMsg};
-use tttt_tui::{PaneRenderer, ViewerClient};
+use tttt_tui::ViewerClient;
 
 fn make_viewer_pair(
     pty_cols: u16,
@@ -23,8 +23,6 @@ fn make_viewer_pair(
         pty_rows + 1,
         sidebar_width,
     );
-    // Override renderer to match PTY dimensions exactly
-    viewer.renderer = PaneRenderer::new(pty_cols, pty_rows, 1, 1);
     viewer.invalidate();
 
     (viewer, client_stream)
@@ -131,7 +129,7 @@ fn test_viewer_skip_unchanged() {
 
     // Second update with same content + cursor — should skip
     let sent2 = viewer.send_screen_update(parser.screen(), 0, 5);
-    assert!(sent2, "should return true (no error)");
+    assert!(!sent2, "second update with same content should be skipped");
 
     // Client should have received only one message
     std::thread::sleep(std::time::Duration::from_millis(50));

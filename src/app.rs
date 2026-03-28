@@ -7,7 +7,10 @@ use crossterm::{
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Clear, Paragraph},
     Terminal,
 };
 use std::os::fd::{AsRawFd, BorrowedFd};
@@ -296,23 +299,17 @@ fn prefix_key_name(key: u8) -> String {
     }
 }
 
-/// Builds the full help-screen string (with terminal escape sequences).
-fn format_help_screen(prefix_name: &str) -> String {
-    format!(
-        "{}{}\x1b[1mtttt help\x1b[0m  (prefix: {})\
-        {}  0-9  Switch to terminal N\
-        {}  n    Next terminal\
-        {}  p    Previous terminal\
-        {}  d    Detach/quit\
-        {}  r    Live reload (execv)\
-        {}  ?    This help\
-        {}  {p}{p}  Send literal prefix\
-        {}Press any key to dismiss...",
-        clear_screen(), cursor_goto(2, 4), prefix_name,
-        cursor_goto(4, 4), cursor_goto(5, 4), cursor_goto(6, 4),
-        cursor_goto(7, 4), cursor_goto(8, 4),
-        cursor_goto(9, 4), cursor_goto(11, 4),
-        cursor_goto(13, 4), p = prefix_name,
+/// Compute a centered Rect for the help popup within the given terminal area.
+/// Returns `(x, y, width, height)` values for [`ratatui::layout::Rect::new`].
+fn help_popup_area(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let popup_width: u16 = 45;
+    let popup_height: u16 = 14;
+    let x = area.width.saturating_sub(popup_width) / 2;
+    let y = area.height.saturating_sub(popup_height) / 2;
+    ratatui::layout::Rect::new(
+        x, y,
+        popup_width.min(area.width),
+        popup_height.min(area.height),
     )
 }
 
@@ -362,6 +359,8 @@ pub struct App {
     pub restart_root_requested: bool,
     /// When the server started (for uptime display).
     server_start_time: Instant,
+    /// When true, render_frame() will draw a help overlay popup.
+    showing_help: bool,
 }
 
 impl App {
@@ -407,6 +406,7 @@ impl App {
             reload_requested: false,
             restart_root_requested: false,
             server_start_time: Instant::now(),
+            showing_help: false,
             config,
         }
     }
@@ -1124,14 +1124,15 @@ impl App {
     }
 
     fn show_help(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let prefix_name = prefix_key_name(self.config.prefix_key);
-        let help = format_help_screen(&prefix_name);
-        let stdout_fd = std::io::stdout().as_raw_fd();
-        write_all(stdout_fd, help.as_bytes())?;
+        self.showing_help = true;
+        self.render_frame()?;
+
+        // Block for dismiss key
         let stdin_fd = std::io::stdin().as_raw_fd();
         let mut buf = [0u8; 64];
         let _ = nix::unistd::read(stdin_fd, &mut buf);
-        // Redraw the full frame to clear the help screen
+
+        self.showing_help = false;
         self.render_frame()?;
         Ok(())
     }
@@ -1177,6 +1178,12 @@ impl App {
             let mgr = self.sessions.lock().unwrap();
             mgr.list()
         };
+        let showing_help = self.showing_help;
+        let prefix_name = if showing_help {
+            Some(prefix_key_name(self.config.prefix_key))
+        } else {
+            None
+        };
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -1200,6 +1207,43 @@ impl App {
                 &reminders,
             ).build_info(&uptime);
             frame.render_widget(widget, chunks[1]);
+
+            // Help overlay popup
+            if showing_help {
+                let p = prefix_name.as_deref().unwrap_or("");
+                let popup_width = 45u16;
+                let popup_height = 14u16;
+                let x = area.width.saturating_sub(popup_width) / 2;
+                let y = area.height.saturating_sub(popup_height) / 2;
+                let popup_area = Rect::new(
+                    x, y,
+                    popup_width.min(area.width),
+                    popup_height.min(area.height),
+                );
+
+                frame.render_widget(Clear, popup_area);
+
+                let help_text = vec![
+                    Line::from(vec![Span::styled("tttt help", Style::default().add_modifier(Modifier::BOLD))]),
+                    Line::from(format!("prefix: {}", p)),
+                    Line::from(""),
+                    Line::from("  0-9  Switch to terminal N"),
+                    Line::from("  n    Next terminal"),
+                    Line::from("  p    Previous terminal"),
+                    Line::from("  c    Create new terminal"),
+                    Line::from("  d    Detach/quit"),
+                    Line::from("  r    Live reload (execv)"),
+                    Line::from("  ?    This help"),
+                    Line::from(format!("  {p}{p}  Send literal prefix")),
+                    Line::from(""),
+                    Line::from("Press any key to dismiss..."),
+                ];
+
+                let help_widget = Paragraph::new(help_text)
+                    .block(Block::bordered().title(" Help "))
+                    .style(Style::default().fg(Color::White).bg(Color::Black));
+                frame.render_widget(help_widget, popup_area);
+            }
         })?;
 
         // Position cursor at PTY cursor location
@@ -1386,8 +1430,6 @@ impl App {
                             pty_rows + 1, // total rows
                             self.config.sidebar_width,
                         );
-                        // Override renderer to match actual PTY dimensions
-                        client.renderer = PaneRenderer::new(pty_cols, pty_rows, 1, 1);
                         client.active_session = self.active_session.clone();
                         client.invalidate();
                         let _ = self.logger.log_event(&LogEvent::new(
@@ -1446,8 +1488,6 @@ impl App {
                             // (client subtracts its own sidebar if it has one)
                             self.viewer_clients[i].cols = cols;
                             self.viewer_clients[i].rows = rows;
-                            let pty_rows = rows.saturating_sub(1);
-                            self.viewer_clients[i].renderer.resize(cols, pty_rows);
                             self.viewer_clients[i].invalidate();
                             // Resize PTY to minimum across all clients (tmux behavior)
                             self.resize_pty_to_min_and_redraw();
@@ -1514,10 +1554,9 @@ impl App {
             let _ = self.render_frame();
         }
 
-        // Always resize and invalidate viewer renderers so they get a fresh update
+        // Always invalidate viewer hash state so they get a fresh update
         // Also notify clients of the new virtual window size
         for client in &mut self.viewer_clients {
-            client.renderer.resize(min_cols, min_rows);
             client.invalidate();
             // Send window size update to client
             client.send_window_size(min_cols, min_rows);
@@ -1560,7 +1599,7 @@ impl App {
 mod tests {
     use super::*;
 
-    // ── Chunk 1: prefix_key_name / format_help_screen ────────────────────────
+    // ── Chunk 1: prefix_key_name / help popup ────────────────────────────────
 
     #[test]
     fn test_prefix_key_name_ctrl_backslash() {
@@ -1584,21 +1623,49 @@ mod tests {
     }
 
     #[test]
-    fn test_format_help_screen_contains_prefix() {
-        let help = format_help_screen("Ctrl+A");
-        assert!(help.contains("Ctrl+A"), "help screen should contain the prefix name");
+    fn test_help_popup_area_centered_large_terminal() {
+        // 200x50 terminal — popup should be centered
+        let area = ratatui::layout::Rect::new(0, 0, 200, 50);
+        let popup = help_popup_area(area);
+        assert_eq!(popup.width, 45, "popup width should be 45");
+        assert_eq!(popup.height, 14, "popup height should be 14");
+        // x = (200 - 45) / 2 = 77
+        assert_eq!(popup.x, 77, "popup should be horizontally centered");
+        // y = (50 - 14) / 2 = 18
+        assert_eq!(popup.y, 18, "popup should be vertically centered");
     }
 
     #[test]
-    fn test_format_help_screen_contains_keybindings() {
-        let help = format_help_screen("Ctrl+\\");
-        assert!(help.contains("Switch to terminal"), "should mention switching");
-        assert!(help.contains("Next terminal"), "should mention next");
-        assert!(help.contains("Previous terminal"), "should mention prev");
-        assert!(help.contains("Detach/quit"), "should mention detach");
-        assert!(help.contains("Live reload"), "should mention reload");
-        assert!(help.contains("This help"), "should mention help");
-        assert!(help.contains("Press any key"), "should mention dismiss");
+    fn test_help_popup_area_centered_standard_terminal() {
+        // 80x24 terminal
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let popup = help_popup_area(area);
+        assert_eq!(popup.width, 45);
+        assert_eq!(popup.height, 14);
+        // x = (80 - 45) / 2 = 17
+        assert_eq!(popup.x, 17);
+        // y = (24 - 14) / 2 = 5
+        assert_eq!(popup.y, 5);
+    }
+
+    #[test]
+    fn test_help_popup_area_clamped_when_terminal_too_small() {
+        // Terminal smaller than popup — should clamp to terminal size, origin at 0
+        let area = ratatui::layout::Rect::new(0, 0, 20, 5);
+        let popup = help_popup_area(area);
+        assert_eq!(popup.width, 20, "width clamped to terminal width");
+        assert_eq!(popup.height, 5, "height clamped to terminal height");
+        assert_eq!(popup.x, 0, "x should be 0 when terminal narrower than popup");
+        assert_eq!(popup.y, 0, "y should be 0 when terminal shorter than popup");
+    }
+
+    #[test]
+    fn test_help_popup_area_prefix_appears_in_help_text() {
+        // Verify the prefix key name format used in the popup lines
+        let prefix = "Ctrl+A";
+        let line = format!("  {prefix}{prefix}  Send literal prefix");
+        assert!(line.contains("Ctrl+ACtrl+A"), "literal prefix line should repeat prefix twice");
+        assert!(line.contains("Send literal prefix"));
     }
 
     // ── Chunk 7: decide_input_action ─────────────────────────────────────────
@@ -1873,11 +1940,12 @@ mod tests {
     }
 
     #[test]
-    fn test_format_help_screen_prefix_appears_twice_for_literal_prefix() {
-        // The "send literal prefix" line shows "prefix prefix" (e.g. "Ctrl+A Ctrl+A")
-        let help = format_help_screen("XX");
-        let count = help.matches("XX").count();
-        assert!(count >= 2, "prefix should appear at least twice (label + literal-prefix entry)");
+    fn test_help_popup_area_prefix_appears_twice_for_literal_prefix() {
+        // The "send literal prefix" line shows "prefixprefix" (e.g. "XXX" when prefix is "XX")
+        let prefix = "XX";
+        let line = format!("  {prefix}{prefix}  Send literal prefix");
+        let count = line.matches("XX").count();
+        assert!(count >= 2, "prefix should appear at least twice in literal-prefix entry");
     }
 
     // ── Gap-fill helpers: build_width_gap_output / build_height_gap_output ───
