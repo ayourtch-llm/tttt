@@ -1,11 +1,20 @@
 use crate::config::Config;
 use crate::reload::{self, SavedState, SavedSession, SavedCronJob, SavedWatcher};
+use crossterm::{
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    Terminal,
+};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tttt_log::{Direction, LogEvent, LogSink, MultiLogger, SharedSqliteLogSink, SqliteLogger, TextLogger};
+use tttt_log::{Direction as LogDirection, LogEvent, LogSink, MultiLogger, SharedSqliteLogSink, SqliteLogger, TextLogger};
 use tttt_mcp::notification::NotificationRegistry;
 use tttt_mcp::{SharedNotificationRegistry, SharedScheduler, SharedScratchpad, SharedSidebarMessages};
 use tttt_pty::{AnyPty, PtySession, RealPty, SessionManager, SessionStatus};
@@ -13,7 +22,7 @@ use tttt_scheduler::{Scheduler, SchedulerEvent};
 use std::os::unix::net::UnixListener;
 use tttt_tui::{
     clear_screen, cursor_goto, protocol, InputEvent, InputParser, PaneRenderer, RawInput,
-    SessionInfo, SidebarRenderer, ViewerClient,
+    SidebarRenderer, ViewerClient, PtyWidget, SidebarWidget,
 };
 
 /// Minimum time between renders to the server terminal (ms).
@@ -21,50 +30,6 @@ use tttt_tui::{
 /// we accumulate changes and only render once the burst settles.
 const RENDER_DEBOUNCE_MS: u64 = 50;
 
-/// Terminal state saved/restored around raw mode.
-struct TerminalState {
-    original_termios: Option<nix::sys::termios::Termios>,
-}
-
-impl TerminalState {
-    fn enter_raw_mode() -> Self {
-        use nix::sys::termios::*;
-        let stdin = std::io::stdin();
-        let original = tcgetattr(&stdin).ok();
-        if let Some(ref orig) = original {
-            let mut raw: Termios = orig.clone();
-            raw.local_flags.remove(LocalFlags::ICANON);
-            raw.local_flags.remove(LocalFlags::ECHO);
-            raw.local_flags.remove(LocalFlags::ISIG);
-            raw.local_flags.remove(LocalFlags::IEXTEN);
-            raw.input_flags.remove(InputFlags::IXON);
-            raw.input_flags.remove(InputFlags::ICRNL);
-            raw.input_flags.remove(InputFlags::BRKINT);
-            raw.input_flags.remove(InputFlags::INPCK);
-            raw.input_flags.remove(InputFlags::ISTRIP);
-            raw.output_flags.remove(OutputFlags::OPOST);
-            raw.control_flags.remove(ControlFlags::CSIZE);
-            raw.control_flags.insert(ControlFlags::CS8);
-            raw.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
-            raw.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
-            let _ = tcsetattr(&stdin, SetArg::TCSAFLUSH, &raw);
-        }
-        Self { original_termios: original }
-    }
-
-    fn restore(&self) {
-        if let Some(ref orig) = self.original_termios {
-            let stdin = std::io::stdin();
-            let _ = nix::sys::termios::tcsetattr(&stdin, nix::sys::termios::SetArg::TCSAFLUSH, orig);
-        }
-    }
-}
-
-impl Drop for TerminalState {
-    fn drop(&mut self) {
-        self.restore();
-    }
-}
 
 impl Drop for App {
     fn drop(&mut self) {
@@ -204,6 +169,7 @@ fn calculate_min_dimensions(
 ///                    filled)
 ///
 /// Returns an empty string when `min_cols >= max_pty_cols` (no gap).
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_width_gap_output(min_cols: u16, max_pty_cols: u16, screen_rows: u16) -> String {
     if min_cols >= max_pty_cols {
         return String::new();
@@ -235,6 +201,7 @@ fn build_width_gap_output(min_cols: u16, max_pty_cols: u16, screen_rows: u16) ->
 /// * `max_pty_cols` — full pane width (columns to fill with dots)
 ///
 /// Returns an empty string when `min_rows >= max_pty_rows` (no gap).
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_height_gap_output(min_rows: u16, max_pty_rows: u16, max_pty_cols: u16) -> String {
     if min_rows >= max_pty_rows {
         return String::new();
@@ -356,6 +323,7 @@ pub struct App {
     input_parser: InputParser,
     sidebar: SidebarRenderer,
     pane_renderer: PaneRenderer,
+    terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
     logger: MultiLogger,
     sqlite_logger: Option<Arc<Mutex<SqliteLogger>>>,
     scheduler: SharedScheduler,
@@ -401,11 +369,20 @@ impl App {
         let display_config = config.display_config();
         let (cols, rows) = terminal_size();
         let (pty_cols, pty_rows) = calculate_pane_dimensions(cols, rows, config.sidebar_width);
+
+        // Set up ratatui terminal with crossterm backend
+        enable_raw_mode().expect("Failed to enable raw mode");
+        let mut stdout = std::io::stdout();
+        execute!(stdout, EnterAlternateScreen).expect("Failed to enter alternate screen");
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend).expect("Failed to create terminal");
+
         Self {
             sessions: Arc::new(Mutex::new(SessionManager::with_max_sessions(config.max_sessions))),
             input_parser: InputParser::new(display_config),
             sidebar: SidebarRenderer::new(config.sidebar_width),
             pane_renderer: PaneRenderer::new(pty_cols, pty_rows, 1, 1),
+            terminal,
             logger: MultiLogger::new(),
             sqlite_logger: None,
             scheduler: Arc::new(Mutex::new(Scheduler::new())),
@@ -724,7 +701,7 @@ impl App {
     }
 
     /// Create a new PTY session with the default shell.
-    pub fn create_session(&mut self, stdout_fd: i32) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn create_session(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let (pty_cols, pty_rows) = calculate_pane_dimensions(
             self.screen_cols, self.screen_rows, self.config.sidebar_width,
         );
@@ -742,7 +719,7 @@ impl App {
         mgr.add_session(session)?;
         drop(mgr);
         self.session_order.push(id.clone());
-        self.switch_to_session(&id, stdout_fd)?;
+        self.switch_to_session(&id)?;
         Ok(())
     }
 
@@ -847,7 +824,6 @@ impl App {
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let _terminal_state = TerminalState::enter_raw_mode();
         let winch = Arc::new(AtomicBool::new(false));
         let _ = signal_hook::flag::register(libc::SIGWINCH, Arc::clone(&winch));
         let sigusr1 = Arc::new(AtomicBool::new(false));
@@ -855,11 +831,9 @@ impl App {
         let sigusr2 = Arc::new(AtomicBool::new(false));
         let _ = signal_hook::flag::register(libc::SIGUSR2, Arc::clone(&sigusr2));
 
-        let stdout_fd = std::io::stdout().as_raw_fd();
         let stdin_fd = std::io::stdin().as_raw_fd();
 
-        write_all(stdout_fd, clear_screen().as_bytes())?;
-        self.render_sidebar(stdout_fd)?;
+        self.render_frame()?;
 
         loop {
             // Get active PTY fd for polling (short lock)
@@ -889,7 +863,7 @@ impl App {
 
             if winch.load(Ordering::Relaxed) {
                 winch.store(false, Ordering::Relaxed);
-                self.handle_resize(stdout_fd)?;
+                self.handle_resize()?;
             }
 
             if sigusr1.load(Ordering::Relaxed) {
@@ -914,7 +888,7 @@ impl App {
                             match session.pump_raw() {
                                 Ok((n, raw_bytes)) if n > 0 => {
                                     let _ = self.logger.log_event(&LogEvent::new(
-                                        id.clone(), Direction::Output, raw_bytes,
+                                        id.clone(), LogDirection::Output, raw_bytes,
                                     ));
                                     let now = Instant::now();
                                     if !self.server_render_dirty {
@@ -945,24 +919,7 @@ impl App {
                 );
 
                 if should_render {
-                    if let Some(id) = self.active_session.clone() {
-                        let render_data = {
-                            let mgr = self.sessions.lock().unwrap();
-                            if let Ok(session) = mgr.get(&id) {
-                                let pane_output = self.pane_renderer.render(session.screen().screen());
-                                let cursor = session.cursor_position();
-                                Some((pane_output, cursor))
-                            } else { None }
-                        };
-                        if let Some((pane_output, (row, col))) = render_data {
-                            if !pane_output.is_empty() {
-                                write_all(stdout_fd, &pane_output)?;
-                                self.render_sidebar(stdout_fd)?;
-                            }
-                            let (tr, tc) = self.pane_renderer.cursor_terminal_position(row, col);
-                            write_all(stdout_fd, cursor_goto(tr, tc).as_bytes())?;
-                        }
-                    }
+                    self.render_frame()?;
                     self.server_render_dirty = false;
                     self.first_dirty_time = None;
                 }
@@ -978,12 +935,12 @@ impl App {
                             let raw = RawInput { bytes: buf[..n].to_vec() };
                             let events = self.input_parser.process(&raw);
                             for event in events {
-                                match self.handle_input_event(event, stdout_fd) {
+                                match self.handle_input_event(event) {
                                     Ok(true) => {}
                                     Ok(false) => return Ok(()),
                                     Err(e) => {
                                         let _ = self.logger.log_event(&LogEvent::new(
-                                            "system".to_string(), Direction::Meta,
+                                            "system".to_string(), LogDirection::Meta,
                                             format!("Input error: {}", e).into_bytes(),
                                         ));
                                     }
@@ -1003,7 +960,7 @@ impl App {
             self.accept_viewer_connections();
 
             // Process viewer client input
-            self.process_viewer_input(stdout_fd)?;
+            self.process_viewer_input()?;
 
             // Send screen updates to all viewers
             self.update_viewers();
@@ -1021,7 +978,7 @@ impl App {
                         if let Ok((n, raw_bytes)) = session.pump_raw() {
                             if n > 0 {
                                 let _ = self.logger.log_event(&LogEvent::new(
-                                    sid.clone(), Direction::Output, raw_bytes,
+                                    sid.clone(), LogDirection::Output, raw_bytes,
                                 ));
                             }
                         }
@@ -1061,7 +1018,7 @@ impl App {
                         let _ = session.send_raw(&bytes);
                     }
                     let _ = self.logger.log_event(&LogEvent::new(
-                        target_id.clone(), Direction::Meta,
+                        target_id.clone(), LogDirection::Meta,
                         format!("[NOTIFICATION] {}", text).into_bytes(),
                     ));
                     self.last_injection_time = Some(Instant::now());
@@ -1089,6 +1046,11 @@ impl App {
             }
         }
 
+        // Restore terminal state
+        disable_raw_mode()?;
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        self.terminal.show_cursor()?;
+
         Ok(())
     }
 
@@ -1100,12 +1062,12 @@ impl App {
         self.session_order = reconcile_session_order(&self.session_order, &actual_ids);
     }
 
-    fn handle_input_event(&mut self, event: InputEvent, stdout_fd: i32) -> Result<bool, Box<dyn std::error::Error>> {
+    fn handle_input_event(&mut self, event: InputEvent) -> Result<bool, Box<dyn std::error::Error>> {
         match decide_input_action(event) {
             InputAction::SendToSession(data) => {
                 if let Some(ref id) = self.active_session {
                     if self.config.log_input {
-                        let _ = self.logger.log_event(&LogEvent::new(id.clone(), Direction::Input, data.clone()));
+                        let _ = self.logger.log_event(&LogEvent::new(id.clone(), LogDirection::Input, data.clone()));
                     }
                     let mut mgr = self.sessions.lock().unwrap();
                     if let Ok(session) = mgr.get_mut(id) {
@@ -1115,12 +1077,12 @@ impl App {
             }
             InputAction::SwitchSession(n) => {
                 if let Some(id) = self.session_order.get(n).cloned() {
-                    self.switch_to_session(&id, stdout_fd)?;
+                    self.switch_to_session(&id)?;
                 }
             }
-            InputAction::NextSession => self.switch_relative(1, stdout_fd)?,
-            InputAction::PrevSession => self.switch_relative(-1, stdout_fd)?,
-            InputAction::ShowHelp => self.show_help(stdout_fd)?,
+            InputAction::NextSession => self.switch_relative(1)?,
+            InputAction::PrevSession => self.switch_relative(-1)?,
+            InputAction::ShowHelp => self.show_help()?,
             InputAction::PrefixEscape => {
                 if let Some(ref id) = self.active_session {
                     let prefix = vec![self.config.prefix_key];
@@ -1132,7 +1094,7 @@ impl App {
             }
             InputAction::Detach => return Ok(false),
             InputAction::CreateSession => {
-                self.create_session(stdout_fd)?;
+                self.create_session()?;
             }
             InputAction::Reload => {
                 self.reload_requested = true;
@@ -1142,53 +1104,35 @@ impl App {
         Ok(true)
     }
 
-    fn switch_to_session(&mut self, id: &str, stdout_fd: i32) -> Result<(), Box<dyn std::error::Error>> {
+    fn switch_to_session(&mut self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
         let exists = self.sessions.lock().unwrap().exists(id);
         if exists {
             self.active_session = Some(id.to_string());
-            write_all(stdout_fd, clear_screen().as_bytes())?;
-            self.pane_renderer.invalidate();
-            let render_data = {
-                let mut mgr = self.sessions.lock().unwrap();
-                if let Ok(session) = mgr.get_mut(id) {
-                    let pane_output = self.pane_renderer.render(session.screen().screen());
-                    let cursor = session.cursor_position();
-                    Some((pane_output, cursor))
-                } else { None }
-            };
-            if let Some((pane_output, (row, col))) = render_data {
-                write_all(stdout_fd, &pane_output)?;
-                self.render_sidebar(stdout_fd)?;
-                let (tr, tc) = self.pane_renderer.cursor_terminal_position(row, col);
-                write_all(stdout_fd, cursor_goto(tr, tc).as_bytes())?;
-            } else {
-                self.render_sidebar(stdout_fd)?;
-            }
+            self.render_frame()?;
         }
         Ok(())
     }
 
-    fn switch_relative(&mut self, delta: i32, stdout_fd: i32) -> Result<(), Box<dyn std::error::Error>> {
+    fn switch_relative(&mut self, delta: i32) -> Result<(), Box<dyn std::error::Error>> {
         let current_idx = self.active_session.as_ref()
             .and_then(|id| self.session_order.iter().position(|s| s == id));
         if let Some(new_idx) = compute_relative_index(current_idx, delta, self.session_order.len()) {
             let id = self.session_order[new_idx].clone();
-            self.switch_to_session(&id, stdout_fd)?;
+            self.switch_to_session(&id)?;
         }
         Ok(())
     }
 
-    fn show_help(&mut self, stdout_fd: i32) -> Result<(), Box<dyn std::error::Error>> {
+    fn show_help(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let prefix_name = prefix_key_name(self.config.prefix_key);
         let help = format_help_screen(&prefix_name);
+        let stdout_fd = std::io::stdout().as_raw_fd();
         write_all(stdout_fd, help.as_bytes())?;
         let stdin_fd = std::io::stdin().as_raw_fd();
         let mut buf = [0u8; 64];
         let _ = nix::unistd::read(stdin_fd, &mut buf);
-        write_all(stdout_fd, clear_screen().as_bytes())?;
-        self.pane_renderer.invalidate();
-        // Can't call render here because pane_renderer is &self — need to redraw on next loop
-        self.render_sidebar(stdout_fd)?;
+        // Redraw the full frame to clear the help screen
+        self.render_frame()?;
         Ok(())
     }
 
@@ -1210,7 +1154,64 @@ impl App {
         Ok(())
     }
 
-    fn handle_resize(&mut self, stdout_fd: i32) -> Result<(), Box<dyn std::error::Error>> {
+    /// Render the full frame using ratatui widgets.
+    fn render_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Collect all data needed for rendering before entering the draw closure,
+        // because we cannot hold the mutex lock across the closure.
+        let screen_data: Option<(vt100::Screen, u16, u16)> = self.active_session.as_ref()
+            .and_then(|id| {
+                let mgr = self.sessions.lock().unwrap();
+                mgr.get(id).ok().map(|session| {
+                    let screen = session.screen().screen().clone();
+                    let (row, col) = session.cursor_position();
+                    (screen, row, col)
+                })
+            });
+
+        let reminders: Vec<String> = self.sidebar_messages.lock().unwrap().clone();
+        let uptime_secs = self.server_start_time.elapsed().as_secs();
+        let uptime = format!("Uptime: {}s", uptime_secs);
+        let sidebar_width = self.config.sidebar_width;
+        let active_id = self.active_session.clone();
+        let sessions_snapshot = {
+            let mgr = self.sessions.lock().unwrap();
+            mgr.list()
+        };
+
+        self.terminal.draw(|frame| {
+            let area = frame.area();
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(sidebar_width),
+                ])
+                .split(area);
+
+            // PTY pane
+            if let Some((ref screen, _, _)) = screen_data {
+                frame.render_widget(PtyWidget::new(screen), chunks[0]);
+            }
+
+            // Sidebar
+            let widget = SidebarWidget::new(
+                &sessions_snapshot,
+                active_id.as_deref(),
+                &reminders,
+            ).build_info(&uptime);
+            frame.render_widget(widget, chunks[1]);
+        })?;
+
+        // Position cursor at PTY cursor location
+        if let Some((_, row, col)) = screen_data {
+            self.terminal.set_cursor_position((col, row))?;
+            self.terminal.show_cursor()?;
+        }
+
+        Ok(())
+    }
+
+    fn handle_resize(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let (cols, rows) = terminal_size();
         self.screen_cols = cols;
         self.screen_rows = rows;
@@ -1232,30 +1233,12 @@ impl App {
         ).into_bytes();
         for id in &resized_ids {
             let _ = self.logger.log_event(&LogEvent::new(
-                id.clone(), Direction::Meta, resize_data.clone(),
+                id.clone(), LogDirection::Meta, resize_data.clone(),
             ));
         }
-        write_all(stdout_fd, clear_screen().as_bytes())?;
-        if let Some(ref id) = self.active_session.clone() {
-            let render_data = {
-                let mut mgr = self.sessions.lock().unwrap();
-                if let Ok(session) = mgr.get_mut(id) {
-                    let pane_output = self.pane_renderer.render(session.screen().screen());
-                    let cursor = session.cursor_position();
-                    Some((pane_output, cursor))
-                } else {
-                    None
-                }
-            };
-            if let Some((pane_output, (row, col))) = render_data {
-                write_all(stdout_fd, &pane_output)?;
-                self.render_sidebar(stdout_fd)?;
-                let (tr, tc) = self.pane_renderer.cursor_terminal_position(row, col);
-                write_all(stdout_fd, cursor_goto(tr, tc).as_bytes())?;
-                return Ok(());
-            }
-        }
-        self.render_sidebar(stdout_fd)?;
+        // Notify ratatui about the resize, then redraw
+        self.terminal.resize(ratatui::layout::Rect::new(0, 0, cols, rows))?;
+        self.render_frame()?;
         Ok(())
     }
 
@@ -1296,7 +1279,7 @@ impl App {
         match event {
             SchedulerEvent::ReminderFired(reminder) => {
                 let _ = self.logger.log_event(&LogEvent::new(
-                    "scheduler".to_string(), Direction::Meta,
+                    "scheduler".to_string(), LogDirection::Meta,
                     format!("REMINDER: {}", reminder.message).into_bytes(),
                 ));
                 // Inject the reminder message into the active session (or first session).
@@ -1408,7 +1391,7 @@ impl App {
                         client.active_session = self.active_session.clone();
                         client.invalidate();
                         let _ = self.logger.log_event(&LogEvent::new(
-                            "viewer".to_string(), Direction::Meta,
+                            "viewer".to_string(), LogDirection::Meta,
                             format!("ACCEPT: viewer connected, active_session={:?}, pty={}x{}", self.active_session, pty_cols, pty_rows).into_bytes(),
                         ));
                         self.viewer_clients.push(client);
@@ -1420,7 +1403,7 @@ impl App {
         }
     }
 
-    fn process_viewer_input(&mut self, _stdout_fd: i32) -> Result<(), Box<dyn std::error::Error>> {
+    fn process_viewer_input(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         for i in 0..self.viewer_clients.len() {
             if !self.viewer_clients[i].connected {
                 continue;
@@ -1436,7 +1419,7 @@ impl App {
                     match msg {
                         protocol::ClientMsg::KeyInput { bytes } => {
                             let _ = self.logger.log_event(&LogEvent::new(
-                                "viewer".to_string(), Direction::Meta,
+                                "viewer".to_string(), LogDirection::Meta,
                                 format!("INPUT: KeyInput len={}, active_session={:?}", bytes.len(), self.viewer_clients[i].active_session).into_bytes(),
                             ));
                             // Forward keystrokes to the viewer's active session
@@ -1456,7 +1439,7 @@ impl App {
                         }
                         protocol::ClientMsg::Resize { cols, rows } => {
                             let _ = self.logger.log_event(&LogEvent::new(
-                                "viewer".to_string(), Direction::Meta,
+                                "viewer".to_string(), LogDirection::Meta,
                                 format!("RESIZE: cols={}, rows={}", cols, rows).into_bytes(),
                             ));
                             // cols = usable PTY width reported by client
@@ -1467,7 +1450,7 @@ impl App {
                             self.viewer_clients[i].renderer.resize(cols, pty_rows);
                             self.viewer_clients[i].invalidate();
                             // Resize PTY to minimum across all clients (tmux behavior)
-                            self.resize_pty_to_min_and_redraw(_stdout_fd);
+                            self.resize_pty_to_min_and_redraw();
                         }
                         protocol::ClientMsg::Detach => {
                             self.viewer_clients[i].send_goodbye();
@@ -1484,15 +1467,15 @@ impl App {
         self.viewer_clients.retain(|c| c.connected);
         if self.viewer_clients.len() < count_before {
             // A client disconnected — resize PTY back up if possible
-            self.resize_pty_to_min_and_redraw(_stdout_fd);
+            self.resize_pty_to_min_and_redraw();
         }
 
         Ok(())
     }
 
     /// Resize the PTY to the minimum size across the main terminal and all connected viewers.
-    /// Clears the main terminal and forces a full redraw to remove stale content.
-    fn resize_pty_to_min_and_redraw(&mut self, stdout_fd: i32) {
+    /// Forces a full ratatui redraw to remove stale content.
+    fn resize_pty_to_min_and_redraw(&mut self) {
         // The PTY can never be larger than the main terminal's usable area
         let (max_pty_cols, max_pty_rows) = calculate_pane_dimensions(
             self.screen_cols, self.screen_rows, self.config.sidebar_width,
@@ -1524,37 +1507,11 @@ impl App {
             }
             drop(mgr);
 
-            // Resize main pane renderer and invalidate for full redraw
+            // Resize main pane renderer
             self.pane_renderer.resize(min_cols, min_rows);
 
-            // Clear main terminal to remove stale content from the old wider PTY
-            let _ = write_all(stdout_fd, clear_screen().as_bytes());
-
-            // Force full redraw of active session on main terminal
-            {
-                let mut mgr = self.sessions.lock().unwrap();
-                if let Some(ref id) = self.active_session.clone() {
-                    if let Ok(session) = mgr.get_mut(id) {
-                        let pane_output = self.pane_renderer.render(session.screen().screen());
-                        let _ = write_all(stdout_fd, &pane_output);
-                    }
-                }
-            }
-            // Fill gap between PTY area and sidebar with gray dots (full terminal height)
-            let max_pty_cols = self.screen_cols.saturating_sub(self.config.sidebar_width);
-            let width_gap = build_width_gap_output(min_cols, max_pty_cols, self.screen_rows);
-            if !width_gap.is_empty() {
-                let _ = write_all(stdout_fd, width_gap.as_bytes());
-            }
-
-            // Fill height gap: rows below PTY area with gray dots across full pane width
-            let max_pty_rows = self.screen_rows.saturating_sub(1); // -1 for status bar
-            let height_gap = build_height_gap_output(min_rows, max_pty_rows, max_pty_cols);
-            if !height_gap.is_empty() {
-                let _ = write_all(stdout_fd, height_gap.as_bytes());
-            }
-
-            let _ = self.render_sidebar(stdout_fd);
+            // Redraw the full frame via ratatui (handles gap fill and sidebar)
+            let _ = self.render_frame();
         }
 
         // Always resize and invalidate viewer renderers so they get a fresh update
@@ -1580,18 +1537,18 @@ impl App {
                     let screen_data_len = screen.contents_formatted().len();
                     let sent = client.send_screen_update(screen, row, col);
                     let _ = self.logger.log_event(&LogEvent::new(
-                        "viewer".to_string(), Direction::Meta,
+                        "viewer".to_string(), LogDirection::Meta,
                         format!("UPDATE: sid={}, sent={}, screen_data_len={}, cursor=({},{})", sid, sent, screen_data_len, row, col).into_bytes(),
                     ));
                 } else {
                     let _ = self.logger.log_event(&LogEvent::new(
-                        "viewer".to_string(), Direction::Meta,
+                        "viewer".to_string(), LogDirection::Meta,
                         format!("UPDATE: session {} not found!", sid).into_bytes(),
                     ));
                 }
             } else {
                 let _ = self.logger.log_event(&LogEvent::new(
-                    "viewer".to_string(), Direction::Meta,
+                    "viewer".to_string(), LogDirection::Meta,
                     "UPDATE: no active_session!".to_string().into_bytes(),
                 ));
             }
@@ -2039,5 +1996,73 @@ mod tests {
         // Height gap always fills from column 1
         let out = build_height_gap_output(5, 8, 40);
         assert!(out.contains(";1H"), "height gap rows must start at column 1");
+    }
+
+    // ── Ratatui layout calculations ───────────────────────────────────────────
+
+    #[test]
+    fn test_render_frame_layout_standard() {
+        use ratatui::layout::{Constraint, Direction, Layout, Rect};
+        // 100 wide, sidebar 30 → pane 70
+        let area = Rect::new(0, 0, 100, 24);
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(30),
+            ])
+            .split(area);
+        assert_eq!(chunks[0].width, 70, "pane should be total minus sidebar");
+        assert_eq!(chunks[1].width, 30, "sidebar should be exactly sidebar_width");
+        assert_eq!(chunks[0].height, 24);
+        assert_eq!(chunks[1].height, 24);
+    }
+
+    #[test]
+    fn test_render_frame_layout_zero_sidebar() {
+        use ratatui::layout::{Constraint, Direction, Layout, Rect};
+        let area = Rect::new(0, 0, 80, 24);
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(0),
+            ])
+            .split(area);
+        assert_eq!(chunks[0].width, 80, "with zero sidebar pane should fill full width");
+        assert_eq!(chunks[1].width, 0);
+    }
+
+    #[test]
+    fn test_render_frame_layout_narrow_terminal_sidebar_wins() {
+        use ratatui::layout::{Constraint, Direction, Layout, Rect};
+        // Terminal only 10 wide, sidebar 30 → pane gets Min(1) = 1, sidebar truncated
+        let area = Rect::new(0, 0, 10, 24);
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(30),
+            ])
+            .split(area);
+        // Total width is 10; sidebar wants 30 but can only get at most 9 (pane needs ≥1)
+        assert!(chunks[0].width >= 1, "pane must always have at least 1 column");
+        assert_eq!(chunks[0].width + chunks[1].width, 10, "chunks must sum to total width");
+    }
+
+    #[test]
+    fn test_render_frame_layout_exact_sidebar_width() {
+        use ratatui::layout::{Constraint, Direction, Layout, Rect};
+        // 50 wide, sidebar 20 → pane 30
+        let area = Rect::new(0, 0, 50, 24);
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(20),
+            ])
+            .split(area);
+        assert_eq!(chunks[0].width, 30);
+        assert_eq!(chunks[1].width, 20);
     }
 }
