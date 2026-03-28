@@ -74,6 +74,12 @@ enum InputAction {
     Detach,
     /// Send the raw prefix key byte to the active session.
     PrefixEscape,
+    /// Mouse events — handled directly, no further mapping needed.
+    MousePress { button: tttt_tui::MouseButton, col: u16, row: u16 },
+    MouseDrag { button: tttt_tui::MouseButton, col: u16, row: u16 },
+    MouseRelease { col: u16, row: u16 },
+    ScrollUp { col: u16, row: u16 },
+    ScrollDown { col: u16, row: u16 },
 }
 
 fn decide_input_action(event: tttt_tui::InputEvent) -> InputAction {
@@ -87,6 +93,11 @@ fn decide_input_action(event: tttt_tui::InputEvent) -> InputAction {
         tttt_tui::InputEvent::Reload              => InputAction::Reload,
         tttt_tui::InputEvent::Detach              => InputAction::Detach,
         tttt_tui::InputEvent::PrefixEscape        => InputAction::PrefixEscape,
+        tttt_tui::InputEvent::MousePress { button, col, row } => InputAction::MousePress { button, col, row },
+        tttt_tui::InputEvent::MouseDrag { button, col, row } => InputAction::MouseDrag { button, col, row },
+        tttt_tui::InputEvent::MouseRelease { col, row } => InputAction::MouseRelease { col, row },
+        tttt_tui::InputEvent::ScrollUp { col, row } => InputAction::ScrollUp { col, row },
+        tttt_tui::InputEvent::ScrollDown { col, row } => InputAction::ScrollDown { col, row },
     }
 }
 
@@ -1024,6 +1035,12 @@ impl App {
                 self.reload_requested = true;
                 return Ok(false);
             }
+            // Mouse events — placeholder for Phase 4 wiring
+            InputAction::MousePress { .. }
+            | InputAction::MouseDrag { .. }
+            | InputAction::MouseRelease { .. }
+            | InputAction::ScrollUp { .. }
+            | InputAction::ScrollDown { .. } => {}
         }
         Ok(true)
     }

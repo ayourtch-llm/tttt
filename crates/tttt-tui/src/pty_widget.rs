@@ -1,3 +1,4 @@
+use crate::selection::Selection;
 use crate::vt100_style;
 use ratatui::prelude::*;
 use ratatui::widgets::Widget;
@@ -6,11 +7,18 @@ use ratatui::widgets::Widget;
 /// Cells beyond the PTY dimensions are filled with dim gray dots.
 pub struct PtyWidget<'a> {
     screen: &'a vt100::Screen,
+    selection: Option<&'a Selection>,
 }
 
 impl<'a> PtyWidget<'a> {
     pub fn new(screen: &'a vt100::Screen) -> Self {
-        Self { screen }
+        Self { screen, selection: None }
+    }
+
+    /// Set the active selection for visual highlighting.
+    pub fn with_selection(mut self, sel: &'a Selection) -> Self {
+        self.selection = Some(sel);
+        self
     }
 }
 
@@ -33,11 +41,19 @@ impl<'a> Widget for PtyWidget<'a> {
                         }
                         let contents = cell.contents();
                         let symbol = if contents.is_empty() { " " } else { &contents };
-                        let style = vt100_style::cell_style(cell);
+                        let mut style = vt100_style::cell_style(cell);
+
+                        // Highlight selected cells
+                        if let Some(sel) = &self.selection {
+                            if sel.contains(row, col) {
+                                style = style.add_modifier(Modifier::REVERSED);
+                            }
+                        }
+
                         buf[(x, y)].set_symbol(symbol).set_style(style);
                     }
                 } else {
-                    // Gap fill: dim gray dot
+                    // Gap fill: dim gray dot (never highlighted)
                     buf[(x, y)].set_symbol(".").set_style(gap_style);
                 }
             }
@@ -48,6 +64,7 @@ impl<'a> Widget for PtyWidget<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selection::Selection;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
 
@@ -207,5 +224,69 @@ mod tests {
         // Buffer coordinates are offset: x=5, y=3 for the first cell
         assert_eq!(buf[(5, 3)].symbol(), "H");
         assert_eq!(buf[(6, 3)].symbol(), "i");
+    }
+
+    #[test]
+    fn test_selection_highlights_cells() {
+        let parser = make_screen(b"Hello World", 20, 2);
+        let mut sel = Selection::new(0, 0);
+        // Select first 5 chars (cols 0-4 inclusive)
+        sel.head = (0, 4);
+
+        let widget = PtyWidget::new(parser.screen()).with_selection(&sel);
+        let area = Rect::new(0, 0, 20, 2);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+
+        // Selected cells (cols 0-4, row 0) should have REVERSED modifier
+        assert!(
+            buf[(0, 0)].style().add_modifier.contains(Modifier::REVERSED),
+            "col 0 should be REVERSED"
+        );
+        assert!(
+            buf[(4, 0)].style().add_modifier.contains(Modifier::REVERSED),
+            "col 4 should be REVERSED"
+        );
+        // Unselected cell (col 5) should NOT have REVERSED
+        assert!(
+            !buf[(5, 0)].style().add_modifier.contains(Modifier::REVERSED),
+            "col 5 should NOT be REVERSED"
+        );
+    }
+
+    #[test]
+    fn test_no_selection_no_highlight() {
+        let parser = make_screen(b"Hello", 10, 2);
+        let widget = PtyWidget::new(parser.screen());
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+
+        // No cell should have REVERSED modifier
+        assert!(
+            !buf[(0, 0)].style().add_modifier.contains(Modifier::REVERSED),
+            "No selection: col 0 should NOT be REVERSED"
+        );
+    }
+
+    #[test]
+    fn test_selection_does_not_affect_gap_fill() {
+        // PTY is 5 cols wide, area is 10 cols — cols 5-9 are gap fill
+        let parser = make_screen(b"Hi", 5, 2);
+        let mut sel = Selection::new(0, 0);
+        sel.head = (0, 9); // extends into gap area (beyond PTY cols)
+
+        let widget = PtyWidget::new(parser.screen()).with_selection(&sel);
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+
+        // Gap fill cells (cols 5-9) should NOT be highlighted
+        for col in 5..10u16 {
+            assert!(
+                !buf[(col, 0)].style().add_modifier.contains(Modifier::REVERSED),
+                "Gap fill col {col} should NOT be REVERSED"
+            );
+        }
     }
 }
