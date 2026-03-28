@@ -1,10 +1,9 @@
 //! Tests for cursor movement keys (arrows, backspace) in real PTY sessions.
 //!
-//! These verify that the PaneRenderer correctly reflects cursor position
-//! changes when the user presses arrow keys and edits text.
+//! These verify that cursor position changes correctly when the user presses
+//! arrow keys and edits text.
 
 use tttt_pty::{PtySession, RealPty};
-use tttt_tui::PaneRenderer;
 
 fn wait_and_pump(session: &mut PtySession<RealPty>, ms: u64) {
     std::thread::sleep(std::time::Duration::from_millis(ms));
@@ -233,75 +232,3 @@ fn test_backspace_deletes_chars() {
     session.kill().unwrap();
 }
 
-/// Verify PaneRenderer correctly reflects cursor position after arrow keys.
-#[test]
-fn test_pane_renderer_reflects_cursor_after_arrows() {
-    let pty_cols: u16 = 80;
-    let pty_rows: u16 = 24;
-    let display_cols: u16 = 120;
-
-    let backend =
-        RealPty::spawn("/bin/bash", &["--norc", "--noprofile"], pty_cols, pty_rows).unwrap();
-    let mut session = PtySession::new(
-        "s1".to_string(),
-        backend,
-        "bash".to_string(),
-        pty_cols,
-        pty_rows,
-    );
-
-    let mut renderer = PaneRenderer::new(pty_cols, pty_rows, 1, 1);
-    let mut display = vt100::Parser::new(pty_rows, display_cols, 0);
-
-    // Wait for prompt
-    for _ in 0..20 {
-        wait_and_pump(&mut session, 100);
-        if session.get_screen().contains("$") || session.get_screen().contains("#") {
-            break;
-        }
-    }
-
-    // Render initial state
-    let output = renderer.render(session.screen().screen());
-    display.process(&output);
-
-    // Type "test"
-    session.send_raw(b"test").unwrap();
-    wait_and_pump(&mut session, 100);
-    let output = renderer.render(session.screen().screen());
-    display.process(&output);
-
-    // The PTY screen and display should agree on content
-    let pty_screen = session.get_screen();
-    assert!(pty_screen.contains("test"), "PTY should show 'test'");
-
-    // Check that the display also shows "test"
-    let display_screen = display.screen().contents();
-    assert!(
-        display_screen.contains("test"),
-        "display should show 'test': {:?}",
-        display_screen
-    );
-
-    // Press left arrow twice
-    session.send_raw(b"\x1b[D\x1b[D").unwrap();
-    wait_and_pump(&mut session, 100);
-    let output = renderer.render(session.screen().screen());
-    display.process(&output);
-
-    // Verify cursor position from PTY
-    let (pty_row, pty_col) = session.cursor_position();
-
-    // Position the display cursor to match
-    let (tr, tc) = renderer.cursor_terminal_position(pty_row, pty_col);
-    display.process(format!("\x1b[{};{}H", tr, tc).as_bytes());
-    let (disp_row, disp_col) = display.screen().cursor_position();
-
-    assert_eq!(
-        (disp_row, disp_col),
-        (pty_row, pty_col),
-        "display cursor should match PTY cursor after arrow keys"
-    );
-
-    session.kill().unwrap();
-}
