@@ -4,11 +4,15 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tttt_log::{SessionReplay, SqliteLogger};
 use tttt_pty::{MockPty, PtyBackend, PtySession, SessionManager, SessionStatus};
 use tttt_scheduler::Scheduler;
+
+/// A token that can be checked by long-running tool handlers to detect cancellation.
+pub type CancelToken = Arc<AtomicBool>;
 
 /// Parse a rate limit reset time string from PTY screen text.
 /// Looks for patterns like "resets 2pm (Europe/Brussels)" or "resets 2:30pm (US/Pacific)".
@@ -89,6 +93,10 @@ pub trait ToolHandler: Send {
 
     /// Return the list of tool definitions this handler provides.
     fn tool_definitions(&self) -> Vec<Value>;
+
+    /// Set a cancellation token for the next long-running tool call.
+    /// The handler should check this token periodically and return early if set.
+    fn set_cancel_token(&mut self, _token: CancelToken) {}
 }
 
 /// Shared session manager type used by both the TUI and MCP server.
@@ -101,6 +109,7 @@ pub struct PtyToolHandler<B: PtyBackend> {
     default_cols: u16,
     default_rows: u16,
     sqlite_logger: Option<Arc<Mutex<SqliteLogger>>>,
+    cancel_token: Option<CancelToken>,
 }
 
 impl<B: PtyBackend> PtyToolHandler<B> {
@@ -112,6 +121,7 @@ impl<B: PtyBackend> PtyToolHandler<B> {
             default_cols: 80,
             default_rows: 24,
             sqlite_logger: None,
+            cancel_token: None,
         }
     }
 
@@ -129,6 +139,13 @@ impl<B: PtyBackend> PtyToolHandler<B> {
     /// Access the shared session manager.
     pub fn manager(&self) -> &SharedSessionManager<B> {
         &self.manager
+    }
+
+    /// Check if the current operation has been cancelled.
+    fn is_cancelled(&self) -> bool {
+        self.cancel_token
+            .as_ref()
+            .map_or(false, |t| t.load(Ordering::Relaxed))
     }
 
     fn handle_pty_list(&self) -> Result<Value> {
@@ -240,6 +257,9 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
         loop {
+            if self.is_cancelled() {
+                return Ok(json!({"status": "cancelled"}));
+            }
             {
                 let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
                 let session = mgr.get_mut(session_id)?;
@@ -260,11 +280,23 @@ impl<B: PtyBackend> PtyToolHandler<B> {
     }
 
     fn handle_pty_wait_for_idle(&self, args: &Value) -> Result<Value> {
+        let pid = std::process::id();
+        let debug_path = format!("/tmp/tttt-{}-debug.txt", pid);
+        let mut debug_log = |msg: &str| {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true).open(&debug_path)
+            {
+                let _ = writeln!(f, "[{:?}] [wait_for_idle] {}", std::time::SystemTime::now(), msg);
+            }
+        };
+
         let session_id = args["session_id"]
             .as_str()
             .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
         let idle_threshold = args["idle_seconds"].as_f64().unwrap_or(10.0);
         let timeout_secs = args["timeout"].as_f64().unwrap_or(300.0);
+        debug_log(&format!("started: session={}, idle_threshold={}, timeout={}", session_id, idle_threshold, timeout_secs));
 
         let ignore_re = if let Some(pat) = args["ignore_pattern"].as_str() {
             Some(regex::Regex::new(pat).map_err(|e| {
@@ -283,6 +315,10 @@ impl<B: PtyBackend> PtyToolHandler<B> {
             let mut hash_stable_since = Instant::now();
 
             loop {
+                if self.is_cancelled() {
+                    debug_log("cancelled by client");
+                    return Ok(json!({"status": "cancelled"}));
+                }
                 let (screen, last_line) = {
                     let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
                     let session = mgr.get_mut(session_id)?;
@@ -317,14 +353,22 @@ impl<B: PtyBackend> PtyToolHandler<B> {
                 std::thread::sleep(Duration::from_secs(1));
             }
         } else {
+            let mut iteration = 0u32;
             loop {
+                iteration += 1;
+                if self.is_cancelled() {
+                    debug_log("cancelled by client");
+                    return Ok(json!({"status": "cancelled"}));
+                }
                 let (current_idle, last_line) = {
                     let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
                     let session = mgr.get_mut(session_id)?;
                     session.pump()?;
                     (session.idle_seconds(), session.last_non_empty_line())
                 };
+                debug_log(&format!("iter={}, idle={:.1}s, elapsed={:.1}s", iteration, current_idle, start.elapsed().as_secs_f64()));
                 if current_idle >= idle_threshold {
+                    debug_log("returning idle");
                     return Ok(json!({
                         "status": "idle",
                         "idle_seconds": current_idle,
@@ -332,6 +376,7 @@ impl<B: PtyBackend> PtyToolHandler<B> {
                     }));
                 }
                 if Instant::now() >= deadline {
+                    debug_log("returning timeout");
                     return Ok(json!({
                         "status": "timeout",
                         "idle_seconds": current_idle,
@@ -443,7 +488,17 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         let reset_time_str = format!("{:02}:{:02}", hour_24, minute);
 
         // Sleep until the rate limit resets (lock is not held).
-        std::thread::sleep(wait_duration);
+        // Check cancellation every second during the wait.
+        let wait_deadline = Instant::now() + wait_duration;
+        while Instant::now() < wait_deadline {
+            if self.is_cancelled() {
+                return Ok(json!({
+                    "status": "cancelled",
+                    "message": "Rate limit wait cancelled by client"
+                }));
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
 
         // Send "a" to the session (always / wait option).
         {
@@ -571,6 +626,10 @@ impl ToolHandler for PtyToolHandler<tttt_pty::RealPty> {
     fn tool_definitions(&self) -> Vec<Value> {
         crate::tools::pty_tool_definitions()
     }
+
+    fn set_cancel_token(&mut self, token: CancelToken) {
+        self.cancel_token = Some(token);
+    }
 }
 
 impl PtyToolHandler<tttt_pty::AnyPty> {
@@ -645,6 +704,10 @@ impl ToolHandler for PtyToolHandler<tttt_pty::AnyPty> {
     fn tool_definitions(&self) -> Vec<Value> {
         crate::tools::pty_tool_definitions()
     }
+
+    fn set_cancel_token(&mut self, token: CancelToken) {
+        self.cancel_token = Some(token);
+    }
 }
 
 impl ToolHandler for PtyToolHandler<MockPty> {
@@ -671,6 +734,10 @@ impl ToolHandler for PtyToolHandler<MockPty> {
 
     fn tool_definitions(&self) -> Vec<Value> {
         crate::tools::pty_tool_definitions()
+    }
+
+    fn set_cancel_token(&mut self, token: CancelToken) {
+        self.cancel_token = Some(token);
     }
 }
 
@@ -713,6 +780,12 @@ impl ToolHandler for CompositeToolHandler {
             .iter()
             .flat_map(|h| h.tool_definitions())
             .collect()
+    }
+
+    fn set_cancel_token(&mut self, token: CancelToken) {
+        for handler in &mut self.handlers {
+            handler.set_cancel_token(token.clone());
+        }
     }
 }
 

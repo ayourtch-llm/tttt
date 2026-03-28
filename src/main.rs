@@ -417,11 +417,10 @@ fn find_tttt_socket() -> SocketResult {
 fn run_proxy_mcp_server(socket_path: &str) {
     use tttt_mcp::proxy::run_proxy;
 
-    let stdin = std::io::stdin().lock();
+    let stdin = std::io::stdin();
     let stdout = std::io::stdout().lock();
-    let reader = std::io::BufReader::new(stdin);
 
-    if let Err(e) = run_proxy(reader, stdout, socket_path) {
+    if let Err(e) = run_proxy(stdin, stdout, socket_path) {
         eprintln!("MCP proxy error: {}", e);
         std::process::exit(1);
     }

@@ -8,7 +8,7 @@ mod tools;
 
 pub use error::{McpError, Result};
 pub use handler::{
-    CompositeToolHandler, NotificationToolHandler, PtyToolHandler, ReplayToolHandler,
+    CancelToken, CompositeToolHandler, NotificationToolHandler, PtyToolHandler, ReplayToolHandler,
     SchedulerToolHandler, ScratchpadToolHandler, SharedNotificationRegistry, SharedScheduler,
     SharedScratchpad, SharedSessionManager, SharedSidebarMessages, SidebarMessageToolHandler,
     ToolHandler,

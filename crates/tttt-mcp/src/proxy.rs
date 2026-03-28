@@ -9,6 +9,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
 
 /// Maximum number of reconnect attempts before giving up on a single request.
 const MAX_RECONNECT_ATTEMPTS: u32 = 30;
@@ -70,67 +71,266 @@ fn reinitialize(socket: &mut UnixStream) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// Events sent from reader threads to the main proxy event loop.
+enum ProxyEvent {
+    /// A complete JSON-RPC line read from stdin.
+    StdinLine(String),
+    /// Stdin reached EOF.
+    StdinEof,
+    /// A complete length-prefixed response read from the socket.
+    SocketResponse(Vec<u8>),
+    /// The socket reader encountered an error or EOF.
+    SocketError,
+}
+
+/// Spawn a thread that reads length-prefixed messages from a socket
+/// and sends them as `ProxyEvent::SocketResponse` over the channel.
+/// Returns the thread handle.
+fn spawn_socket_reader(
+    socket: UnixStream,
+    tx: mpsc::Sender<ProxyEvent>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(socket);
+        loop {
+            let mut len_buf = [0u8; 4];
+            if reader.read_exact(&mut len_buf).is_err() {
+                let _ = tx.send(ProxyEvent::SocketError);
+                return;
+            }
+            let resp_len = u32::from_be_bytes(len_buf) as usize;
+            let mut resp_buf = vec![0u8; resp_len];
+            if reader.read_exact(&mut resp_buf).is_err() {
+                let _ = tx.send(ProxyEvent::SocketError);
+                return;
+            }
+            if tx.send(ProxyEvent::SocketResponse(resp_buf)).is_err() {
+                return; // receiver dropped
+            }
+        }
+    })
+}
+
 /// Run the MCP proxy: forward JSON-RPC between stdio and a Unix socket.
 ///
-/// - Reads JSON-RPC lines from `reader` (Claude's stdin)
-/// - Forwards each line to the Unix socket (tttt TUI)
-/// - Reads response from socket
-/// - Writes response to `writer` (Claude's stdout)
+/// - Reads JSON-RPC lines from `reader` (Claude's stdin) in a background thread
+/// - Reads responses from the Unix socket (tttt TUI) in another background thread
+/// - Main thread coordinates: forwards requests to socket, responses to `writer`
+///
+/// The concurrent design ensures that notifications (like cancellations) are
+/// forwarded immediately, even while waiting for a long-running tool response.
 ///
 /// On socket disconnection (e.g., during tttt live reload via execv),
 /// automatically reconnects and retries the current request.
-pub fn run_proxy<R: BufRead, W: Write>(
-    mut reader: R,
+pub fn run_proxy<R: Read + Send + 'static, W: Write>(
+    reader: R,
     mut writer: W,
     socket_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut socket = UnixStream::connect(socket_path)?;
+    let (tx, rx) = mpsc::channel();
 
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            break; // EOF from Claude
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let is_notification = is_jsonrpc_notification(trimmed);
-        let request_bytes = trimmed.as_bytes();
-
-        // Try to send request; on failure, reconnect and retry
-        let response = match send_and_receive(&mut socket, request_bytes, is_notification) {
-            Ok(resp) => resp,
-            Err(_) => {
-                // Connection lost — likely a live reload. Reconnect.
-                socket = connect_with_retry(socket_path, MAX_RECONNECT_ATTEMPTS)?;
-                reinitialize(&mut socket)?;
-                send_and_receive(&mut socket, request_bytes, is_notification)
-                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?
+    // Spawn stdin reader thread
+    let stdin_tx = tx.clone();
+    std::thread::spawn(move || {
+        let mut buf_reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match buf_reader.read_line(&mut line) {
+                Ok(0) | Err(_) => {
+                    let _ = stdin_tx.send(ProxyEvent::StdinEof);
+                    return;
+                }
+                Ok(_) => {
+                    let trimmed = line.trim().to_string();
+                    if !trimmed.is_empty() {
+                        if stdin_tx.send(ProxyEvent::StdinLine(trimmed)).is_err() {
+                            return;
+                        }
+                    }
+                }
             }
-        };
+        }
+    });
 
-        if let Some(resp_buf) = response {
-            writer.write_all(&resp_buf)?;
-            writer.write_all(b"\n")?;
-            writer.flush()?;
+    // Connect to TUI socket and spawn socket reader thread
+    let mut socket = UnixStream::connect(socket_path)?;
+    let socket_read = socket.try_clone()?;
+    // Keep a sender clone for spawning new socket reader threads on reconnect.
+    // Set to None when draining to allow the channel to close.
+    let mut master_tx = Some(tx);
+    spawn_socket_reader(socket_read, master_tx.as_ref().unwrap().clone());
+
+    let mut draining = false;
+
+    for event in &rx {
+        match event {
+            ProxyEvent::StdinLine(line) => {
+                if draining {
+                    continue;
+                }
+
+                let req_bytes = line.as_bytes();
+                let len = req_bytes.len() as u32;
+
+                match socket
+                    .write_all(&len.to_be_bytes())
+                    .and_then(|_| socket.write_all(req_bytes))
+                    .and_then(|_| socket.flush())
+                {
+                    Ok(()) => {}
+                    Err(_) => {
+                        // Connection lost — likely a live reload. Reconnect.
+                        socket =
+                            connect_with_retry(socket_path, MAX_RECONNECT_ATTEMPTS)?;
+                        reinitialize(&mut socket)?;
+                        let new_read = socket.try_clone()?;
+                        spawn_socket_reader(
+                            new_read,
+                            master_tx.as_ref().unwrap().clone(),
+                        );
+
+                        // Retry the write
+                        socket.write_all(&len.to_be_bytes())?;
+                        socket.write_all(req_bytes)?;
+                        socket.flush()?;
+                    }
+                }
+            }
+            ProxyEvent::SocketResponse(resp) => {
+                writer.write_all(&resp)?;
+                writer.write_all(b"\n")?;
+                writer.flush()?;
+            }
+            ProxyEvent::StdinEof => {
+                draining = true;
+                let _ = socket.shutdown(std::net::Shutdown::Write);
+                // Drop master sender so channel closes when threads exit
+                master_tx = None;
+            }
+            ProxyEvent::SocketError => {
+                if draining {
+                    continue;
+                }
+                // Proactively reconnect so we're ready for the next request
+                if let Ok(new_socket) =
+                    connect_with_retry(socket_path, MAX_RECONNECT_ATTEMPTS)
+                {
+                    socket = new_socket;
+                    if reinitialize(&mut socket).is_ok() {
+                        if let Ok(new_read) = socket.try_clone() {
+                            spawn_socket_reader(
+                                new_read,
+                                master_tx.as_ref().unwrap().clone(),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
     Ok(())
 }
 
-/// Check if a JSON-RPC request is a notification (id is null or missing)
+/// Check if a JSON-RPC request is a notification (id is null or missing).
+/// Per JSON-RPC 2.0, a notification has no "id" field or "id" is null.
+#[cfg(test)]
 fn is_jsonrpc_notification(line: &str) -> bool {
-    // Quick check: look for "id":null or "id": null
-    line.contains("\"id\":null") || line.contains("\"id\": null")
+    match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(v) => match v.get("id") {
+            None => true,
+            Some(id) => id.is_null(),
+        },
+        Err(_) => false,
+    }
+}
+
+/// Events from the TUI-side socket reader thread.
+enum TuiSocketEvent {
+    /// A complete request read from the socket.
+    Request(Vec<u8>),
+    /// A cancellation notification was received (already applied to cancel token).
+    CancelReceived,
+    /// The socket reader encountered EOF or an error.
+    Eof,
+}
+
+/// Read length-prefixed messages from a socket and send them over a channel.
+/// Cancel notifications are detected inline and immediately applied to the
+/// cancel token, so long-running handlers can observe cancellation promptly.
+fn spawn_tui_socket_reader(
+    socket: UnixStream,
+    tx: mpsc::Sender<TuiSocketEvent>,
+    cancel_token: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    debug_path: String,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let debug_log = |msg: &str| {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&debug_path)
+            {
+                let _ = writeln!(
+                    f,
+                    "[{:?}] [tui-reader] {}",
+                    std::time::SystemTime::now(),
+                    msg
+                );
+            }
+        };
+
+        let mut reader = BufReader::new(socket);
+        loop {
+            let mut len_buf = [0u8; 4];
+            match reader.read_exact(&mut len_buf) {
+                Ok(()) => {}
+                Err(_) => {
+                    debug_log("EOF/error on socket read");
+                    let _ = tx.send(TuiSocketEvent::Eof);
+                    return;
+                }
+            }
+            let req_len = u32::from_be_bytes(len_buf) as usize;
+            let mut req_buf = vec![0u8; req_len];
+            if reader.read_exact(&mut req_buf).is_err() {
+                debug_log("EOF/error reading request body");
+                let _ = tx.send(TuiSocketEvent::Eof);
+                return;
+            }
+
+            // Check for cancel notifications inline and set the token immediately
+            let req_str = String::from_utf8_lossy(&req_buf);
+            if req_str.contains("notifications/cancelled") {
+                debug_log(&format!(
+                    "cancel notification detected, setting token: {}",
+                    &req_str[..req_str.len().min(200)]
+                ));
+                cancel_token.store(true, std::sync::atomic::Ordering::Relaxed);
+                if tx.send(TuiSocketEvent::CancelReceived).is_err() {
+                    return;
+                }
+            } else {
+                debug_log(&format!(
+                    "forwarding request len={}: {}",
+                    req_buf.len(),
+                    &req_str[..req_str.len().min(200)]
+                ));
+                if tx.send(TuiSocketEvent::Request(req_buf)).is_err() {
+                    return;
+                }
+            }
+        }
+    })
 }
 
 /// Server-side handler: reads proxied requests from a Unix socket,
 /// processes them using a ToolHandler, and sends responses back.
+///
+/// Uses a reader thread so that cancellation notifications can be detected
+/// while a long-running tool call (like wait_for_idle) is executing.
 ///
 /// This runs in a thread within the TUI process.
 pub fn handle_proxy_client<H: crate::handler::ToolHandler>(
@@ -138,37 +338,132 @@ pub fn handle_proxy_client<H: crate::handler::ToolHandler>(
     handler: &mut H,
     server_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut writer = stream;
+    let mut writer = stream.try_clone()?;
+
+    let pid = std::process::id();
+    let debug_path = format!("/tmp/tttt-{}-debug.txt", pid);
+    let debug_path_clone = debug_path.clone();
+    let debug_log = move |msg: &str| {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&debug_path_clone)
+        {
+            let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
+        }
+    };
+    debug_log(&format!("proxy started, debug_path={}", debug_path));
+
+    // Cancel token shared between the reader thread and the handler.
+    // The reader thread sets it when it detects a cancel notification;
+    // long-running handlers check it each iteration.
+    let cancel_token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Spawn reader thread to decouple socket reads from request processing.
+    let (tx, rx) = mpsc::channel();
+    let _reader_handle =
+        spawn_tui_socket_reader(stream, tx, cancel_token.clone(), debug_path.clone());
 
     loop {
-        // Read length-prefixed request
-        let mut len_buf = [0u8; 4];
-        match reader.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(Box::new(e)),
-        }
-        let req_len = u32::from_be_bytes(len_buf) as usize;
-        let mut req_buf = vec![0u8; req_len];
-        reader.read_exact(&mut req_buf)?;
+        debug_log("waiting for request...");
+        let req_buf = match rx.recv() {
+            Ok(TuiSocketEvent::Request(buf)) => buf,
+            Ok(TuiSocketEvent::CancelReceived) => {
+                debug_log("cancel received while idle (no active tool call), ignoring");
+                continue;
+            }
+            Ok(TuiSocketEvent::Eof) | Err(_) => {
+                debug_log("EOF on read, breaking");
+                break;
+            }
+        };
 
         let req_str = String::from_utf8_lossy(&req_buf);
+        debug_log(&format!(
+            "got request len={}: {}",
+            req_buf.len(),
+            &req_str[..req_str.len().min(200)]
+        ));
 
-        // Parse and process the JSON-RPC request
+        // Check if this is a tools/call (potentially long-running)
+        let is_tools_call = req_str.contains("\"method\":\"tools/call\"")
+            || req_str.contains("\"method\": \"tools/call\"");
+
+        if is_tools_call {
+            // Reset cancel token and set it on the handler before processing
+            cancel_token.store(false, std::sync::atomic::Ordering::Relaxed);
+            handler.set_cancel_token(cancel_token.clone());
+            debug_log("tools/call: cancel token armed, processing...");
+        }
+
+        // Process the request (may block for a long time on tools/call).
+        // During this time, the reader thread continues reading from the socket
+        // and will set cancel_token if a cancel notification arrives.
         let response = process_jsonrpc_request(&req_str, handler, server_name);
+        debug_log(&format!(
+            "response len={}: {}",
+            response.len(),
+            &response[..response.len().min(200)]
+        ));
+
+        // After processing, drain any pending messages that arrived while blocked.
+        loop {
+            match rx.try_recv() {
+                Ok(TuiSocketEvent::Request(pending_buf)) => {
+                    let pending_str = String::from_utf8_lossy(&pending_buf);
+                    debug_log(&format!(
+                        "draining pending request len={}: {}",
+                        pending_buf.len(),
+                        &pending_str[..pending_str.len().min(200)]
+                    ));
+                    // Process the queued request
+                    let pending_response =
+                        process_jsonrpc_request(&pending_str, handler, server_name);
+                    if !pending_response.is_empty() {
+                        debug_log(&format!(
+                            "sending pending response len={}",
+                            pending_response.len()
+                        ));
+                        let resp_bytes = pending_response.as_bytes();
+                        let resp_len = resp_bytes.len() as u32;
+                        writer.write_all(&resp_len.to_be_bytes())?;
+                        writer.write_all(resp_bytes)?;
+                        writer.flush()?;
+                        debug_log("pending response sent");
+                    }
+                }
+                Ok(TuiSocketEvent::CancelReceived) => {
+                    debug_log("cancel notification consumed from pending queue");
+                }
+                Ok(TuiSocketEvent::Eof) => {
+                    debug_log("EOF while draining pending");
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
 
         // Skip sending for notifications (empty response)
         if response.is_empty() {
+            debug_log("notification (empty response), continuing");
             continue;
         }
 
         // Send length-prefixed response
         let resp_bytes = response.as_bytes();
         let resp_len = resp_bytes.len() as u32;
-        writer.write_all(&resp_len.to_be_bytes())?;
+        match writer.write_all(&resp_len.to_be_bytes()) {
+            Ok(()) => {}
+            Err(e) => {
+                debug_log(&format!("write error: {}", e));
+                return Err(Box::new(e));
+            }
+        }
         writer.write_all(resp_bytes)?;
         writer.flush()?;
+        debug_log("response sent");
     }
 
     Ok(())
@@ -281,6 +576,19 @@ mod tests {
     #[test]
     fn test_is_not_notification_id_zero() {
         assert!(!is_jsonrpc_notification(r#"{"id":0,"method":"ping"}"#));
+    }
+
+    #[test]
+    fn test_is_notification_missing_id() {
+        // JSON-RPC 2.0: a request with no "id" field at all is a notification
+        assert!(is_jsonrpc_notification(
+            r#"{"method":"notifications/cancelled","params":{"requestId":2}}"#
+        ));
+    }
+
+    #[test]
+    fn test_is_not_notification_invalid_json() {
+        assert!(!is_jsonrpc_notification("not json {{{"));
     }
 
     // ── process_jsonrpc_request ──────────────────────────────────────────────
