@@ -11,6 +11,19 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 
+/// Truncate a string to at most `max_bytes` bytes, ensuring the cut
+/// falls on a UTF-8 char boundary so slicing never panics.
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Maximum number of reconnect attempts before giving up on a single request.
 const MAX_RECONNECT_ATTEMPTS: u32 = 30;
 
@@ -421,7 +434,7 @@ fn spawn_tui_socket_reader(
             if req_str.contains("notifications/cancelled") {
                 debug_log(&format!(
                     "cancel notification detected, setting token: {}",
-                    &req_str[..req_str.len().min(200)]
+                    truncate_str(&req_str, 200)
                 ));
                 cancel_token.store(true, std::sync::atomic::Ordering::Relaxed);
                 if tx.send(TuiSocketEvent::CancelReceived).is_err() {
@@ -432,7 +445,7 @@ fn spawn_tui_socket_reader(
                     "forwarding request len={} ndjson={}: {}",
                     req_buf.len(),
                     is_ndjson,
-                    &req_str[..req_str.len().min(200)]
+                    truncate_str(&req_str, 200)
                 ));
                 if tx.send(TuiSocketEvent::Request(req_buf, is_ndjson)).is_err() {
                     return;
@@ -499,7 +512,7 @@ pub fn handle_proxy_client<H: crate::handler::ToolHandler>(
         debug_log(&format!(
             "got request len={}: {}",
             req_buf.len(),
-            &req_str[..req_str.len().min(200)]
+            truncate_str(&req_str, 200)
         ));
 
         // Check if this is a tools/call (potentially long-running)
@@ -520,7 +533,7 @@ pub fn handle_proxy_client<H: crate::handler::ToolHandler>(
         debug_log(&format!(
             "response len={}: {}",
             response.len(),
-            &response[..response.len().min(200)]
+            truncate_str(&response, 200)
         ));
 
         // After processing, drain any pending messages that arrived while blocked.
@@ -531,7 +544,7 @@ pub fn handle_proxy_client<H: crate::handler::ToolHandler>(
                     debug_log(&format!(
                         "draining pending request len={}: {}",
                         pending_buf.len(),
-                        &pending_str[..pending_str.len().min(200)]
+                        truncate_str(&pending_str, 200)
                     ));
                     // Process the queued request
                     let pending_response =

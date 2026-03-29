@@ -35,13 +35,27 @@ impl<'a> SidebarWidget<'a> {
 
 /// Truncate a string to at most `max_len` characters. If truncation occurs and
 /// `max_len > 3`, the result ends with `"..."`.
+/// Return the largest byte index ≤ `max_bytes` that sits on a char boundary.
+fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
+    if max_bytes >= s.len() {
+        return s.len();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else if max_len > 3 {
-        format!("{}...", &s[..max_len - 3])
+        let end = floor_char_boundary(s, max_len - 3);
+        format!("{}...", &s[..end])
     } else {
-        s[..max_len].to_string()
+        let end = floor_char_boundary(s, max_len);
+        s[..end].to_string()
     }
 }
 
@@ -80,7 +94,7 @@ impl<'a> Widget for SidebarWidget<'a> {
         } else {
             "TERMINALS.".to_string()
         };
-        let padded_header = format!("{:width$}", &header_text[..header_text.len().min(usable_width)], width = usable_width);
+        let padded_header = format!("{:width$}", &header_text[..floor_char_boundary(&header_text, usable_width)], width = usable_width);
         render_line(0, &padded_header, inactive_style, buf);
 
         // --- Row 1: Separator ---
@@ -106,7 +120,7 @@ impl<'a> Widget for SidebarWidget<'a> {
             let name_width = usable_width.saturating_sub(3);
             let truncated_name = truncate(display_name, name_width);
             let label = format!("{}{} {}", i, status_char, truncated_name);
-            let padded_label = format!("{:width$}", &label[..label.len().min(usable_width)], width = usable_width);
+            let padded_label = format!("{:width$}", &label[..floor_char_boundary(&label, usable_width)], width = usable_width);
             render_line(row, &padded_label, style, buf);
             row += 1;
         }
