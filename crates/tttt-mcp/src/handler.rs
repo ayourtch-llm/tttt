@@ -1332,16 +1332,16 @@ impl<B: PtyBackend> TuiToolHandler<B> {
             .as_str()
             .ok_or_else(|| McpError::InvalidParams("session_id required".into()))?;
 
-        // Verify the session exists
+        // Resolve name to canonical session ID (e.g. "my-shell" → "pty-0")
         let mgr = self.sessions.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
-        mgr.get(session_id).map_err(|_| {
+        let resolved_id = mgr.resolve_id(session_id).map_err(|_| {
             McpError::InvalidParams(format!("session '{}' not found", session_id))
-        })?;
+        })?.to_string();
         drop(mgr);
 
-        *self.tui_state.pending_switch.lock().unwrap() = Some(session_id.to_string());
+        *self.tui_state.pending_switch.lock().unwrap() = Some(resolved_id.clone());
         self.tui_state.dirty.store(true, Ordering::Relaxed);
-        Ok(json!({"status": "ok", "switched_to": session_id}))
+        Ok(json!({"status": "ok", "switched_to": resolved_id}))
     }
 
     fn handle_tui_get_info(&self) -> Result<Value> {
@@ -1373,10 +1373,15 @@ impl<B: PtyBackend> TuiToolHandler<B> {
     }
 
     fn handle_tui_highlight(&self, args: &Value) -> Result<Value> {
-        let session_id = args["session_id"]
+        let raw_session_id = args["session_id"]
             .as_str()
-            .ok_or_else(|| McpError::InvalidParams("session_id required".into()))?
-            .to_string();
+            .ok_or_else(|| McpError::InvalidParams("session_id required".into()))?;
+        // Resolve name to canonical session ID
+        let mgr = self.sessions.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+        let session_id = mgr.resolve_id(raw_session_id).map_err(|_| {
+            McpError::InvalidParams(format!("session '{}' not found", raw_session_id))
+        })?.to_string();
+        drop(mgr);
         let highlight_id = args["id"]
             .as_str()
             .ok_or_else(|| McpError::InvalidParams("id required".into()))?
@@ -2939,6 +2944,53 @@ mod tests {
         let pending = handler.tui_state.pending_switch.lock().unwrap().clone();
         assert_eq!(pending, Some("pty-1".to_string()));
         assert!(handler.tui_state.dirty.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_tui_switch_by_name_resolves_to_id() {
+        // Add a named session
+        let sessions: SharedSessionManager<MockPty> = Arc::new(Mutex::new(SessionManager::new()));
+        let session = tttt_pty::PtySession::new(
+            "pty-1".to_string(),
+            MockPty::new(80, 24),
+            "bash".to_string(),
+            80, 24,
+        );
+        sessions.lock().unwrap().add_session_with_name(session, "my-shell".to_string()).unwrap();
+        let tui_state = Arc::new(TuiState::new());
+        let mut handler = TuiToolHandler::new(tui_state.clone(), sessions, 120, 40);
+
+        // Switch using the name
+        let result = handler.handle_tool_call("tttt_tui_switch", &json!({"session_id": "my-shell"})).unwrap();
+        // Should resolve to the canonical ID, not the name
+        assert_eq!(result["switched_to"], "pty-1");
+        let pending = tui_state.pending_switch.lock().unwrap().clone();
+        assert_eq!(pending, Some("pty-1".to_string()));
+    }
+
+    #[test]
+    fn test_tui_highlight_by_name_resolves_to_id() {
+        let sessions: SharedSessionManager<MockPty> = Arc::new(Mutex::new(SessionManager::new()));
+        let session = tttt_pty::PtySession::new(
+            "pty-1".to_string(),
+            MockPty::new(80, 24),
+            "bash".to_string(),
+            80, 24,
+        );
+        sessions.lock().unwrap().add_session_with_name(session, "my-shell".to_string()).unwrap();
+        let tui_state = Arc::new(TuiState::new());
+        let mut handler = TuiToolHandler::new(tui_state.clone(), sessions, 120, 40);
+
+        // Add highlight using the name
+        let result = handler.handle_tool_call("tttt_tui_highlight", &json!({
+            "session_id": "my-shell", "id": "h1", "color": "red",
+            "x": 0, "y": 0, "width": 10, "height": 1
+        })).unwrap();
+        assert_eq!(result["status"], "ok");
+        // Highlight should be keyed by canonical ID
+        let highlights = tui_state.highlights.lock().unwrap();
+        assert!(highlights.contains_key("pty-1"));
+        assert!(!highlights.contains_key("my-shell"));
     }
 
     #[test]
