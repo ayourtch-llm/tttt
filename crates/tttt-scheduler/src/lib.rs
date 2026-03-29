@@ -205,37 +205,81 @@ impl Default for Scheduler {
     }
 }
 
-/// Parse a simple interval expression.
-/// Supports: "10s", "5m", "1h", "*/5" (interpreted as every 5 minutes).
+/// Parse an interval expression.
+///
+/// Supports multiple formats:
+/// - Compact: "10s", "5m", "1h"
+/// - Cron-style: "*/5 * * * *" (every 5 minutes), "*/1 * * * *" (every minute)
+/// - Shorthand cron: "*/5" (every 5 minutes)
+/// - Human: "every 30 seconds", "every 2 minutes", "every 1 hour"
 fn parse_interval(expr: &str) -> Result<Duration> {
     let expr = expr.trim();
 
+    // Compact: "10s", "5m", "1h"
     if let Some(secs) = expr.strip_suffix('s') {
-        let n: u64 = secs
-            .parse()
-            .map_err(|_| SchedulerError::InvalidExpression(expr.to_string()))?;
-        return Ok(Duration::from_secs(n));
+        if let Ok(n) = secs.parse::<u64>() {
+            return Ok(Duration::from_secs(n));
+        }
     }
 
     if let Some(mins) = expr.strip_suffix('m') {
-        let n: u64 = mins
-            .parse()
-            .map_err(|_| SchedulerError::InvalidExpression(expr.to_string()))?;
-        return Ok(Duration::from_secs(n * 60));
+        if let Ok(n) = mins.parse::<u64>() {
+            return Ok(Duration::from_secs(n * 60));
+        }
     }
 
     if let Some(hours) = expr.strip_suffix('h') {
-        let n: u64 = hours
-            .parse()
-            .map_err(|_| SchedulerError::InvalidExpression(expr.to_string()))?;
-        return Ok(Duration::from_secs(n * 3600));
+        if let Ok(n) = hours.parse::<u64>() {
+            return Ok(Duration::from_secs(n * 3600));
+        }
     }
 
+    // Standard 5-field cron: only "*/N" in the first (minute) field is supported.
+    // Matches "*/1 * * * *", "*/5 * * * *", etc.
+    {
+        let fields: Vec<&str> = expr.split_whitespace().collect();
+        if fields.len() == 5 && fields[1..] == ["*", "*", "*", "*"] {
+            if let Some(n_str) = fields[0].strip_prefix("*/") {
+                if let Ok(n) = n_str.parse::<u64>() {
+                    if n > 0 {
+                        return Ok(Duration::from_secs(n * 60));
+                    }
+                }
+            }
+        }
+    }
+
+    // Shorthand cron: "*/5" (every 5 minutes)
     if let Some(interval) = expr.strip_prefix("*/") {
-        let n: u64 = interval
-            .parse()
-            .map_err(|_| SchedulerError::InvalidExpression(expr.to_string()))?;
-        return Ok(Duration::from_secs(n * 60));
+        if let Ok(n) = interval.parse::<u64>() {
+            if n > 0 {
+                return Ok(Duration::from_secs(n * 60));
+            }
+        }
+    }
+
+    // Human: "every N second(s)/minute(s)/hour(s)"
+    if let Some(rest) = expr.strip_prefix("every ").or_else(|| expr.strip_prefix("every\t")) {
+        let rest = rest.trim();
+        // Split into number and unit
+        let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
+        if parts.len() == 2 {
+            if let Ok(n) = parts[0].parse::<u64>() {
+                let unit = parts[1].trim().to_lowercase();
+                match unit.as_str() {
+                    "second" | "seconds" | "sec" | "secs" | "s" => {
+                        return Ok(Duration::from_secs(n));
+                    }
+                    "minute" | "minutes" | "min" | "mins" | "m" => {
+                        return Ok(Duration::from_secs(n * 60));
+                    }
+                    "hour" | "hours" | "hr" | "hrs" | "h" => {
+                        return Ok(Duration::from_secs(n * 3600));
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     Err(SchedulerError::InvalidExpression(expr.to_string()))
@@ -450,14 +494,47 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_interval_cron_style() {
+    fn test_parse_interval_cron_shorthand() {
         assert_eq!(parse_interval("*/5").unwrap(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_parse_interval_cron_5_field() {
+        // "*/1 * * * *" = every 1 minute
+        assert_eq!(parse_interval("*/1 * * * *").unwrap(), Duration::from_secs(60));
+        // "*/5 * * * *" = every 5 minutes
+        assert_eq!(parse_interval("*/5 * * * *").unwrap(), Duration::from_secs(300));
+        // "*/30 * * * *" = every 30 minutes
+        assert_eq!(parse_interval("*/30 * * * *").unwrap(), Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn test_parse_interval_human_seconds() {
+        assert_eq!(parse_interval("every 30 seconds").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_interval("every 1 second").unwrap(), Duration::from_secs(1));
+        assert_eq!(parse_interval("every 10 secs").unwrap(), Duration::from_secs(10));
+        assert_eq!(parse_interval("every 5 s").unwrap(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_parse_interval_human_minutes() {
+        assert_eq!(parse_interval("every 1 minute").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_interval("every 2 minutes").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_interval("every 5 min").unwrap(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_parse_interval_human_hours() {
+        assert_eq!(parse_interval("every 1 hour").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_interval("every 2 hours").unwrap(), Duration::from_secs(7200));
     }
 
     #[test]
     fn test_parse_interval_invalid() {
         assert!(parse_interval("abc").is_err());
         assert!(parse_interval("").is_err());
+        // Unsupported cron patterns
+        assert!(parse_interval("0 12 * * *").is_err());
     }
 
     #[test]

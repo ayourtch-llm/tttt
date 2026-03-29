@@ -1,0 +1,37 @@
+# Shell command permission template
+#
+# Handles common shell command permission prompts.
+
+Value Preset Command ()
+
+# State: Waiting for command prompt
+WaitPrompt
+  # Shell prompt patterns
+  ^.*[\$#%]\s*
+    -> Send ${Command} WaitOutput
+
+# State: Waiting for command output
+WaitOutput
+  # Command completed (shell prompt returned)
+  ^.*[\$#%]\s*
+    -> Done "completed"
+
+  # Permission prompt detected
+  ^.*Do you want to
+    -> Transition PermissionPrompt
+
+# State: Permission prompt
+PermissionPrompt
+  # Auto-approve
+  ^.*Do you want to proceed\?
+    -> Send "y\r" WaitOutput
+
+  ^.*Do you want to create
+    -> Send "y\r" WaitOutput
+
+  ^.*Do you want to edit
+    -> Send "y\r" WaitOutput
+
+  # Continue waiting
+  ^.*
+    -> Continue PermissionPrompt

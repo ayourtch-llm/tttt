@@ -1587,10 +1587,16 @@ impl App {
                 }
             }
             SchedulerEvent::CronFired(job) => {
+                let _ = self.logger.log_event(&LogEvent::new(
+                    "scheduler".to_string(), LogDirection::Meta,
+                    format!("CRON[{}]: {}", job.id, job.command).into_bytes(),
+                ));
+                // Always target the session_id specified in the job.
                 if let Some(ref session_id) = job.session_id {
                     let mut mgr = self.sessions.lock().unwrap();
                     if let Ok(session) = mgr.get_mut(session_id) {
-                        let _ = session.send_keys(&job.command);
+                        let text = format!("\r\n[CRON {}]: {}\r\n", job.id, job.command);
+                        let _ = session.send_raw(text.as_bytes());
                     }
                 }
             }

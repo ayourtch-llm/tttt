@@ -1,0 +1,58 @@
+# Claude Code permission auto-approval template
+#
+# Handles common permission prompts from Claude Code and similar AI assistants.
+# Auto-approves file operations, command execution, and git operations.
+#
+# Usage: Load this template with the TextFSMPlus FSM and feed terminal output.
+# The FSM will automatically send responses when permission prompts are detected.
+
+Value Preset AutoApprove (true)
+
+# State: Waiting for permission prompt
+PermissionPrompt
+  # File creation
+  ^.*Do you want to create\s+([^ ]+)\?
+    -> Send "\r" WaitConfirmation
+
+  # File edit
+  ^.*Do you want to make this edit
+    -> Send "\r" WaitConfirmation
+
+  # Command execution
+  ^.*Do you want to proceed\?
+    -> Send "\r" WaitConfirmation
+
+  # Git operations
+  ^.*Do you want to commit these changes\?
+    -> Send "\r" WaitConfirmation
+
+  ^.*Do you want to push these changes\?
+    -> Send "\r" WaitConfirmation
+
+  # Default: Auto-approve any "Do you want to" prompt
+  ^.*Do you want to
+    -> Send "\r" WaitConfirmation
+
+# State: Waiting for confirmation
+WaitConfirmation
+  # Success indicators
+  ^.*✓.*
+    -> Done "approved"
+
+  # Continue waiting
+  ^.*[⏺✻✶✳✽·✢].*\.\.\.
+    -> Continue WaitConfirmation
+
+  # Timeout or error
+  ^.*❌.*
+    -> Error "approval failed"
+
+# Default state: No permission prompt
+Default
+  # Match any permission prompt
+  ^.*Do you want to
+    -> Transition PermissionPrompt
+
+  # Done if no prompt found
+  ^.*
+    -> Done "no_prompt"

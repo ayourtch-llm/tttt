@@ -231,13 +231,13 @@ pub fn scheduler_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "tttt_cron_create",
-            "description": "Create a recurring cron job",
+            "description": "Create a recurring cron job that injects a message into a session",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "expression": { "type": "string", "description": "Cron expression (e.g., '*/5 * * * *')" },
-                    "command": { "type": "string", "description": "Command or message to execute/inject" },
-                    "session_id": { "type": "string", "description": "Optional target session" }
+                    "expression": { "type": "string", "description": "Interval expression: cron-style ('*/1 * * * *', '*/5'), compact ('30s', '5m', '1h'), or human ('every 30 seconds', 'every 2 minutes')" },
+                    "command": { "type": "string", "description": "Message to inject into the target session when the cron fires" },
+                    "session_id": { "type": "string", "description": "Target session ID or name (required for message delivery)" }
                 },
                 "required": ["expression", "command"]
             }
