@@ -1324,7 +1324,8 @@ impl App {
         let manual_scroll = self.scroll_offset;
         let selection_base = self.selection_scroll_base;
         let has_selection = self.selection.is_some();
-        let screen_data: Option<(vt100::Screen, u16, u16)> = self.active_session.as_ref()
+        // screen_data: (screen, cursor_row, cursor_col, pty_rows)
+        let screen_data: Option<(vt100::Screen, u16, u16, u16)> = self.active_session.as_ref()
             .and_then(|id| {
                 let mgr = self.sessions.lock().unwrap();
                 mgr.get(id).ok().map(|session| {
@@ -1344,12 +1345,13 @@ impl App {
                     if effective_scroll > 0 {
                         screen.set_scrollback(effective_scroll);
                     }
+                    let (pty_rows, _) = screen.size();
                     let (row, col) = if effective_scroll > 0 {
                         (0, 0) // Hide cursor when scrolled back
                     } else {
                         session.cursor_position()
                     };
-                    (screen, row, col)
+                    (screen, row, col, pty_rows)
                 })
             });
 
@@ -1401,7 +1403,7 @@ impl App {
                 .split(area);
 
             // PTY pane
-            if let Some((ref screen, _, _)) = screen_data {
+            if let Some((ref screen, _, _, _)) = screen_data {
                 let mut widget = PtyWidget::new(screen);
                 if let Some(sel) = selection_ref {
                     widget = widget.with_selection(sel);
@@ -1500,9 +1502,13 @@ impl App {
             }
         })?;
 
-        // Position cursor at PTY cursor location
-        if let Some((_, row, col)) = screen_data {
-            self.terminal.set_cursor_position((col, row))?;
+        // Position cursor at PTY cursor location, adjusted for row offset
+        // when the PTY is taller than the display pane.
+        if let Some((_, cursor_row, col, pty_rows)) = screen_data {
+            let pane_height = self.screen_rows.saturating_sub(1); // status bar
+            let row_offset = pty_rows.saturating_sub(pane_height);
+            let display_row = cursor_row.saturating_sub(row_offset);
+            self.terminal.set_cursor_position((col, display_row))?;
             self.terminal.show_cursor()?;
         }
 
@@ -1713,6 +1719,7 @@ impl App {
                         let tui_tools_enabled = self.config.tui_tools;
                         let screen_cols = self.screen_cols;
                         let screen_rows = self.screen_rows;
+                        let (pty_cols, pty_rows) = self.pty_dims;
                         let work_dir = self.config.work_dir.clone();
                         let db_path = self.config.db_path.clone();
                         let sqlite_logger = self.sqlite_logger.clone();
@@ -1724,6 +1731,7 @@ impl App {
                             let _ = stream.set_nonblocking(false);
 
                             let pty_handler = PtyToolHandler::new(sessions.clone(), work_dir)
+                                .with_default_dims(pty_cols, pty_rows)
                                 .with_sqlite_logger(sqlite_logger);
                             let scheduler_handler = SchedulerToolHandler::new(scheduler);
                             let notif_handler = NotificationToolHandler::new(notifications, sessions.clone());

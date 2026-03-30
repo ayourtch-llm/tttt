@@ -125,6 +125,19 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         }
     }
 
+    /// Set default PTY dimensions for new sessions (used when cols/rows not specified).
+    pub fn with_default_dims(mut self, cols: u16, rows: u16) -> Self {
+        self.default_cols = cols;
+        self.default_rows = rows;
+        self
+    }
+
+    /// Update the default PTY dimensions (e.g. after a terminal resize).
+    pub fn set_default_dims(&mut self, cols: u16, rows: u16) {
+        self.default_cols = cols;
+        self.default_rows = rows;
+    }
+
     /// Attach a shared SqliteLogger for session metadata recording.
     pub fn with_sqlite_logger(mut self, logger: Option<Arc<Mutex<SqliteLogger>>>) -> Self {
         self.sqlite_logger = logger;

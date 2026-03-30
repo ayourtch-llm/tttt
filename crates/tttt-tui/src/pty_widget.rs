@@ -29,13 +29,18 @@ impl<'a> Widget for PtyWidget<'a> {
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM);
 
+        // When the PTY has more rows than the display area, show the bottom
+        // portion (where the cursor and latest output are) instead of the top.
+        let row_offset = pty_rows.saturating_sub(area.height);
+
         for row in 0..area.height {
             for col in 0..area.width {
                 let x = area.x + col;
                 let y = area.y + row;
+                let pty_row = row + row_offset;
 
-                if row < pty_rows && col < pty_cols {
-                    if let Some(cell) = self.screen.cell(row, col) {
+                if pty_row < pty_rows && col < pty_cols {
+                    if let Some(cell) = self.screen.cell(pty_row, col) {
                         if cell.is_wide_continuation() {
                             continue; // skip continuation cells
                         }
@@ -45,7 +50,7 @@ impl<'a> Widget for PtyWidget<'a> {
 
                         // Highlight selected cells
                         if let Some(sel) = &self.selection {
-                            if sel.contains(row, col) {
+                            if sel.contains(pty_row, col) {
                                 style = style.add_modifier(Modifier::REVERSED);
                             }
                         }
