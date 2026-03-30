@@ -1373,8 +1373,9 @@ impl App {
             mgr.list()
         };
         let showing_help = self.showing_help;
+        let prefix_name_str = prefix_key_name(self.config.prefix_key);
         let prefix_name = if showing_help {
-            Some(prefix_key_name(self.config.prefix_key))
+            Some(prefix_name_str.clone())
         } else {
             None
         };
@@ -1451,17 +1452,24 @@ impl App {
             ).build_info(&uptime);
             frame.render_widget(widget, chunks[1]);
 
-            // Ctrl+C escape hint in the bottom status row of the PTY pane.
-            if show_ctrl_c_hint && chunks[0].height > 0 {
+            // Hint in the bottom status row of the PTY pane.
+            if chunks[0].height > 0 {
                 let hint_area = Rect::new(
                     chunks[0].x,
                     chunks[0].y + chunks[0].height.saturating_sub(1),
                     chunks[0].width,
                     1,
                 );
-                let hint_widget = Paragraph::new("Press Ctrl+\\ then ? for help")
-                    .style(Style::default().fg(Color::Yellow).bg(Color::Black));
-                frame.render_widget(hint_widget, hint_area);
+                if show_ctrl_c_hint {
+                    let hint_widget = Paragraph::new("Press Ctrl+\\ then ? for help")
+                        .style(Style::default().fg(Color::Yellow).bg(Color::Black));
+                    frame.render_widget(hint_widget, hint_area);
+                } else {
+                    let hint_text = format!("Press {} ? for help", prefix_name_str);
+                    let hint_widget = Paragraph::new(hint_text)
+                        .style(Style::default().fg(Color::DarkGray));
+                    frame.render_widget(hint_widget, hint_area);
+                }
             }
 
             // Help overlay popup
