@@ -1,9 +1,11 @@
 #!/bin/bash
 # Docker entrypoint for tttt
-# If no args given, launch claude. Otherwise pass args to tttt (with restart loop).
+# If no args given, run tttt with "-e docker" (the Docker environment).
+# Otherwise pass all supplied args to tttt.
+# In both cases tttt is restarted automatically on exit.
 
 if [ $# -eq 0 ]; then
-    exec claude
+    set -- -e docker
 fi
 
 while true; do

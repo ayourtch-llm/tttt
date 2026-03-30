@@ -145,6 +145,20 @@ kill -USR1 $(pgrep -f "target/debug/tttt -e")
 kill -USR2 $(pgrep -f "target/debug/tttt -e")
 ```
 
+### Docker
+
+A pre-built Docker image is available. By default it runs `tttt -e docker`, which uses the Docker-specific environment configuration:
+
+```bash
+# Run with the default Docker environment
+docker run -it ghcr.io/ayourtch-llm/tttt:latest
+
+# Pass custom arguments to tttt instead
+docker run -it ghcr.io/ayourtch-llm/tttt:latest -e "claude --prompt 'hello'"
+```
+
+When no arguments are given, the entrypoint launches `tttt -e docker`. Any arguments you supply are passed directly to `tttt`, replacing the default.
+
 ### MCP Configuration
 
 tttt automatically generates an MCP config and injects `--mcp-config` when it detects Claude as the root command. The root agent gets all `tttt_*` tools available immediately.
