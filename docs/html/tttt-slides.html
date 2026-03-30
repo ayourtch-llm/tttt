@@ -250,7 +250,7 @@
       <div class="arch-row">
         <div class="arch-item" style="border-color: rgba(171,71,188,0.3);">tttt-log<br><small style="opacity:0.6">SQLite logging</small></div>
         <div class="arch-item" style="border-color: rgba(239,83,80,0.3);">tttt-scheduler<br><small style="opacity:0.6">Cron & reminders</small></div>
-        <div class="arch-item" style="border-color: rgba(255,255,255,0.15);">tttt-sandbox<br><small style="opacity:0.6">OS isolation</small></div>
+        <div class="arch-item" style="border-color: rgba(255,255,255,0.08); opacity: 0.35; border-style: dashed;">tttt-sandbox<br><small style="opacity:0.6">OS isolation</small><br><small style="opacity:0.8; font-style: italic; color: #ffca28;">planned</small></div>
         <div class="arch-item" style="border-color: rgba(255,255,255,0.15);">vt100<br><small style="opacity:0.6">Terminal emulator</small></div>
       </div>
     </div>
@@ -315,14 +315,6 @@
           permission prompts, confirmations, and more.
         </p>
       </div>
-      <div class="card yellow">
-        <h4 class="accent-yellow">Docker Ready</h4>
-        <p style="opacity:0.8; line-height:1.6;">
-          Pre-built Docker image runs <code>tttt -e docker</code> out of the box.
-          Custom arguments override the default. AI harnesses are
-          lazy-installed on first use for EULA compliance.
-        </p>
-      </div>
     </div>
     <div class="tech-tags" style="margin-top: 2.5rem;">
       <span class="tag">Rust 2021</span>
@@ -378,6 +370,11 @@
       <a href="https://github.com/ayourtch-llm/tttt" style="font-size: 1.8rem; color: #4fc3f7; text-decoration: none;">
         github.com/ayourtch-llm/tttt
       </a>
+    </div>
+    <div class="card" style="margin-top: 2rem; max-width: 700px; width: 100%; text-align: left; border-color: rgba(79,195,247,0.3);">
+      <h4 class="accent">Try it now</h4>
+      <pre style="margin-top: 0.5rem; font-size: 1.1rem; line-height: 1.8; opacity: 0.9;"><code>docker pull ghcr.io/ayourtch-llm/tttt:latest
+docker run -it ghcr.io/ayourtch-llm/tttt:latest</code></pre>
     </div>
   </div>
   <div class="slide-num">7 / 7</div>
