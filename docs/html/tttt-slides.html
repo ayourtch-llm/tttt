@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>tttt - Takes Two To Tango</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: #0a0a0a; color: #e0e0e0; }
+
+  .slide {
+    width: 100vw; height: 100vh;
+    display: flex; flex-direction: column;
+    justify-content: center; align-items: center;
+    padding: 6vh 8vw;
+    scroll-snap-align: start;
+    position: relative;
+  }
+
+  html { scroll-snap-type: y mandatory; overflow-y: scroll; scroll-behavior: smooth; }
+
+  /* Slide themes */
+  .slide-title { background: linear-gradient(135deg, #0f1923 0%, #1a1a2e 50%, #16213e 100%); }
+  .slide-problem { background: linear-gradient(135deg, #1a0a0a 0%, #2d1117 50%, #1a0a0a 100%); }
+  .slide-solution { background: linear-gradient(135deg, #0a1a0f 0%, #112d17 50%, #0a1a0f 100%); }
+  .slide-arch { background: linear-gradient(135deg, #0f0a1a 0%, #1a112d 50%, #0f0a1a 100%); }
+  .slide-features { background: linear-gradient(135deg, #1a1a0a 0%, #2d2d11 50%, #1a1a0a 100%); }
+  .slide-origin { background: linear-gradient(135deg, #0a1a1a 0%, #112d2d 50%, #0a1a1a 100%); }
+
+  h1 { font-size: 4.5rem; font-weight: 700; margin-bottom: 1rem; }
+  h2 { font-size: 3rem; font-weight: 600; margin-bottom: 2rem; }
+  h3 { font-size: 1.6rem; font-weight: 400; opacity: 0.7; margin-bottom: 1rem; }
+
+  .accent { color: #4fc3f7; }
+  .accent-red { color: #ef5350; }
+  .accent-green { color: #66bb6a; }
+  .accent-yellow { color: #ffca28; }
+  .accent-purple { color: #ab47bc; }
+
+  .subtitle { font-size: 1.8rem; opacity: 0.8; margin-top: 0.5rem; }
+
+  .content { max-width: 1100px; width: 100%; text-align: left; }
+  .content-center { text-align: center; }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 3rem; width: 100%; max-width: 1100px; }
+
+  .card {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 12px;
+    padding: 1.8rem;
+  }
+  .card h4 { font-size: 1.3rem; margin-bottom: 0.8rem; }
+  .card ul { list-style: none; }
+  .card li { padding: 0.3rem 0; font-size: 1.05rem; opacity: 0.85; }
+  .card li::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 10px; vertical-align: middle; }
+
+  .blue li::before { background: #4fc3f7; }
+  .green li::before { background: #66bb6a; }
+  .yellow li::before { background: #ffca28; }
+  .purple li::before { background: #ab47bc; }
+  .red li::before { background: #ef5350; }
+
+  .pain-list { list-style: none; max-width: 900px; }
+  .pain-list li {
+    padding: 0.8rem 0;
+    font-size: 1.25rem;
+    display: flex; align-items: baseline; gap: 1rem;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  .pain-list .problem { color: #ef5350; min-width: 360px; }
+  .pain-list .arrow { color: #666; }
+  .pain-list .fix { color: #66bb6a; }
+
+  .arch-box {
+    display: flex; flex-direction: column; align-items: center; gap: 1rem;
+    width: 100%; max-width: 800px;
+  }
+  .arch-row {
+    display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;
+  }
+  .arch-item {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 8px;
+    padding: 0.8rem 1.4rem;
+    font-size: 1rem;
+    text-align: center;
+    min-width: 130px;
+  }
+  .arch-item.main {
+    background: rgba(79,195,247,0.15);
+    border-color: rgba(79,195,247,0.4);
+    font-size: 1.2rem;
+    padding: 1rem 2rem;
+  }
+  .arch-connector { font-size: 1.5rem; opacity: 0.4; }
+
+  .tag {
+    display: inline-block;
+    background: rgba(255,255,255,0.08);
+    border-radius: 6px;
+    padding: 0.3rem 0.8rem;
+    margin: 0.3rem;
+    font-size: 0.95rem;
+  }
+
+  .slide-num {
+    position: absolute; bottom: 2rem; right: 3rem;
+    font-size: 0.9rem; opacity: 0.3;
+  }
+
+  .big-emoji { font-size: 3rem; margin-bottom: 1rem; }
+
+  .quote {
+    font-style: italic; font-size: 1.3rem; opacity: 0.7;
+    border-left: 3px solid #4fc3f7; padding-left: 1.5rem;
+    margin-top: 2rem; max-width: 700px;
+  }
+
+  .tech-tags { display: flex; flex-wrap: wrap; justify-content: center; gap: 0.5rem; margin-top: 1.5rem; }
+
+  @media (max-width: 900px) {
+    .grid-2 { grid-template-columns: 1fr; }
+    h1 { font-size: 3rem; }
+    h2 { font-size: 2.2rem; }
+    .pain-list li { flex-direction: column; gap: 0.3rem; }
+    .pain-list .problem { min-width: unset; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Slide 1: Title -->
+<div class="slide slide-title">
+  <h1><span class="accent">tttt</span></h1>
+  <h3>Takes Two To Tango</h3>
+  <p class="subtitle">A terminal multiplexer built for AI agent orchestration</p>
+  <div class="tech-tags" style="margin-top: 3rem;">
+    <span class="tag">Rust</span>
+    <span class="tag">MCP Protocol</span>
+    <span class="tag">PTY Management</span>
+    <span class="tag">ratatui TUI</span>
+  </div>
+  <div class="slide-num">1 / 6</div>
+</div>
+
+<!-- Slide 2: The Problem -->
+<div class="slide slide-problem">
+  <div class="content content-center">
+    <h2>The Problem: <span class="accent-red">AI Agents Hit Walls</span></h2>
+    <h3 style="margin-bottom: 2.5rem;">Lessons from an 8+ hour orchestration session (Opus coordinating Sonnet via tmux)</h3>
+    <ul class="pain-list">
+      <li>
+        <span class="problem">80+ permission prompts blocked execution</span>
+        <span class="arrow">&rarr;</span>
+        <span class="fix">No way to auto-respond</span>
+      </li>
+      <li>
+        <span class="problem">40% of tokens wasted on polling loops</span>
+        <span class="arrow">&rarr;</span>
+        <span class="fix">"sleep 5 && tail" is all you have</span>
+      </li>
+      <li>
+        <span class="problem">Messages lost to terminal scrollback</span>
+        <span class="arrow">&rarr;</span>
+        <span class="fix">No persistent state between agents</span>
+      </li>
+      <li>
+        <span class="problem">No structured output detection</span>
+        <span class="arrow">&rarr;</span>
+        <span class="fix">Can't wait for specific patterns</span>
+      </li>
+      <li>
+        <span class="problem">Rate limits kill unattended sessions</span>
+        <span class="arrow">&rarr;</span>
+        <span class="fix">No automatic recovery</span>
+      </li>
+    </ul>
+  </div>
+  <div class="slide-num">2 / 6</div>
+</div>
+
+<!-- Slide 3: The Solution -->
+<div class="slide slide-solution">
+  <div class="content content-center">
+    <h2>The Solution: <span class="accent-green">tmux for AI Agents</span></h2>
+    <h3 style="margin-bottom: 2rem;">A root agent spawns, monitors, and coordinates workers &mdash; all through MCP tools</h3>
+    <div class="grid-2">
+      <div class="card blue">
+        <h4 class="accent">PTY Management (15 tools)</h4>
+        <ul>
+          <li>Launch sessions with custom commands</li>
+          <li>Send keystrokes (including Ctrl+C, arrows)</li>
+          <li>Read screen contents programmatically</li>
+          <li>Wait for regex patterns or idle state</li>
+          <li>Auto-handle rate limit dialogs</li>
+        </ul>
+      </div>
+      <div class="card green">
+        <h4 class="accent-green">Agent Coordination (5 tools)</h4>
+        <ul>
+          <li>Watch sessions for patterns, auto-inject text</li>
+          <li>One-shot and recurring notifications</li>
+          <li>Self-inject into own session</li>
+          <li>Persistent key-value scratchpad</li>
+          <li>Sidebar messaging between agents</li>
+        </ul>
+      </div>
+      <div class="card yellow">
+        <h4 class="accent-yellow">Scheduling (4 tools)</h4>
+        <ul>
+          <li>Cron jobs with message injection</li>
+          <li>One-shot reminders</li>
+          <li>Timer-based health checks</li>
+          <li>Recurring task automation</li>
+        </ul>
+      </div>
+      <div class="card purple">
+        <h4 class="accent-purple">Session Replay (3 tools)</h4>
+        <ul>
+          <li>SQLite-backed session recording</li>
+          <li>Interactive replay TUI with playback controls</li>
+          <li>Timeline and screen reconstruction</li>
+          <li>Programmatic replay via MCP</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">3 / 6</div>
+</div>
+
+<!-- Slide 4: Architecture -->
+<div class="slide slide-arch">
+  <div class="content content-center">
+    <h2>Architecture: <span class="accent-purple">8-Crate Workspace</span></h2>
+    <div class="arch-box" style="margin-top: 2rem;">
+      <div class="arch-row">
+        <div class="arch-item main">tttt (binary)<br><small style="opacity:0.6">app.rs &middot; main.rs &middot; reload.rs</small></div>
+      </div>
+      <div class="arch-connector">&darr;</div>
+      <div class="arch-row">
+        <div class="arch-item" style="border-color: rgba(79,195,247,0.3);">tttt-pty<br><small style="opacity:0.6">PTY sessions</small></div>
+        <div class="arch-item" style="border-color: rgba(102,187,106,0.3);">tttt-mcp<br><small style="opacity:0.6">MCP server</small></div>
+        <div class="arch-item" style="border-color: rgba(255,202,40,0.3);">tttt-tui<br><small style="opacity:0.6">UI rendering</small></div>
+      </div>
+      <div class="arch-connector">&darr;</div>
+      <div class="arch-row">
+        <div class="arch-item" style="border-color: rgba(171,71,188,0.3);">tttt-log<br><small style="opacity:0.6">SQLite logging</small></div>
+        <div class="arch-item" style="border-color: rgba(239,83,80,0.3);">tttt-scheduler<br><small style="opacity:0.6">Cron & reminders</small></div>
+        <div class="arch-item" style="border-color: rgba(255,255,255,0.15);">tttt-sandbox<br><small style="opacity:0.6">OS isolation</small></div>
+        <div class="arch-item" style="border-color: rgba(255,255,255,0.15);">vt100<br><small style="opacity:0.6">Terminal emulator</small></div>
+      </div>
+    </div>
+    <div style="margin-top: 2.5rem; display: flex; gap: 2rem; flex-wrap: wrap; justify-content: center;">
+      <div class="card" style="flex:1; min-width: 250px; max-width: 350px;">
+        <h4 class="accent">Key Design Choices</h4>
+        <ul class="blue">
+          <li><code>PtyBackend</code> trait for mock/real/restored PTYs</li>
+          <li>Shared <code>SessionManager</code> across TUI + MCP</li>
+          <li>Non-blocking reads with <code>poll()</code></li>
+          <li>Render debouncing (50ms idle / 200ms max)</li>
+        </ul>
+      </div>
+      <div class="card" style="flex:1; min-width: 250px; max-width: 350px;">
+        <h4 class="accent-green">Live Reload</h4>
+        <ul class="green">
+          <li><b>SIGUSR1</b>: <code>execv()</code> in-place, preserves all FDs</li>
+          <li><b>SIGUSR2</b>: Full restart with <code>--resume</code></li>
+          <li>Same PID, children don't notice</li>
+          <li>Enables development while running</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">4 / 6</div>
+</div>
+
+<!-- Slide 5: Key Features Deep Dive -->
+<div class="slide slide-features">
+  <div class="content content-center">
+    <h2><span class="accent-yellow">Operational Highlights</span></h2>
+    <div class="grid-2" style="margin-top: 1.5rem;">
+      <div class="card red">
+        <h4 class="accent-red">Rate Limit Auto-Recovery</h4>
+        <p style="opacity:0.8; line-height:1.6;">
+          <code>tttt_pty_handle_rate_limit</code> detects Claude Code rate limit dialogs,
+          parses the reset timestamp, sleeps until ready, and auto-continues.
+          Unattended sessions survive overnight.
+        </p>
+      </div>
+      <div class="card blue">
+        <h4 class="accent">Smart Waiting</h4>
+        <p style="opacity:0.8; line-height:1.6;">
+          <code>tttt_pty_wait_for</code> blocks until a regex matches on screen.
+          <code>tttt_pty_wait_for_idle</code> waits for output to stop.
+          No more "sleep &amp;&amp; poll" loops burning tokens.
+        </p>
+      </div>
+      <div class="card green">
+        <h4 class="accent-green">Remote Attach</h4>
+        <p style="opacity:0.8; line-height:1.6;">
+          <code>tttt attach</code> connects from another terminal via Unix socket.
+          Watch AI agents work in real-time with full color rendering.
+          Multiple viewers supported simultaneously.
+        </p>
+      </div>
+      <div class="card purple">
+        <h4 class="accent-purple">Pattern-Triggered Actions</h4>
+        <p style="opacity:0.8; line-height:1.6;">
+          <code>tttt_notify_on_pattern</code> watches any session for regex matches
+          and auto-injects text responses. Recurring watchers handle
+          permission prompts, confirmations, and more.
+        </p>
+      </div>
+    </div>
+    <div class="tech-tags" style="margin-top: 2.5rem;">
+      <span class="tag">Rust 2021</span>
+      <span class="tag">portable-pty</span>
+      <span class="tag">ratatui</span>
+      <span class="tag">tokio</span>
+      <span class="tag">nix</span>
+      <span class="tag">rusqlite</span>
+      <span class="tag">serde</span>
+      <span class="tag">crossterm</span>
+      <span class="tag">signal-hook</span>
+      <span class="tag">vt100</span>
+    </div>
+  </div>
+  <div class="slide-num">5 / 6</div>
+</div>
+
+<!-- Slide 6: Origin Story -->
+<div class="slide slide-origin">
+  <div class="content content-center">
+    <h2><span class="accent">Designed by AI, for AI</span></h2>
+    <h3 style="margin-bottom: 2.5rem;">A self-hosting bootstrap loop</h3>
+    <div style="display: flex; flex-direction: column; gap: 1.5rem; max-width: 800px; text-align: left;">
+      <div class="card" style="border-left: 3px solid #ef5350;">
+        <h4><span class="accent-red">Phase 1</span> &mdash; Discovery</h4>
+        <p style="opacity:0.8;">8+ hour research session: Claude Opus orchestrated Claude Sonnet via tmux. Every pain point in Slide 2 was hit firsthand.</p>
+      </div>
+      <div class="card" style="border-left: 3px solid #ffca28;">
+        <h4><span class="accent-yellow">Phase 2</span> &mdash; Design</h4>
+        <p style="opacity:0.8;">Claude Opus wrote 18 user stories with prioritized requirements, directly from operational experience. The spec was born from real failures.</p>
+      </div>
+      <div class="card" style="border-left: 3px solid #66bb6a;">
+        <h4><span class="accent-green">Phase 3</span> &mdash; Self-Hosting</h4>
+        <p style="opacity:0.8;">Claude Opus running <em>inside</em> tttt orchestrated Claude Sonnet workers to build tttt itself. Every feature validated in real-time by the agents using it.</p>
+      </div>
+    </div>
+    <div class="quote" style="margin-top: 2.5rem;">
+      "The tool was designed by the agent that needed it, built by the agents that would use it, and tested by running those agents inside it."
+    </div>
+  </div>
+  <div class="slide-num">6 / 6</div>
+</div>
+
+</body>
+</html>

@@ -82,6 +82,8 @@ pub struct SavedCronJob {
     pub expression: String,
     pub command: String,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub if_busy: tttt_scheduler::BusyPolicy,
 }
 
 /// Saved notification watcher.
@@ -192,6 +194,7 @@ mod tests {
                 expression: "10s".to_string(),
                 command: "check".to_string(),
                 session_id: Some("pty-1".to_string()),
+                if_busy: tttt_scheduler::BusyPolicy::Drop,
             }],
             watchers: vec![SavedWatcher {
                 id: "notify-1".to_string(),

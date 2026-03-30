@@ -6,6 +6,26 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
+/// What to do when a cron/reminder fires but the target session is busy (user typing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BusyPolicy {
+    /// Drop the message silently.
+    #[default]
+    Drop,
+    /// Wait until the session is idle, then inject.
+    Wait,
+}
+
+impl BusyPolicy {
+    pub fn from_str_opt(s: Option<&str>) -> Self {
+        match s {
+            Some("wait") => BusyPolicy::Wait,
+            _ => BusyPolicy::Drop,
+        }
+    }
+}
+
 /// A one-shot reminder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reminder {
@@ -22,6 +42,7 @@ pub struct CronJob {
     pub expression: String,
     pub command: String,
     pub session_id: Option<String>,
+    pub if_busy: BusyPolicy,
     /// Interval in seconds (simplified cron: we parse "every N seconds" style).
     #[serde(skip)]
     pub interval: Option<Duration>,
@@ -93,6 +114,7 @@ impl Scheduler {
         expression: String,
         command: String,
         session_id: Option<String>,
+        if_busy: BusyPolicy,
         now: Instant,
     ) -> Result<String> {
         let interval = parse_interval(&expression)?;
@@ -104,6 +126,7 @@ impl Scheduler {
             expression,
             command,
             session_id,
+            if_busy,
             interval: Some(interval),
             next_fire: Some(now + interval),
         };
@@ -368,7 +391,7 @@ mod tests {
         let e = epoch();
         let mut sched = Scheduler::with_epoch(e);
         let id = sched
-            .add_cron("10s".to_string(), "check".to_string(), None, e)
+            .add_cron("10s".to_string(), "check".to_string(), None, BusyPolicy::Drop, e)
             .unwrap();
         assert_eq!(id, "cron-1");
         assert_eq!(sched.cron_count(), 1);
@@ -378,7 +401,7 @@ mod tests {
     fn test_add_cron_invalid() {
         let e = epoch();
         let mut sched = Scheduler::with_epoch(e);
-        let result = sched.add_cron("invalid!!!".to_string(), "x".to_string(), None, e);
+        let result = sched.add_cron("invalid!!!".to_string(), "x".to_string(), None, BusyPolicy::Drop, e);
         assert!(result.is_err());
     }
 
@@ -387,7 +410,7 @@ mod tests {
         let e = epoch();
         let mut sched = Scheduler::with_epoch(e);
         let id = sched
-            .add_cron("10s".to_string(), "x".to_string(), None, e)
+            .add_cron("10s".to_string(), "x".to_string(), None, BusyPolicy::Drop, e)
             .unwrap();
         sched.remove_cron(&id).unwrap();
         assert_eq!(sched.cron_count(), 0);
@@ -403,8 +426,8 @@ mod tests {
     fn test_list_cron() {
         let e = epoch();
         let mut sched = Scheduler::with_epoch(e);
-        sched.add_cron("10s".to_string(), "a".to_string(), None, e).unwrap();
-        sched.add_cron("20s".to_string(), "b".to_string(), None, e).unwrap();
+        sched.add_cron("10s".to_string(), "a".to_string(), None, BusyPolicy::Drop, e).unwrap();
+        sched.add_cron("20s".to_string(), "b".to_string(), None, BusyPolicy::Drop, e).unwrap();
         assert_eq!(sched.list_cron().len(), 2);
     }
 
@@ -413,7 +436,7 @@ mod tests {
         let e = epoch();
         let mut sched = Scheduler::with_epoch(e);
         sched
-            .add_cron("10s".to_string(), "ping".to_string(), None, e)
+            .add_cron("10s".to_string(), "ping".to_string(), None, BusyPolicy::Drop, e)
             .unwrap();
 
         // Not yet
@@ -434,7 +457,7 @@ mod tests {
         let e = epoch();
         let mut sched = Scheduler::with_epoch(e);
         sched
-            .add_cron("5s".to_string(), "tick".to_string(), None, e)
+            .add_cron("5s".to_string(), "tick".to_string(), None, BusyPolicy::Drop, e)
             .unwrap();
 
         // First fire
@@ -472,7 +495,7 @@ mod tests {
         let e = epoch();
         let mut sched = Scheduler::with_epoch(e);
         sched
-            .add_cron("10s".to_string(), "x".to_string(), None, e)
+            .add_cron("10s".to_string(), "x".to_string(), None, BusyPolicy::Drop, e)
             .unwrap();
         let wake = sched.next_wake().unwrap();
         assert!(wake <= e + Duration::from_secs(10) + Duration::from_millis(1));

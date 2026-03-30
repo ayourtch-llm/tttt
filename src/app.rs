@@ -313,6 +313,8 @@ pub struct App {
     ctrl_c_hint_until: Option<Instant>,
     /// Last session metadata snapshot — compared each tick to detect changes.
     last_session_snapshot: Vec<tttt_pty::SessionMetadata>,
+    /// Deferred scheduler events waiting for target session to become idle.
+    deferred_scheduler_events: Vec<SchedulerEvent>,
 }
 
 impl App {
@@ -365,6 +367,7 @@ impl App {
             selection_scroll_base: 0,
             ctrl_c_hint_until: None,
             last_session_snapshot: Vec::new(),
+            deferred_scheduler_events: Vec::new(),
             config,
         }
     }
@@ -467,6 +470,7 @@ impl App {
                 job.expression.clone(),
                 job.command.clone(),
                 job.session_id.clone(),
+                job.if_busy,
                 now,
             ) {
                 eprintln!("Warning: failed to restore cron job {}: {}", job.id, e);
@@ -759,6 +763,7 @@ impl App {
                 expression: job.expression.clone(),
                 command: job.command.clone(),
                 session_id: job.session_id.clone(),
+                if_busy: job.if_busy,
             }).collect()
         };
 
@@ -1083,6 +1088,7 @@ impl App {
 
             let events = self.scheduler.lock().unwrap().tick(std::time::Instant::now());
             for event in events { self.handle_scheduler_event(event); }
+            self.drain_deferred_scheduler_events();
         }
 
         // Capture last screen content from root session for diagnostics
@@ -1567,8 +1573,12 @@ impl App {
         }
     }
 
+    /// Minimum seconds of input idle before we inject scheduler messages.
+    /// If the user typed something more recently, we defer or drop to avoid clobbering.
+    const SCHEDULER_INPUT_IDLE_THRESHOLD: f64 = 2.0;
+
     fn handle_scheduler_event(&mut self, event: SchedulerEvent) {
-        match event {
+        match &event {
             SchedulerEvent::ReminderFired(reminder) => {
                 let _ = self.logger.log_event(&LogEvent::new(
                     "scheduler".to_string(), LogDirection::Meta,
@@ -1581,6 +1591,12 @@ impl App {
                 if let Some(sid) = target {
                     let mut mgr = self.sessions.lock().unwrap();
                     if let Ok(session) = mgr.get_mut(&sid) {
+                        if session.input_idle_seconds() < Self::SCHEDULER_INPUT_IDLE_THRESHOLD {
+                            // Reminders always use wait policy — defer
+                            drop(mgr);
+                            self.deferred_scheduler_events.push(event);
+                            return;
+                        }
                         let text = format!("\n[REMINDER: {}]\r", reminder.message);
                         let _ = session.send_raw(text.as_bytes());
                     }
@@ -1595,12 +1611,87 @@ impl App {
                 if let Some(ref session_id) = job.session_id {
                     let mut mgr = self.sessions.lock().unwrap();
                     if let Ok(session) = mgr.get_mut(session_id) {
-                        let text = format!("\r\n[CRON {}]: {}\r\n", job.id, job.command);
+                        if session.input_idle_seconds() < Self::SCHEDULER_INPUT_IDLE_THRESHOLD {
+                            match job.if_busy {
+                                tttt_scheduler::BusyPolicy::Wait => {
+                                    drop(mgr);
+                                    self.deferred_scheduler_events.push(event);
+                                }
+                                tttt_scheduler::BusyPolicy::Drop => {}
+                            }
+                            return;
+                        }
+                        // Auto-terminate with \r so the agent processes the message
+                        let text = format!("\r\n[CRON {}]: {}\r", job.id, job.command);
                         let _ = session.send_raw(text.as_bytes());
                     }
                 }
             }
         }
+    }
+
+    /// Retry any deferred scheduler events whose target sessions are now idle.
+    fn drain_deferred_scheduler_events(&mut self) {
+        if self.deferred_scheduler_events.is_empty() {
+            return;
+        }
+        let mut still_deferred = Vec::new();
+        let events = std::mem::take(&mut self.deferred_scheduler_events);
+        for event in events {
+            let (target_id, is_idle) = match &event {
+                SchedulerEvent::ReminderFired(_) => {
+                    let sid = self.active_session.clone().or_else(|| {
+                        self.session_order.first().cloned()
+                    });
+                    match sid {
+                        Some(id) => {
+                            let mgr = self.sessions.lock().unwrap();
+                            let idle = mgr.get(&id).map_or(true, |s| {
+                                s.input_idle_seconds() >= Self::SCHEDULER_INPUT_IDLE_THRESHOLD
+                            });
+                            (Some(id), idle)
+                        }
+                        None => (None, false),
+                    }
+                }
+                SchedulerEvent::CronFired(job) => {
+                    match &job.session_id {
+                        Some(id) => {
+                            let mgr = self.sessions.lock().unwrap();
+                            let idle = mgr.get(id).map_or(true, |s| {
+                                s.input_idle_seconds() >= Self::SCHEDULER_INPUT_IDLE_THRESHOLD
+                            });
+                            (Some(id.clone()), idle)
+                        }
+                        None => (None, false),
+                    }
+                }
+            };
+            if is_idle && target_id.is_some() {
+                // Inject now
+                match &event {
+                    SchedulerEvent::ReminderFired(reminder) => {
+                        let sid = target_id.unwrap();
+                        let mut mgr = self.sessions.lock().unwrap();
+                        if let Ok(session) = mgr.get_mut(&sid) {
+                            let text = format!("\n[REMINDER: {}]\r", reminder.message);
+                            let _ = session.send_raw(text.as_bytes());
+                        }
+                    }
+                    SchedulerEvent::CronFired(job) => {
+                        let sid = target_id.unwrap();
+                        let mut mgr = self.sessions.lock().unwrap();
+                        if let Ok(session) = mgr.get_mut(&sid) {
+                            let text = format!("\r\n[CRON {}]: {}\r", job.id, job.command);
+                            let _ = session.send_raw(text.as_bytes());
+                        }
+                    }
+                }
+            } else {
+                still_deferred.push(event);
+            }
+        }
+        self.deferred_scheduler_events = still_deferred;
     }
 
     // === MCP proxy management ===

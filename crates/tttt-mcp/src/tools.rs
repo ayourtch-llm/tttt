@@ -237,7 +237,8 @@ pub fn scheduler_tool_definitions() -> Vec<Value> {
                 "properties": {
                     "expression": { "type": "string", "description": "Interval expression: cron-style ('*/1 * * * *', '*/5'), compact ('30s', '5m', '1h'), or human ('every 30 seconds', 'every 2 minutes')" },
                     "command": { "type": "string", "description": "Message to inject into the target session when the cron fires" },
-                    "session_id": { "type": "string", "description": "Target session ID or name (required for message delivery)" }
+                    "session_id": { "type": "string", "description": "Target session ID or name (required for message delivery)" },
+                    "if_busy": { "type": "string", "enum": ["drop", "wait"], "description": "What to do if the target session is busy (user typing). 'drop' (default) silently skips the message. 'wait' defers injection until the session is idle." }
                 },
                 "required": ["expression", "command"]
             }

@@ -841,13 +841,14 @@ impl SchedulerToolHandler {
             .ok_or_else(|| McpError::InvalidParams("command required".to_string()))?
             .to_string();
         let session_id = args["session_id"].as_str().map(|s| s.to_string());
+        let if_busy = tttt_scheduler::BusyPolicy::from_str_opt(args["if_busy"].as_str());
 
         let now = Instant::now();
         let mut sched = self
             .scheduler
             .lock()
             .map_err(|e| McpError::Protocol(e.to_string()))?;
-        let id = sched.add_cron(expression, command, session_id, now)?;
+        let id = sched.add_cron(expression, command, session_id, if_busy, now)?;
         Ok(json!({"job_id": id}))
     }
 
@@ -865,6 +866,7 @@ impl SchedulerToolHandler {
                     "expression": j.expression,
                     "command": j.command,
                     "session_id": j.session_id,
+                    "if_busy": format!("{:?}", j.if_busy).to_lowercase(),
                 })
             })
             .collect();
