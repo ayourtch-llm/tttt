@@ -33,6 +33,7 @@ pub trait PtyBackend: Send {
 pub struct RealPty {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
+    #[cfg_attr(unix, allow(dead_code))]
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
     /// Raw fd of the reader for poll() integration.
@@ -110,7 +111,6 @@ impl RealPty {
         #[cfg(unix)]
         {
             use nix::fcntl::{fcntl, FcntlArg};
-            use nix::sys::stat::{Mode, SFlag};
             let flags = fcntl(reader_raw_fd, FcntlArg::F_GETFL)
                 .map_err(|e| PtyError::Spawn(format!("fcntl F_GETFL failed: {}", e)))?;
             fcntl(reader_raw_fd, FcntlArg::F_SETFL(nix::fcntl::OFlag::from_bits_truncate(flags) | nix::fcntl::OFlag::O_NONBLOCK))
@@ -191,7 +191,7 @@ impl PtyBackend for RealPty {
         {
             match nix::unistd::read(self.reader_raw_fd, buf) {
                 Ok(n) => return Ok(n),
-                Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EWOULDBLOCK) => {
+                Err(nix::errno::Errno::EAGAIN) => {
                     return Ok(0)
                 }
                 Err(nix::errno::Errno::EIO) => return Ok(0), // PTY closed

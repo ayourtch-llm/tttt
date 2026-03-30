@@ -92,7 +92,7 @@ impl PtyBackend for RestoredPty {
                         offset += n;
                         break;
                     }
-                    Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EWOULDBLOCK) => {
+                    Err(nix::errno::Errno::EAGAIN) => {
                         retries += 1;
                         if retries >= MAX_RETRIES {
                             return Err(PtyError::Io(std::io::Error::new(
@@ -112,7 +112,7 @@ impl PtyBackend for RestoredPty {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         match nix::unistd::read(self.master_fd, buf) {
             Ok(n) => Ok(n),
-            Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EWOULDBLOCK) => Ok(0),
+            Err(nix::errno::Errno::EAGAIN) => Ok(0),
             Err(nix::errno::Errno::EIO) => Ok(0), // PTY closed
             Err(e) => Err(PtyError::Io(std::io::Error::from(e))),
         }

@@ -295,7 +295,7 @@ impl<B: PtyBackend> PtyToolHandler<B> {
     fn handle_pty_wait_for_idle(&self, args: &Value) -> Result<Value> {
         let pid = std::process::id();
         let debug_path = format!("/tmp/tttt-{}-debug.txt", pid);
-        let mut debug_log = |msg: &str| {
+        let debug_log = |msg: &str| {
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true).append(true).open(&debug_path)

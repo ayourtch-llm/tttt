@@ -373,6 +373,7 @@ impl App {
     }
 
     /// Get a shared reference to the session manager (for the MCP server thread).
+    #[allow(dead_code)]
     pub fn shared_sessions(&self) -> Arc<Mutex<SessionManager<AnyPty>>> {
         self.sessions.clone()
     }
@@ -590,6 +591,7 @@ impl App {
     }
 
     /// Remove a session ID from the session order list.
+    #[allow(dead_code)]
     pub fn remove_from_session_order(&mut self, id: &str) {
         self.session_order.retain(|s| s != id);
         if self.active_session.as_deref() == Some(id) {
