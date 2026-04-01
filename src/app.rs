@@ -2050,13 +2050,22 @@ fn copy_to_clipboard_osc52(text: &str) {
     use std::io::Write;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     let osc = format!("\x1b]52;c;{}\x07", encoded);
+    // Inside tmux, wrap in DCS passthrough so the sequence reaches the
+    // outer terminal instead of being consumed by tmux.
+    let seq = if std::env::var_os("TMUX").is_some() {
+        // DCS passthrough: double each ESC in the payload, wrap with Ptmux;..ST
+        let escaped = osc.replace('\x1b', "\x1b\x1b");
+        format!("\x1bPtmux;{}\x1b\\", escaped)
+    } else {
+        osc
+    };
     // Write to /dev/tty to bypass alternate screen buffer
     if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
-        let _ = tty.write_all(osc.as_bytes());
+        let _ = tty.write_all(seq.as_bytes());
         let _ = tty.flush();
     } else {
         // Fallback to stdout if /dev/tty unavailable
-        let _ = std::io::stdout().write_all(osc.as_bytes());
+        let _ = std::io::stdout().write_all(seq.as_bytes());
         let _ = std::io::stdout().flush();
     }
 }
