@@ -1462,13 +1462,19 @@ impl Screen {
             match next_param!() {
                 &[0] => self.attrs = crate::attrs::Attrs::default(),
                 &[1] => self.attrs.set_bold(true),
+                &[2] => self.attrs.set_dim(true),
                 &[3] => self.attrs.set_italic(true),
                 &[4] => self.attrs.set_underline(true),
                 &[7] => self.attrs.set_inverse(true),
-                &[22] => self.attrs.set_bold(false),
+                &[9] => self.attrs.set_strikethrough(true),
+                &[22] => {
+                    self.attrs.set_bold(false);
+                    self.attrs.set_dim(false);
+                }
                 &[23] => self.attrs.set_italic(false),
                 &[24] => self.attrs.set_underline(false),
                 &[27] => self.attrs.set_inverse(false),
+                &[29] => self.attrs.set_strikethrough(false),
                 &[n] if (30..=37).contains(&n) => {
                     self.attrs.fgcolor =
                         crate::attrs::Color::Idx(to_u8!(n) - 30);

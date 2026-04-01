@@ -24,6 +24,12 @@ pub fn cell_style(cell: &vt100::Cell) -> Style {
     if cell.inverse() {
         style = style.add_modifier(Modifier::REVERSED);
     }
+    if cell.dim() {
+        style = style.add_modifier(Modifier::DIM);
+    }
+    if cell.strikethrough() {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
 
     style
 }
@@ -110,5 +116,35 @@ mod tests {
         let cell = parser.screen().cell(0, 0).unwrap();
         let style = cell_style(cell);
         assert!(style.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn test_cell_style_dim() {
+        // ESC[2m = dim/faint
+        let parser = make_parser_with(b"\x1b[2mX");
+        let cell = parser.screen().cell(0, 0).unwrap();
+        let style = cell_style(cell);
+        assert!(style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn test_cell_style_strikethrough() {
+        // ESC[9m = strikethrough
+        let parser = make_parser_with(b"\x1b[9mX");
+        let cell = parser.screen().cell(0, 0).unwrap();
+        let style = cell_style(cell);
+        assert!(style.add_modifier.contains(Modifier::CROSSED_OUT));
+    }
+
+    #[test]
+    fn test_sgr22_resets_both_bold_and_dim() {
+        // SGR 22 = "normal intensity" resets both bold AND dim
+        let parser = make_parser_with(b"\x1b[1;2mX\x1b[22mY");
+        let x = parser.screen().cell(0, 0).unwrap();
+        assert!(cell_style(x).add_modifier.contains(Modifier::BOLD));
+        assert!(cell_style(x).add_modifier.contains(Modifier::DIM));
+        let y = parser.screen().cell(0, 1).unwrap();
+        assert!(!cell_style(y).add_modifier.contains(Modifier::BOLD));
+        assert!(!cell_style(y).add_modifier.contains(Modifier::DIM));
     }
 }

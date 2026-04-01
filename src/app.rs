@@ -956,30 +956,27 @@ impl App {
             // screen has sync mode set, suppress rendering entirely. The app
             // producing output has bracketed an update and we must wait until
             // the bracket closes (decrst 2026) before presenting a frame.
+            // The sync check is done INSIDE render_frame() under the same lock
+            // as the screen clone to prevent a TOCTOU race: without this, MCP
+            // threads can pump new data (including ?2026h + partial content)
+            // between the sync check and the screen clone, causing mid-frame
+            // rendering artifacts (garbled CUF positions).
             if self.server_render_dirty {
-                // Check if the active session has synchronized output enabled
-                let sync_active = self.active_session.as_ref().map_or(false, |id| {
-                    let mgr = self.sessions.lock().unwrap();
-                    mgr.get(id)
-                        .map(|s| s.synchronized_output())
-                        .unwrap_or(false)
-                });
+                let now = Instant::now();
+                let should_render = should_render_now(
+                    self.server_render_dirty,
+                    self.last_pty_data_time,
+                    self.first_dirty_time,
+                    now,
+                    RENDER_DEBOUNCE_MS,
+                );
 
-                if !sync_active {
-                    let now = Instant::now();
-                    let should_render = should_render_now(
-                        self.server_render_dirty,
-                        self.last_pty_data_time,
-                        self.first_dirty_time,
-                        now,
-                        RENDER_DEBOUNCE_MS,
-                    );
-
-                    if should_render {
-                        self.render_frame()?;
+                if should_render {
+                    if self.render_frame()? {
                         self.server_render_dirty = false;
                         self.first_dirty_time = None;
                     }
+                    // else: sync was active, keep dirty for next iteration
                 }
             }
 
@@ -1320,17 +1317,26 @@ impl App {
     }
 
     /// Render the full frame using ratatui widgets.
-    fn render_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    /// Returns true if a frame was actually rendered, false if rendering was
+    /// suppressed (e.g., due to synchronized output mode being active).
+    fn render_frame(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
         // Collect all data needed for rendering before entering the draw closure,
         // because we cannot hold the mutex lock across the closure.
         let manual_scroll = self.scroll_offset;
         let selection_base = self.selection_scroll_base;
         let has_selection = self.selection.is_some();
+        let mut sync_suppressed = false;
         // screen_data: (screen, cursor_row, cursor_col, pty_rows)
         let screen_data: Option<(vt100::Screen, u16, u16, u16)> = self.active_session.as_ref()
             .and_then(|id| {
                 let mgr = self.sessions.lock().unwrap();
-                mgr.get(id).ok().map(|session| {
+                mgr.get(id).ok().and_then(|session| {
+                    // Check synchronized output under the SAME lock as the screen
+                    // clone to prevent TOCTOU race with MCP threads pumping data.
+                    if session.synchronized_output() {
+                        sync_suppressed = true;
+                        return None; // suppress: sync bracket still open
+                    }
                     // Clone screen first, then apply scroll offset on the clone
                     // so we don't affect the shared session state (viewers see live view)
                     let mut screen = session.screen().screen().clone();
@@ -1353,9 +1359,15 @@ impl App {
                     } else {
                         session.cursor_position()
                     };
-                    (screen, row, col, pty_rows)
+                    Some((screen, row, col, pty_rows))
                 })
             });
+
+        // If sync mode suppressed the render, return false so the caller
+        // keeps dirty=true and retries on the next loop iteration.
+        if sync_suppressed {
+            return Ok(false);
+        }
 
         // Collect highlights for the active session
         let active_highlights: Vec<tttt_mcp::TuiHighlight> = self.active_session.as_ref()
@@ -1522,7 +1534,7 @@ impl App {
             self.terminal.show_cursor()?;
         }
 
-        Ok(())
+        Ok(true)
     }
 
     fn handle_resize(&mut self) -> Result<(), Box<dyn std::error::Error>> {
