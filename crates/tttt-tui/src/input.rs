@@ -243,9 +243,8 @@ impl InputParser {
                     None => {
                         // Could be an incomplete sequence: check if there's no terminator yet
                         // by looking for M or m after position pos+3.
-                        let has_terminator = all_bytes[pos + 3..]
-                            .iter()
-                            .any(|&b| b == b'M' || b == b'm');
+                        let has_terminator = all_bytes.get(pos + 3..)
+                            .map_or(false, |rest| rest.iter().any(|&b| b == b'M' || b == b'm'));
                         if !has_terminator {
                             // Incomplete — buffer the rest for next call
                             self.mouse_buf.extend_from_slice(&all_bytes[pos..]);
