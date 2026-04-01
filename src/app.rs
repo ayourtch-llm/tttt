@@ -1994,8 +1994,17 @@ fn compute_selection_scroll_compensation(
     drift + manual_scroll_offset
 }
 
-/// Copy text to the system clipboard via OSC 52 escape sequence.
+/// Copy text to the system clipboard.
+/// Over SSH, prefer OSC 52 since native commands (pbcopy/xclip) would
+/// copy to the remote machine's clipboard, not the local one.
 fn copy_to_clipboard(text: &str) {
+    let is_ssh = std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some();
+    if is_ssh {
+        // OSC 52 reaches the local terminal through SSH
+        copy_to_clipboard_osc52(text);
+        return;
+    }
     // Try platform-native clipboard first (works in all terminals)
     if copy_to_clipboard_native(text) {
         return;
@@ -2033,13 +2042,23 @@ fn copy_to_clipboard_native(text: &str) -> bool {
 }
 
 /// Copy via OSC 52 escape sequence (terminal must support it).
+/// Writes to /dev/tty to bypass ratatui's alternate screen buffer,
+/// ensuring the sequence reaches the actual terminal emulator
+/// (critical for SSH sessions where the local terminal handles OSC 52).
 fn copy_to_clipboard_osc52(text: &str) {
     use base64::Engine;
     use std::io::Write;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     let osc = format!("\x1b]52;c;{}\x07", encoded);
-    let _ = std::io::stdout().write_all(osc.as_bytes());
-    let _ = std::io::stdout().flush();
+    // Write to /dev/tty to bypass alternate screen buffer
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        let _ = tty.write_all(osc.as_bytes());
+        let _ = tty.flush();
+    } else {
+        // Fallback to stdout if /dev/tty unavailable
+        let _ = std::io::stdout().write_all(osc.as_bytes());
+        let _ = std::io::stdout().flush();
+    }
 }
 
 #[cfg(test)]
