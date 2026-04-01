@@ -309,8 +309,10 @@ pub struct App {
     scroll_offset: usize,
     /// Scrollback count when selection started — used to compensate for new output
     selection_scroll_base: usize,
-    /// When Some(deadline), show the Ctrl+C escape hint until that instant.
+    /// When Some(deadline), show a hint message until that instant.
     ctrl_c_hint_until: Option<Instant>,
+    /// Custom hint message to show (if None, shows default help hint).
+    ctrl_c_hint_message: Option<String>,
     /// Last session metadata snapshot — compared each tick to detect changes.
     last_session_snapshot: Vec<tttt_pty::SessionMetadata>,
     /// Deferred scheduler events waiting for target session to become idle.
@@ -366,6 +368,7 @@ impl App {
             scroll_offset: 0,
             selection_scroll_base: 0,
             ctrl_c_hint_until: None,
+            ctrl_c_hint_message: None,
             last_session_snapshot: Vec::new(),
             deferred_scheduler_events: Vec::new(),
             config,
@@ -1242,7 +1245,15 @@ impl App {
                                 let text = sel.extract_text(&screen);
                                 drop(mgr);
                                 if !text.is_empty() {
-                                    copy_to_clipboard(&text);
+                                    match copy_to_clipboard(&text) {
+                                        ClipboardResult::TmuxPassthroughDisabled => {
+                                            self.ctrl_c_hint_until = Some(Instant::now() + std::time::Duration::from_secs(5));
+                                            self.ctrl_c_hint_message = Some(
+                                                "Copy failed: run `tmux set -g allow-passthrough on`".to_string()
+                                            );
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                         }
@@ -1402,10 +1413,12 @@ impl App {
             Some(_) => {
                 // Expired — clear it.
                 self.ctrl_c_hint_until = None;
+                self.ctrl_c_hint_message = None;
                 false
             }
             None => false,
         };
+        let hint_message = self.ctrl_c_hint_message.clone();
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -1475,7 +1488,9 @@ impl App {
                     1,
                 );
                 if show_ctrl_c_hint {
-                    let hint_widget = Paragraph::new("Press Ctrl+\\ then ? for help")
+                    let msg = hint_message.as_deref()
+                        .unwrap_or("Press Ctrl+\\ then ? for help");
+                    let hint_widget = Paragraph::new(msg)
                         .style(Style::default().fg(Color::Yellow).bg(Color::Black));
                     frame.render_widget(hint_widget, hint_area);
                 } else {
@@ -1994,23 +2009,32 @@ fn compute_selection_scroll_compensation(
     drift + manual_scroll_offset
 }
 
+/// Result of a clipboard copy attempt.
+enum ClipboardResult {
+    /// Copied via native command (pbcopy/xclip)
+    Native,
+    /// Copied via OSC 52
+    Osc52,
+    /// tmux passthrough is not enabled — copy likely failed
+    TmuxPassthroughDisabled,
+}
+
 /// Copy text to the system clipboard.
 /// Over SSH, prefer OSC 52 since native commands (pbcopy/xclip) would
 /// copy to the remote machine's clipboard, not the local one.
-fn copy_to_clipboard(text: &str) {
+fn copy_to_clipboard(text: &str) -> ClipboardResult {
     let is_ssh = std::env::var_os("SSH_CONNECTION").is_some()
         || std::env::var_os("SSH_TTY").is_some();
     if is_ssh {
         // OSC 52 reaches the local terminal through SSH
-        copy_to_clipboard_osc52(text);
-        return;
+        return copy_to_clipboard_osc52(text);
     }
     // Try platform-native clipboard first (works in all terminals)
     if copy_to_clipboard_native(text) {
-        return;
+        return ClipboardResult::Native;
     }
     // Fall back to OSC 52 (works in iTerm2, kitty, alacritty, etc.)
-    copy_to_clipboard_osc52(text);
+    copy_to_clipboard_osc52(text)
 }
 
 /// Copy via platform-native command (pbcopy on macOS, xclip/xsel on Linux).
@@ -2045,19 +2069,36 @@ fn copy_to_clipboard_native(text: &str) -> bool {
 /// Writes to /dev/tty to bypass ratatui's alternate screen buffer,
 /// ensuring the sequence reaches the actual terminal emulator
 /// (critical for SSH sessions where the local terminal handles OSC 52).
-fn copy_to_clipboard_osc52(text: &str) {
+/// Check if tmux has allow-passthrough enabled.
+fn tmux_passthrough_enabled() -> bool {
+    use std::process::Command;
+    Command::new("tmux")
+        .args(["show", "-gv", "allow-passthrough"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map_or(false, |v| {
+            let v = v.trim();
+            v == "on" || v == "all"
+        })
+}
+
+fn copy_to_clipboard_osc52(text: &str) -> ClipboardResult {
     use base64::Engine;
     use std::io::Write;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     let osc = format!("\x1b]52;c;{}\x07", encoded);
     // Inside tmux, wrap in DCS passthrough so the sequence reaches the
     // outer terminal instead of being consumed by tmux.
-    let seq = if std::env::var_os("TMUX").is_some() {
+    let (seq, in_tmux) = if std::env::var_os("TMUX").is_some() {
+        if !tmux_passthrough_enabled() {
+            return ClipboardResult::TmuxPassthroughDisabled;
+        }
         // DCS passthrough: double each ESC in the payload, wrap with Ptmux;..ST
         let escaped = osc.replace('\x1b', "\x1b\x1b");
-        format!("\x1bPtmux;{}\x1b\\", escaped)
+        (format!("\x1bPtmux;{}\x1b\\", escaped), true)
     } else {
-        osc
+        (osc, false)
     };
     // Write to /dev/tty to bypass alternate screen buffer
     if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
@@ -2068,6 +2109,8 @@ fn copy_to_clipboard_osc52(text: &str) {
         let _ = std::io::stdout().write_all(seq.as_bytes());
         let _ = std::io::stdout().flush();
     }
+    let _ = in_tmux;
+    ClipboardResult::Osc52
 }
 
 #[cfg(test)]
