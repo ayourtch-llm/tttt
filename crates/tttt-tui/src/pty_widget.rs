@@ -172,9 +172,11 @@ mod tests {
     }
 
     #[test]
-    fn test_area_smaller_than_pty() {
-        // Area 3x2, PTY 10x5 — should clip to area, no panic
-        let parser = make_screen(b"Hello World", 10, 5);
+    fn test_area_narrower_than_pty() {
+        // PTY 10x2 wraps "Hello World" across two rows; area 3x2 clips to
+        // the leftmost 3 columns. Heights match so no row_offset is involved
+        // and the assertions exercise pure column clipping.
+        let parser = make_screen(b"Hello World", 10, 2);
         let widget = PtyWidget::new(parser.screen());
         let area = Rect::new(0, 0, 3, 2);
         let mut buf = Buffer::empty(area);
@@ -183,6 +185,32 @@ mod tests {
         assert_eq!(buf[(0, 0)].symbol(), "H");
         assert_eq!(buf[(1, 0)].symbol(), "e");
         assert_eq!(buf[(2, 0)].symbol(), "l");
+    }
+
+    #[test]
+    fn test_area_shorter_than_pty_shows_bottom_rows() {
+        // PTY 5x4, area 5x2 — when the PTY is taller than the area we render
+        // the bottom area.height rows (so the cursor / latest output stays
+        // visible). With four lines of text the bottom two rows are "C" and
+        // "D".
+        let parser = make_screen(b"A\r\nB\r\nC\r\nD", 5, 4);
+        let widget = PtyWidget::new(parser.screen());
+        let area = Rect::new(0, 0, 5, 2);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        // The bottom two PTY rows (rows 2 and 3) should appear at area
+        // rows 0 and 1.
+        assert_eq!(buf[(0, 0)].symbol(), "C", "area row 0 should be PTY row 2");
+        assert_eq!(buf[(0, 1)].symbol(), "D", "area row 1 should be PTY row 3");
+        // Top two PTY rows ("A" and "B") should not appear anywhere in
+        // the rendered buffer.
+        for row in 0..area.height {
+            for col in 0..area.width {
+                let sym = buf[(col, row)].symbol();
+                assert_ne!(sym, "A", "PTY row 0 should be clipped off the top");
+                assert_ne!(sym, "B", "PTY row 1 should be clipped off the top");
+            }
+        }
     }
 
     #[test]
