@@ -110,6 +110,11 @@ pub enum InputEvent {
     ScrollDown { col: u16, row: u16 },
     /// Show the "press Ctrl+\\ then q to detach" hint in the status line.
     ShowCtrlCHint,
+    /// Force a full repaint of the host terminal (clears ratatui's previous-frame
+    /// buffer so the next draw is a full diff). Bound to `prefix l`.
+    Redraw,
+    /// Dump diagnostic state for the active session to a file. Bound to `prefix i`.
+    DumpDiagnostics,
 }
 
 /// Try to parse an SGR mouse sequence from a byte slice.
@@ -335,6 +340,18 @@ impl InputParser {
                         }
                         events.push(InputEvent::Reload);
                     }
+                    b'l' | b'L' => {
+                        if !passthrough.is_empty() {
+                            events.push(InputEvent::PassThrough(std::mem::take(&mut passthrough)));
+                        }
+                        events.push(InputEvent::Redraw);
+                    }
+                    b'i' | b'I' => {
+                        if !passthrough.is_empty() {
+                            events.push(InputEvent::PassThrough(std::mem::take(&mut passthrough)));
+                        }
+                        events.push(InputEvent::DumpDiagnostics);
+                    }
                     b if b == self.config.prefix_key => {
                         // Double prefix = send literal prefix key
                         passthrough.push(self.config.prefix_key);
@@ -547,6 +564,62 @@ mod tests {
         let mut p = parser();
         let events = p.process(&input(&[0x1c, b'R']));
         assert_eq!(events, vec![InputEvent::Reload]);
+    }
+
+    #[test]
+    fn test_prefix_then_l_redraw() {
+        let mut p = parser();
+        let events = p.process(&input(&[0x1c, b'l']));
+        assert_eq!(events, vec![InputEvent::Redraw]);
+        assert!(!p.is_prefix_armed());
+    }
+
+    #[test]
+    fn test_prefix_then_L_redraw_uppercase() {
+        let mut p = parser();
+        let events = p.process(&input(&[0x1c, b'L']));
+        assert_eq!(events, vec![InputEvent::Redraw]);
+    }
+
+    #[test]
+    fn test_prefix_then_i_dump_diagnostics() {
+        let mut p = parser();
+        let events = p.process(&input(&[0x1c, b'i']));
+        assert_eq!(events, vec![InputEvent::DumpDiagnostics]);
+        assert!(!p.is_prefix_armed());
+    }
+
+    #[test]
+    fn test_prefix_then_I_dump_diagnostics_uppercase() {
+        let mut p = parser();
+        let events = p.process(&input(&[0x1c, b'I']));
+        assert_eq!(events, vec![InputEvent::DumpDiagnostics]);
+    }
+
+    #[test]
+    fn test_redraw_flushes_pending_passthrough() {
+        let mut p = parser();
+        let events = p.process(&input(&[b'a', b'b', 0x1c, b'l']));
+        assert_eq!(
+            events,
+            vec![
+                InputEvent::PassThrough(b"ab".to_vec()),
+                InputEvent::Redraw,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_dump_diagnostics_flushes_pending_passthrough() {
+        let mut p = parser();
+        let events = p.process(&input(&[b'x', 0x1c, b'i']));
+        assert_eq!(
+            events,
+            vec![
+                InputEvent::PassThrough(b"x".to_vec()),
+                InputEvent::DumpDiagnostics,
+            ]
+        );
     }
 
     #[test]

@@ -83,6 +83,10 @@ enum InputAction {
     ScrollDown { col: u16, row: u16 },
     /// Show the Ctrl+C escape hint in the status line.
     ShowCtrlCHint,
+    /// Force a full repaint of the host terminal (recovery from corrupted display).
+    Redraw,
+    /// Write a diagnostic dump of the active session's render state to a file.
+    DumpDiagnostics,
 }
 
 fn decide_input_action(event: tttt_tui::InputEvent) -> InputAction {
@@ -102,6 +106,8 @@ fn decide_input_action(event: tttt_tui::InputEvent) -> InputAction {
         tttt_tui::InputEvent::ScrollUp { col, row } => InputAction::ScrollUp { col, row },
         tttt_tui::InputEvent::ScrollDown { col, row } => InputAction::ScrollDown { col, row },
         tttt_tui::InputEvent::ShowCtrlCHint => InputAction::ShowCtrlCHint,
+        tttt_tui::InputEvent::Redraw => InputAction::Redraw,
+        tttt_tui::InputEvent::DumpDiagnostics => InputAction::DumpDiagnostics,
     }
 }
 
@@ -240,10 +246,116 @@ fn prefix_key_name(key: u8) -> String {
 
 /// Compute a centered Rect for the help popup within the given terminal area.
 /// Returns `(x, y, width, height)` values for [`ratatui::layout::Rect::new`].
-#[cfg(test)]
+/// Inputs for the diagnostic dump formatter — kept as a plain struct so the
+/// formatter is a pure function that can be unit-tested without an `App`.
+pub(crate) struct DiagnosticInputs<'a> {
+    pub timestamp_ms: u128,
+    pub session_id: &'a str,
+    pub session_command: &'a str,
+    pub session_status: &'a tttt_pty::SessionStatus,
+    /// Parser size as `(cols, rows)`.
+    pub parser_size: (u16, u16),
+    /// Cursor position as `(row, col)`.
+    pub cursor: (u16, u16),
+    pub max_scroll: usize,
+    /// Host terminal size as `(cols, rows)`.
+    pub host_size: (u16, u16),
+    pub sidebar_width: u16,
+    pub pty_dims: (u16, u16),
+    /// Pane area size as `(cols, rows)`.
+    pub pane_size: (u16, u16),
+    pub scroll_offset: usize,
+    pub selection_scroll_base: usize,
+    pub selection: Option<&'a tttt_tui::Selection>,
+    pub all_sessions: &'a [tttt_pty::SessionMetadata],
+    pub plain_contents: &'a str,
+    /// The buffer that PtyWidget produces when rendered into the pane area.
+    pub rendered_buffer: &'a ratatui::buffer::Buffer,
+    pub formatted_contents: &'a [u8],
+}
+
+/// Render the diagnostic dump to a byte vector. Pure function — no I/O.
+pub(crate) fn format_diagnostic_dump(inputs: &DiagnosticInputs) -> Vec<u8> {
+    use std::io::Write;
+    let mut out: Vec<u8> = Vec::new();
+    let _ = writeln!(out, "tttt diagnostic dump");
+    let _ = writeln!(out, "timestamp_ms: {}", inputs.timestamp_ms);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "[active session]");
+    let _ = writeln!(out, "id:                {}", inputs.session_id);
+    let _ = writeln!(out, "command:           {}", inputs.session_command);
+    let _ = writeln!(out, "status:            {:?}", inputs.session_status);
+    let _ = writeln!(
+        out,
+        "parser size:       {}x{} (cols x rows)",
+        inputs.parser_size.0, inputs.parser_size.1
+    );
+    let _ = writeln!(
+        out,
+        "cursor:            ({}, {}) (row, col)",
+        inputs.cursor.0, inputs.cursor.1
+    );
+    let _ = writeln!(out, "max_scroll_offset: {}", inputs.max_scroll);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "[host terminal / app state]");
+    let _ = writeln!(
+        out,
+        "host size:         {}x{} (cols x rows)",
+        inputs.host_size.0, inputs.host_size.1
+    );
+    let _ = writeln!(out, "sidebar_width:     {}", inputs.sidebar_width);
+    let _ = writeln!(
+        out,
+        "configured pty_dims: {}x{}",
+        inputs.pty_dims.0, inputs.pty_dims.1
+    );
+    let _ = writeln!(
+        out,
+        "pane area:         {}x{} (cols x rows)",
+        inputs.pane_size.0, inputs.pane_size.1
+    );
+    let _ = writeln!(out, "scroll_offset:     {}", inputs.scroll_offset);
+    let _ = writeln!(
+        out,
+        "selection_scroll_base: {}",
+        inputs.selection_scroll_base
+    );
+    let _ = writeln!(out, "selection:         {:?}", inputs.selection);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "[all sessions]");
+    for s in inputs.all_sessions {
+        let _ = writeln!(
+            out,
+            "  {} {}x{} {:?} cmd={}",
+            s.id, s.cols, s.rows, s.status, s.command
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "[parser plain contents]");
+    let _ = writeln!(out, "{}", inputs.plain_contents);
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "[ptywidget render output (what the renderer would draw)]"
+    );
+    let buf_area = inputs.rendered_buffer.area();
+    for row in 0..buf_area.height {
+        let mut line = String::new();
+        for col in 0..buf_area.width {
+            line.push_str(inputs.rendered_buffer[(col, row)].symbol());
+        }
+        let _ = writeln!(out, "{:>3} | {}", row, line);
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "[parser formatted contents (raw ANSI bytes)]");
+    out.extend_from_slice(inputs.formatted_contents);
+    let _ = writeln!(out);
+    out
+}
+
 fn help_popup_area(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
     let popup_width: u16 = 45;
-    let popup_height: u16 = 14;
+    let popup_height: u16 = 16;
     let x = area.width.saturating_sub(popup_width) / 2;
     let y = area.height.saturating_sub(popup_height) / 2;
     ratatui::layout::Rect::new(
@@ -1290,6 +1402,25 @@ impl App {
                 self.ctrl_c_hint_until = Some(Instant::now() + Duration::from_secs(3));
                 self.server_render_dirty = true;
             }
+            InputAction::Redraw => {
+                self.force_redraw()?;
+            }
+            InputAction::DumpDiagnostics => {
+                match self.dump_diagnostics() {
+                    Ok(path) => {
+                        use std::time::Duration;
+                        self.ctrl_c_hint_message = Some(format!("diag: {}", path));
+                        self.ctrl_c_hint_until = Some(Instant::now() + Duration::from_secs(5));
+                        self.server_render_dirty = true;
+                    }
+                    Err(e) => {
+                        use std::time::Duration;
+                        self.ctrl_c_hint_message = Some(format!("diag failed: {}", e));
+                        self.ctrl_c_hint_until = Some(Instant::now() + Duration::from_secs(5));
+                        self.server_render_dirty = true;
+                    }
+                }
+            }
         }
         Ok(true)
     }
@@ -1504,15 +1635,7 @@ impl App {
             // Help overlay popup
             if showing_help {
                 let p = prefix_name.as_deref().unwrap_or("");
-                let popup_width = 45u16;
-                let popup_height = 14u16;
-                let x = area.width.saturating_sub(popup_width) / 2;
-                let y = area.height.saturating_sub(popup_height) / 2;
-                let popup_area = Rect::new(
-                    x, y,
-                    popup_width.min(area.width),
-                    popup_height.min(area.height),
-                );
+                let popup_area = help_popup_area(area);
 
                 frame.render_widget(Clear, popup_area);
 
@@ -1526,6 +1649,8 @@ impl App {
                     Line::from("  c    Create new terminal"),
                     Line::from("  d    Detach/quit"),
                     Line::from("  r    Live reload (execv)"),
+                    Line::from("  l    Force redraw (recover)"),
+                    Line::from("  i    Dump diagnostics to /tmp"),
                     Line::from("  ?    This help"),
                     Line::from(format!("  {p}{p}  Send literal prefix")),
                     Line::from(""),
@@ -1581,6 +1706,88 @@ impl App {
         self.terminal.resize(ratatui::layout::Rect::new(0, 0, cols, rows))?;
         self.render_frame()?;
         Ok(())
+    }
+
+    /// Force a full repaint of the host terminal. Used as a recovery shortcut
+    /// when the displayed screen disagrees with what the parser actually holds
+    /// (e.g. ratatui's previous-frame buffer drifted out of sync with reality).
+    /// Calling `Terminal::clear` resets ratatui's diff baseline so the next
+    /// `draw` writes every cell from scratch.
+    fn force_redraw(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.terminal.clear()?;
+        self.server_render_dirty = true;
+        self.render_frame()?;
+        Ok(())
+    }
+
+    /// Write a diagnostic dump of the active session's render-relevant state
+    /// to a file. Returns the file path on success. Used to investigate
+    /// rendering anomalies — captures everything needed to compare what the
+    /// parser thinks the screen is, what the renderer would draw, and what
+    /// the host terminal dimensions are.
+    fn dump_diagnostics(&self) -> Result<String, Box<dyn std::error::Error>> {
+        use std::io::Write;
+        let id = self.active_session.as_ref()
+            .ok_or("no active session")?
+            .clone();
+
+        let mgr = self.sessions.lock().unwrap();
+        let session = mgr.get(&id).map_err(|e| format!("session lookup failed: {}", e))?;
+        let metadata = session.metadata();
+        let screen = session.screen().screen();
+        let (parser_rows, parser_cols) = screen.size();
+        let cursor = session.cursor_position();
+        let max_scroll = session.max_scroll_offset();
+        let plain_contents = screen.contents();
+        let formatted_contents = screen.contents_formatted();
+
+        // Render PtyWidget into a fresh buffer at the same size the host
+        // terminal uses for the PTY pane. This is what *should* be on screen.
+        let pane_height = self.screen_rows.saturating_sub(1);
+        let pane_width = self.screen_cols.saturating_sub(self.config.sidebar_width);
+        let area = Rect::new(0, 0, pane_width, pane_height);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        {
+            use ratatui::widgets::Widget;
+            let widget = PtyWidget::new(screen);
+            widget.render(area, &mut buf);
+        }
+
+        // All session metadata for cross-session context.
+        let all_sessions = mgr.list();
+        drop(mgr);
+
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+
+        let bytes = format_diagnostic_dump(&DiagnosticInputs {
+            timestamp_ms: ts_ms,
+            session_id: &id,
+            session_command: &metadata.command,
+            session_status: &metadata.status,
+            parser_size: (parser_cols, parser_rows),
+            cursor,
+            max_scroll,
+            host_size: (self.screen_cols, self.screen_rows),
+            sidebar_width: self.config.sidebar_width,
+            pty_dims: self.pty_dims,
+            pane_size: (pane_width, pane_height),
+            scroll_offset: self.scroll_offset,
+            selection_scroll_base: self.selection_scroll_base,
+            selection: self.selection.as_ref(),
+            all_sessions: &all_sessions,
+            plain_contents: &plain_contents,
+            rendered_buffer: &buf,
+            formatted_contents: &formatted_contents,
+        });
+
+        let path = format!("/tmp/tttt-diag-{}.txt", ts_ms);
+        let mut file = std::fs::File::create(&path)?;
+        file.write_all(&bytes)?;
+
+        Ok(path)
     }
 
     fn check_session_exit(&mut self) -> bool {
@@ -2146,11 +2353,11 @@ mod tests {
         let area = ratatui::layout::Rect::new(0, 0, 200, 50);
         let popup = help_popup_area(area);
         assert_eq!(popup.width, 45, "popup width should be 45");
-        assert_eq!(popup.height, 14, "popup height should be 14");
+        assert_eq!(popup.height, 16, "popup height should be 16");
         // x = (200 - 45) / 2 = 77
         assert_eq!(popup.x, 77, "popup should be horizontally centered");
-        // y = (50 - 14) / 2 = 18
-        assert_eq!(popup.y, 18, "popup should be vertically centered");
+        // y = (50 - 16) / 2 = 17
+        assert_eq!(popup.y, 17, "popup should be vertically centered");
     }
 
     #[test]
@@ -2159,11 +2366,11 @@ mod tests {
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
         let popup = help_popup_area(area);
         assert_eq!(popup.width, 45);
-        assert_eq!(popup.height, 14);
+        assert_eq!(popup.height, 16);
         // x = (80 - 45) / 2 = 17
         assert_eq!(popup.x, 17);
-        // y = (24 - 14) / 2 = 5
-        assert_eq!(popup.y, 5);
+        // y = (24 - 16) / 2 = 4
+        assert_eq!(popup.y, 4);
     }
 
     #[test]
@@ -2245,6 +2452,220 @@ mod tests {
         assert_eq!(
             decide_input_action(InputEvent::ShowCtrlCHint),
             InputAction::ShowCtrlCHint
+        );
+    }
+
+    #[test]
+    fn test_decide_input_action_redraw() {
+        assert_eq!(
+            decide_input_action(InputEvent::Redraw),
+            InputAction::Redraw,
+        );
+    }
+
+    #[test]
+    fn test_decide_input_action_dump_diagnostics() {
+        assert_eq!(
+            decide_input_action(InputEvent::DumpDiagnostics),
+            InputAction::DumpDiagnostics,
+        );
+    }
+
+    // ── Chunk 8: format_diagnostic_dump ──────────────────────────────────────
+
+    fn make_test_buffer(cols: u16, rows: u16, fill: &str) -> ratatui::buffer::Buffer {
+        let area = ratatui::layout::Rect::new(0, 0, cols, rows);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        for r in 0..rows {
+            for c in 0..cols {
+                buf[(c, r)].set_symbol(fill);
+            }
+        }
+        buf
+    }
+
+    fn make_test_inputs<'a>(
+        session_command: &'a str,
+        session_status: &'a tttt_pty::SessionStatus,
+        all_sessions: &'a [tttt_pty::SessionMetadata],
+        plain_contents: &'a str,
+        rendered_buffer: &'a ratatui::buffer::Buffer,
+        formatted_contents: &'a [u8],
+    ) -> DiagnosticInputs<'a> {
+        DiagnosticInputs {
+            timestamp_ms: 1_700_000_000_000,
+            session_id: "sess-1",
+            session_command,
+            session_status,
+            parser_size: (80, 24),
+            cursor: (3, 7),
+            max_scroll: 42,
+            host_size: (120, 40),
+            sidebar_width: 30,
+            pty_dims: (90, 39),
+            pane_size: (90, 39),
+            scroll_offset: 0,
+            selection_scroll_base: 0,
+            selection: None,
+            all_sessions,
+            plain_contents,
+            rendered_buffer,
+            formatted_contents,
+        }
+    }
+
+    #[test]
+    fn test_format_diagnostic_dump_contains_expected_headings() {
+        let buf = make_test_buffer(4, 2, "x");
+        let status = tttt_pty::SessionStatus::Running;
+        let dump = format_diagnostic_dump(&make_test_inputs(
+            "/bin/zsh",
+            &status,
+            &[],
+            "hello",
+            &buf,
+            b"\x1b[31mhi\x1b[0m",
+        ));
+        let text = String::from_utf8(dump).unwrap();
+        assert!(text.contains("tttt diagnostic dump"));
+        assert!(text.contains("[active session]"));
+        assert!(text.contains("[host terminal / app state]"));
+        assert!(text.contains("[all sessions]"));
+        assert!(text.contains("[parser plain contents]"));
+        assert!(text.contains("[ptywidget render output (what the renderer would draw)]"));
+        assert!(text.contains("[parser formatted contents (raw ANSI bytes)]"));
+    }
+
+    #[test]
+    fn test_format_diagnostic_dump_renders_session_fields() {
+        let buf = make_test_buffer(2, 1, ".");
+        let status = tttt_pty::SessionStatus::Running;
+        let dump = format_diagnostic_dump(&make_test_inputs(
+            "/bin/bash",
+            &status,
+            &[],
+            "",
+            &buf,
+            b"",
+        ));
+        let text = String::from_utf8(dump).unwrap();
+        assert!(text.contains("timestamp_ms: 1700000000000"));
+        assert!(text.contains("id:                sess-1"));
+        assert!(text.contains("command:           /bin/bash"));
+        assert!(text.contains("Running"));
+        assert!(text.contains("parser size:       80x24 (cols x rows)"));
+        assert!(text.contains("cursor:            (3, 7) (row, col)"));
+        assert!(text.contains("max_scroll_offset: 42"));
+        assert!(text.contains("host size:         120x40 (cols x rows)"));
+        assert!(text.contains("sidebar_width:     30"));
+        assert!(text.contains("configured pty_dims: 90x39"));
+        assert!(text.contains("pane area:         90x39 (cols x rows)"));
+        assert!(text.contains("scroll_offset:     0"));
+        assert!(text.contains("selection:         None"));
+    }
+
+    #[test]
+    fn test_format_diagnostic_dump_renders_buffer_content() {
+        // 5x2 buffer filled with 'A' should produce two rows of "AAAAA"
+        // prefixed with row numbers like "  0 | AAAAA".
+        let buf = make_test_buffer(5, 2, "A");
+        let status = tttt_pty::SessionStatus::Running;
+        let dump = format_diagnostic_dump(&make_test_inputs(
+            "cmd",
+            &status,
+            &[],
+            "",
+            &buf,
+            b"",
+        ));
+        let text = String::from_utf8(dump).unwrap();
+        assert!(text.contains("  0 | AAAAA"));
+        assert!(text.contains("  1 | AAAAA"));
+        // Should not contain row index 2 since the buffer is only 2 rows tall
+        assert!(!text.contains("  2 | "));
+    }
+
+    #[test]
+    fn test_format_diagnostic_dump_renders_all_sessions_listing() {
+        let buf = make_test_buffer(1, 1, ".");
+        let status = tttt_pty::SessionStatus::Running;
+        let exited_status = tttt_pty::SessionStatus::Exited(0);
+        let sessions = vec![
+            tttt_pty::SessionMetadata {
+                id: "alpha".to_string(),
+                command: "vim".to_string(),
+                status: status.clone(),
+                cols: 80,
+                rows: 24,
+                name: None,
+                created_at: None,
+                root: false,
+            },
+            tttt_pty::SessionMetadata {
+                id: "beta".to_string(),
+                command: "bash".to_string(),
+                status: exited_status,
+                cols: 100,
+                rows: 30,
+                name: None,
+                created_at: None,
+                root: false,
+            },
+        ];
+        let dump = format_diagnostic_dump(&make_test_inputs(
+            "vim",
+            &status,
+            &sessions,
+            "",
+            &buf,
+            b"",
+        ));
+        let text = String::from_utf8(dump).unwrap();
+        assert!(text.contains("  alpha 80x24"));
+        assert!(text.contains("cmd=vim"));
+        assert!(text.contains("  beta 100x30"));
+        assert!(text.contains("cmd=bash"));
+    }
+
+    #[test]
+    fn test_format_diagnostic_dump_includes_selection_when_present() {
+        let buf = make_test_buffer(1, 1, ".");
+        let status = tttt_pty::SessionStatus::Running;
+        let sel = tttt_tui::Selection {
+            anchor: (1, 2),
+            head: (4, 5),
+        };
+        let mut inputs = make_test_inputs("cmd", &status, &[], "", &buf, b"");
+        inputs.selection = Some(&sel);
+        inputs.selection_scroll_base = 7;
+        let dump = format_diagnostic_dump(&inputs);
+        let text = String::from_utf8(dump).unwrap();
+        assert!(text.contains("selection_scroll_base: 7"));
+        assert!(text.contains("selection:         Some("));
+        assert!(text.contains("anchor: (1, 2)"));
+        assert!(text.contains("head: (4, 5)"));
+    }
+
+    #[test]
+    fn test_format_diagnostic_dump_includes_raw_formatted_bytes() {
+        // The raw ANSI bytes section should contain the literal escape bytes
+        // (not lossy-converted), so a byte search is the strongest assertion.
+        let buf = make_test_buffer(1, 1, ".");
+        let status = tttt_pty::SessionStatus::Running;
+        let raw = b"\x1b[31mRED\x1b[0m";
+        let dump = format_diagnostic_dump(&make_test_inputs(
+            "cmd",
+            &status,
+            &[],
+            "",
+            &buf,
+            raw,
+        ));
+        // Search for the raw bytes anywhere in the dump.
+        let needle: &[u8] = b"\x1b[31mRED\x1b[0m";
+        assert!(
+            dump.windows(needle.len()).any(|w| w == needle),
+            "expected raw ANSI bytes to appear verbatim in the dump",
         );
     }
 
