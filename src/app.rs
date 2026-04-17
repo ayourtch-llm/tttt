@@ -429,9 +429,9 @@ pub struct App {
     last_session_snapshot: Vec<tttt_pty::SessionMetadata>,
     /// Deferred scheduler events waiting for target session to become idle.
     deferred_scheduler_events: Vec<SchedulerEvent>,
-    /// Pending Enter keystrokes for cron injections, sent after a delay so
-    /// the target app has time to process the text before submission.
-    pending_cron_enters: Vec<(String, Instant)>,
+    /// Pending Enter keystrokes for injections (cron, reminder, notification),
+    /// sent after a delay so the target app processes the text before submission.
+    pending_delayed_enters: Vec<(String, Instant)>,
 }
 
 impl App {
@@ -486,7 +486,7 @@ impl App {
             ctrl_c_hint_message: None,
             last_session_snapshot: Vec::new(),
             deferred_scheduler_events: Vec::new(),
-            pending_cron_enters: Vec::new(),
+            pending_delayed_enters: Vec::new(),
             config,
         }
     }
@@ -1184,16 +1184,19 @@ impl App {
                     let (target_id, text) = self.pending_injection_queue.remove(0);
                     let mut mgr = self.sessions.lock().unwrap();
                     if let Ok(session) = mgr.get_mut(&target_id) {
-                        let mut bytes = text.replace("[ENTER]", "\r").into_bytes();
-                        // Always auto-submit: append \r if not already present
-                        if bytes.last() != Some(&b'\r') {
-                            bytes.push(b'\r');
-                        }
-                        let _ = session.send_raw(&bytes);
+                        // Send text via send_keys (without auto-appending Enter).
+                        // Strip trailing \r/\n — a delayed [ENTER] will be queued below.
+                        let clean = text.trim_end_matches(|c| c == '\r' || c == '\n');
+                        let _ = session.send_keys(clean);
                     }
+                    drop(mgr);
                     let _ = self.logger.log_event(&LogEvent::new(
                         target_id.clone(), LogDirection::Meta,
                         format!("[NOTIFICATION] {}", text).into_bytes(),
+                    ));
+                    self.pending_delayed_enters.push((
+                        target_id,
+                        Instant::now() + std::time::Duration::from_millis(100),
                     ));
                     self.last_injection_time = Some(Instant::now());
                 }
@@ -1207,7 +1210,7 @@ impl App {
             let events = self.scheduler.lock().unwrap().tick(std::time::Instant::now());
             for event in events { self.handle_scheduler_event(event); }
             self.drain_deferred_scheduler_events();
-            self.drain_pending_cron_enters();
+            self.drain_pending_delayed_enters();
         }
 
         // Capture last screen content from root session for diagnostics
@@ -1852,8 +1855,13 @@ impl App {
                             self.deferred_scheduler_events.push(event);
                             return;
                         }
-                        let text = format!("\n[REMINDER: {}]\r", reminder.message);
-                        let _ = session.send_raw(text.as_bytes());
+                        let text = format!("[ENTER][REMINDER: {}]", reminder.message);
+                        let _ = session.send_keys(&text);
+                        drop(mgr);
+                        self.pending_delayed_enters.push((
+                            sid.clone(),
+                            Instant::now() + std::time::Duration::from_millis(100),
+                        ));
                     }
                 }
             }
@@ -1885,7 +1893,7 @@ impl App {
                         let text = format!("[ENTER][CRON {}]: {}", job.id, cmd);
                         let _ = session.send_keys(&text);
                         drop(mgr);
-                        self.pending_cron_enters.push((
+                        self.pending_delayed_enters.push((
                             session_id.clone(),
                             Instant::now() + std::time::Duration::from_millis(100),
                         ));
@@ -1942,9 +1950,13 @@ impl App {
                         let sid = target_id.unwrap();
                         let mut mgr = self.sessions.lock().unwrap();
                         if let Ok(session) = mgr.get_mut(&sid) {
-                            let text = format!("\n[REMINDER: {}]\r", reminder.message);
-                            let _ = session.send_raw(text.as_bytes());
+                            let text = format!("[ENTER][REMINDER: {}]", reminder.message);
+                            let _ = session.send_keys(&text);
                         }
+                        self.pending_delayed_enters.push((
+                            sid,
+                            Instant::now() + std::time::Duration::from_millis(100),
+                        ));
                     }
                     SchedulerEvent::CronFired(job) => {
                         let sid = target_id.unwrap();
@@ -1954,7 +1966,7 @@ impl App {
                             let text = format!("[ENTER][CRON {}]: {}", job.id, cmd);
                             let _ = session.send_keys(&text);
                         }
-                        self.pending_cron_enters.push((
+                        self.pending_delayed_enters.push((
                             sid,
                             Instant::now() + std::time::Duration::from_millis(100),
                         ));
@@ -1967,14 +1979,14 @@ impl App {
         self.deferred_scheduler_events = still_deferred;
     }
 
-    /// Send any pending Enter keystrokes for cron injections whose delay has elapsed.
-    fn drain_pending_cron_enters(&mut self) {
-        if self.pending_cron_enters.is_empty() {
+    /// Send any pending Enter keystrokes whose delay has elapsed.
+    fn drain_pending_delayed_enters(&mut self) {
+        if self.pending_delayed_enters.is_empty() {
             return;
         }
         let now = Instant::now();
         let mut remaining = Vec::new();
-        for (session_id, fire_at) in std::mem::take(&mut self.pending_cron_enters) {
+        for (session_id, fire_at) in std::mem::take(&mut self.pending_delayed_enters) {
             if now >= fire_at {
                 let mut mgr = self.sessions.lock().unwrap();
                 if let Ok(session) = mgr.get_mut(&session_id) {
@@ -1984,7 +1996,7 @@ impl App {
                 remaining.push((session_id, fire_at));
             }
         }
-        self.pending_cron_enters = remaining;
+        self.pending_delayed_enters = remaining;
     }
 
     // === MCP proxy management ===

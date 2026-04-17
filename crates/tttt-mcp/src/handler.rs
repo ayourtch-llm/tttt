@@ -1029,14 +1029,20 @@ impl<B: PtyBackend> NotificationToolHandler<B> {
             .as_str()
             .ok_or_else(|| McpError::InvalidParams("text required".into()))?;
 
-        let mut mgr = self.sessions.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
-        let session = mgr.get_mut(session_id)?;
-        let mut bytes = text.as_bytes().to_vec();
-        // Always auto-submit: append \r if not already present
-        if bytes.last() != Some(&b'\r') {
-            bytes.push(b'\r');
+        // Send text first, then after a short delay send Enter separately
+        // so the target app has time to process the text before submission.
+        let clean = text.trim_end_matches(|c| c == '\r' || c == '\n');
+        {
+            let mut mgr = self.sessions.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+            let session = mgr.get_mut(session_id)?;
+            session.send_keys(clean)?;
         }
-        session.send_raw(&bytes)?;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        {
+            let mut mgr = self.sessions.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
+            let session = mgr.get_mut(session_id)?;
+            session.send_keys("[ENTER]")?;
+        }
         Ok(json!({"status": "ok"}))
     }
 }
