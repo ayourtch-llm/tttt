@@ -1215,6 +1215,7 @@ impl App {
                 let active_id = self.active_session.clone();
                 let mut mgr = self.sessions.lock().unwrap();
                 let ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
+                let mut visible_dirty = false;
                 for sid in ids {
                     if active_id.as_deref() == Some(&sid) {
                         continue; // already pumped above
@@ -1225,9 +1226,21 @@ impl App {
                                 let _ = self.logger.log_event(&LogEvent::new(
                                     sid.clone(), LogDirection::Output, raw_bytes,
                                 ));
+                                if self.visible_sessions.iter().any(|v| v == &sid) {
+                                    visible_dirty = true;
+                                }
                             }
                         }
                     }
+                }
+                drop(mgr);
+                if visible_dirty {
+                    let now = Instant::now();
+                    if !self.server_render_dirty {
+                        self.first_dirty_time = Some(now);
+                    }
+                    self.server_render_dirty = true;
+                    self.last_pty_data_time = Some(now);
                 }
             }
 
