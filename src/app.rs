@@ -238,6 +238,46 @@ fn toggle_session_visibility(
     }
 }
 
+/// Pick a grid (rows, cols) for `n` panes that gives each cell an aspect
+/// ratio close to the container's, while keeping `rows * cols >= n`.
+///
+/// The score minimizes `|cell_w/cell_h - container_w/container_h|` over all
+/// candidates. Ties resolve in favor of fewer rows (more horizontal layouts),
+/// which keeps the visual order predictable when multiple grids match.
+///
+/// Examples (container 100x30, target aspect ≈ 3.33):
+/// - n=2 → (1, 2): cells 50x30, side-by-side.
+/// - n=4 → (2, 2): cells 50x15, exact aspect match.
+/// - n=6 → (2, 3): cells 33x15, closer to target than 3x2's 50x10.
+fn compute_grid_dims(n: usize, container_cols: u16, container_rows: u16) -> (usize, usize) {
+    if n <= 1 {
+        return (1, 1);
+    }
+    let target = (container_cols.max(1) as f32) / (container_rows.max(1) as f32);
+    let mut best: Option<(f32, usize, usize)> = None;
+    for cols in 1..=n {
+        let rows = n.div_ceil(cols);
+        let cell_w = (container_cols as f32) / (cols as f32);
+        let cell_h = (container_rows as f32) / (rows as f32);
+        let aspect = if cell_h > 0.0 { cell_w / cell_h } else { f32::INFINITY };
+        let score = (aspect - target).abs();
+        let candidate = (score, rows, cols);
+        match best {
+            None => best = Some(candidate),
+            Some((bs, br, _)) => {
+                // Strictly lower score wins; ties prefer fewer rows.
+                if score < bs - f32::EPSILON
+                    || ((score - bs).abs() < f32::EPSILON && rows < br)
+                {
+                    best = Some(candidate);
+                }
+            }
+        }
+    }
+    let (_, rows, cols) = best.unwrap();
+    (rows, cols)
+}
+
 /// Compute a cursor-aware viewport row offset for rendering a PTY screen
 /// into a smaller display area.
 ///
@@ -1705,19 +1745,45 @@ impl App {
                 ])
                 .split(area);
 
-            // Vertical split of the PTY pane area for multi-view: equal-height
-            // rows, one per visible session. With a single visible session this
-            // collapses to the original full-area render.
-            let pane_areas: std::rc::Rc<[Rect]> = if panes.len() <= 1 {
-                std::rc::Rc::from(vec![chunks[0]])
+            // Aspect-ratio-aware grid layout for multi-view. Pick (rows, cols)
+            // so each cell's aspect approximates the container's; fill row-major
+            // with the last row spanning fewer (wider) cells when N isn't a
+            // perfect rectangle. Single pane collapses to the full area.
+            let pane_areas: Vec<Rect> = if panes.len() <= 1 {
+                vec![chunks[0]]
             } else {
-                let constraints: Vec<Constraint> = (0..panes.len())
-                    .map(|_| Constraint::Ratio(1, panes.len() as u32))
+                let (grid_rows, grid_cols) = compute_grid_dims(
+                    panes.len(),
+                    chunks[0].width,
+                    chunks[0].height,
+                );
+                let row_constraints: Vec<Constraint> = (0..grid_rows)
+                    .map(|_| Constraint::Ratio(1, grid_rows as u32))
                     .collect();
-                Layout::default()
+                let row_areas = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints(constraints)
-                    .split(chunks[0])
+                    .constraints(row_constraints)
+                    .split(chunks[0]);
+
+                let mut rects: Vec<Rect> = Vec::with_capacity(panes.len());
+                for r in 0..grid_rows {
+                    let remaining = panes.len().saturating_sub(r * grid_cols);
+                    if remaining == 0 {
+                        break;
+                    }
+                    let cells_in_row = remaining.min(grid_cols);
+                    let col_constraints: Vec<Constraint> = (0..cells_in_row)
+                        .map(|_| Constraint::Ratio(1, cells_in_row as u32))
+                        .collect();
+                    let col_areas = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints(col_constraints)
+                        .split(row_areas[r]);
+                    for c in 0..cells_in_row {
+                        rects.push(col_areas[c]);
+                    }
+                }
+                rects
             };
 
             for (i, pane) in panes.iter().enumerate() {
@@ -3136,6 +3202,73 @@ mod tests {
             &ss(&["a", "b", "c"]),
         );
         assert_eq!(result, ss(&["a", "c"]));
+    }
+
+    // ── Chunk 3d: compute_grid_dims ──────────────────────────────────────────
+
+    #[test]
+    fn test_grid_single_pane_is_1x1() {
+        assert_eq!(compute_grid_dims(1, 100, 30), (1, 1));
+        assert_eq!(compute_grid_dims(0, 100, 30), (1, 1));
+    }
+
+    #[test]
+    fn test_grid_two_panes_in_wide_container_are_side_by_side() {
+        // 100x30 container, aspect ≈ 3.33. 1x2 cells are 50x30 (aspect 1.67),
+        // 2x1 cells are 100x15 (aspect 6.67). Side-by-side wins.
+        assert_eq!(compute_grid_dims(2, 100, 30), (1, 2));
+    }
+
+    #[test]
+    fn test_grid_four_panes_makes_2x2() {
+        // 100x30: 2x2 cells are 50x15 (exact aspect match).
+        assert_eq!(compute_grid_dims(4, 100, 30), (2, 2));
+    }
+
+    #[test]
+    fn test_grid_six_panes_in_wide_container_makes_2x3() {
+        // 100x30: 2x3 cells 33x15 (aspect 2.2), 3x2 cells 50x10 (aspect 5.0).
+        // Target 3.33 → 2x3 wins (closer aspect).
+        assert_eq!(compute_grid_dims(6, 100, 30), (2, 3));
+    }
+
+    #[test]
+    fn test_grid_nine_panes_makes_3x3() {
+        // 90x30 container; 3x3 cells 30x10 (aspect 3.0) ≈ container 3.0.
+        assert_eq!(compute_grid_dims(9, 90, 30), (3, 3));
+    }
+
+    #[test]
+    fn test_grid_three_panes_picks_close_aspect() {
+        // 100x30 (aspect 3.33). Candidates:
+        //   1x3: 33x30, aspect 1.1
+        //   2x2: 50x15, aspect 3.33 (exact, but one blank cell)
+        //   3x1: 100x10, aspect 10
+        // 2x2 wins on aspect.
+        assert_eq!(compute_grid_dims(3, 100, 30), (2, 2));
+    }
+
+    #[test]
+    fn test_grid_handles_tall_container() {
+        // 30x100 container, aspect 0.3. For 4 panes:
+        //   1x4: 7x100, aspect 0.07
+        //   2x2: 15x50, aspect 0.3 (exact)
+        //   4x1: 30x25, aspect 1.2
+        // 2x2 wins.
+        assert_eq!(compute_grid_dims(4, 30, 100), (2, 2));
+    }
+
+    #[test]
+    fn test_grid_satisfies_capacity() {
+        // Sanity: rows * cols must be >= n for any input.
+        for n in 1..=12 {
+            let (r, c) = compute_grid_dims(n, 100, 30);
+            assert!(
+                r * c >= n,
+                "n={n}: grid {r}x{c} has capacity {} < n",
+                r * c
+            );
+        }
     }
 
     // ── Chunk 3c: compute_pane_row_offset ────────────────────────────────────
