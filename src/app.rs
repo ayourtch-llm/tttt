@@ -87,6 +87,9 @@ enum InputAction {
     Redraw,
     /// Write a diagnostic dump of the active session's render state to a file.
     DumpDiagnostics,
+    /// Toggle the sticky/pinned-visible state of the active session
+    /// (keyboard parity with ctrl-click on the active sidebar entry).
+    ToggleStickyActive,
 }
 
 fn decide_input_action(event: tttt_tui::InputEvent) -> InputAction {
@@ -108,6 +111,7 @@ fn decide_input_action(event: tttt_tui::InputEvent) -> InputAction {
         tttt_tui::InputEvent::ShowCtrlCHint => InputAction::ShowCtrlCHint,
         tttt_tui::InputEvent::Redraw => InputAction::Redraw,
         tttt_tui::InputEvent::DumpDiagnostics => InputAction::DumpDiagnostics,
+        tttt_tui::InputEvent::ToggleStickyActive => InputAction::ToggleStickyActive,
     }
 }
 
@@ -1692,6 +1696,14 @@ impl App {
                     }
                 }
             }
+            InputAction::ToggleStickyActive => {
+                if let Some(active) = self.active_session.clone() {
+                    self.visible_sessions =
+                        toggle_session_visibility(&self.visible_sessions, &active);
+                    self.apply_pane_resize();
+                    self.server_render_dirty = true;
+                }
+            }
         }
         Ok(true)
     }
@@ -1971,6 +1983,7 @@ impl App {
                     Line::from("  r    Live reload (execv)"),
                     Line::from("  l    Force redraw (recover)"),
                     Line::from("  i    Dump diagnostics to /tmp"),
+                    Line::from("  .    Toggle sticky on current pane"),
                     Line::from("  ?    This help"),
                     Line::from(format!("  {p}{p}  Send literal prefix")),
                     Line::from(""),
@@ -2919,6 +2932,14 @@ mod tests {
         assert_eq!(
             decide_input_action(InputEvent::DumpDiagnostics),
             InputAction::DumpDiagnostics,
+        );
+    }
+
+    #[test]
+    fn test_decide_input_action_toggle_sticky_active() {
+        assert_eq!(
+            decide_input_action(InputEvent::ToggleStickyActive),
+            InputAction::ToggleStickyActive,
         );
     }
 

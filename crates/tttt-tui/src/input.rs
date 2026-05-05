@@ -135,6 +135,9 @@ pub enum InputEvent {
     Redraw,
     /// Dump diagnostic state for the active session to a file. Bound to `prefix i`.
     DumpDiagnostics,
+    /// Toggle the sticky (pinned-visible) state of the active session.
+    /// Bound to `prefix .`.
+    ToggleStickyActive,
 }
 
 /// Try to parse an SGR mouse sequence from a byte slice.
@@ -376,6 +379,12 @@ impl InputParser {
                             events.push(InputEvent::PassThrough(std::mem::take(&mut passthrough)));
                         }
                         events.push(InputEvent::DumpDiagnostics);
+                    }
+                    b'.' => {
+                        if !passthrough.is_empty() {
+                            events.push(InputEvent::PassThrough(std::mem::take(&mut passthrough)));
+                        }
+                        events.push(InputEvent::ToggleStickyActive);
                     }
                     b if b == self.config.prefix_key => {
                         // Double prefix = send literal prefix key
@@ -619,6 +628,28 @@ mod tests {
         let mut p = parser();
         let events = p.process(&input(&[0x1c, b'I']));
         assert_eq!(events, vec![InputEvent::DumpDiagnostics]);
+    }
+
+    #[test]
+    fn test_prefix_then_period_toggles_sticky() {
+        let mut p = parser();
+        let events = p.process(&input(&[0x1c, b'.']));
+        assert_eq!(events, vec![InputEvent::ToggleStickyActive]);
+        assert!(!p.is_prefix_armed());
+    }
+
+    #[test]
+    fn test_prefix_then_period_flushes_pending_passthrough() {
+        // 'a' 'b' then prefix-period must flush "ab" before the toggle event.
+        let mut p = parser();
+        let events = p.process(&input(&[b'a', b'b', 0x1c, b'.']));
+        assert_eq!(
+            events,
+            vec![
+                InputEvent::PassThrough(b"ab".to_vec()),
+                InputEvent::ToggleStickyActive,
+            ]
+        );
     }
 
     #[test]
