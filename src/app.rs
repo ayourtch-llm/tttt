@@ -233,6 +233,95 @@ fn toggle_session_visibility(visible: &[String], target_id: &str) -> Vec<String>
     }
 }
 
+/// Computed rectangles for the main viewport's layout.
+///
+/// Single source of truth shared between `render_frame` (for painting) and
+/// the PTY resize path (for SIGWINCH). When the two diverge, apps inside
+/// the panes see the wrong size — keeping them computed in one place
+/// avoids that drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneLayout {
+    /// The right-side sidebar area.
+    sidebar: Rect,
+    /// The bottom hint row reserved for status text. Carved out of the
+    /// pane container *before* the grid split so panes have clean edges.
+    hint: Rect,
+    /// One Rect per pane in `render_ids` order, row-major. Empty when no
+    /// panes are visible.
+    pane_rects: Vec<Rect>,
+}
+
+/// Compute the rect layout for the main viewport given the terminal size,
+/// sidebar width, and the number of panes that will be displayed.
+fn compute_pane_layout(
+    screen_cols: u16,
+    screen_rows: u16,
+    sidebar_width: u16,
+    n_panes: usize,
+) -> PaneLayout {
+    let area = Rect::new(0, 0, screen_cols, screen_rows);
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(sidebar_width),
+        ])
+        .split(area);
+    let pane_container = h_chunks[0];
+
+    // Reserve the bottom row of the pane container for the hint. With this
+    // split the grid never paints over the hint, and apps in the bottom
+    // pane no longer lose their last row.
+    let v_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(pane_container);
+    let grid_area = v_chunks[0];
+    let hint = v_chunks[1];
+
+    let pane_rects: Vec<Rect> = if n_panes == 0 {
+        Vec::new()
+    } else if n_panes == 1 {
+        vec![grid_area]
+    } else {
+        let (grid_rows, grid_cols) =
+            compute_grid_dims(n_panes, grid_area.width, grid_area.height);
+        let row_constraints: Vec<Constraint> = (0..grid_rows)
+            .map(|_| Constraint::Ratio(1, grid_rows as u32))
+            .collect();
+        let row_areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(row_constraints)
+            .split(grid_area);
+
+        let mut rects: Vec<Rect> = Vec::with_capacity(n_panes);
+        for r in 0..grid_rows {
+            let remaining = n_panes.saturating_sub(r * grid_cols);
+            if remaining == 0 {
+                break;
+            }
+            let cells_in_row = remaining.min(grid_cols);
+            let col_constraints: Vec<Constraint> = (0..cells_in_row)
+                .map(|_| Constraint::Ratio(1, cells_in_row as u32))
+                .collect();
+            let col_areas = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(col_constraints)
+                .split(row_areas[r]);
+            for c in 0..cells_in_row {
+                rects.push(col_areas[c]);
+            }
+        }
+        rects
+    };
+
+    PaneLayout {
+        sidebar: h_chunks[1],
+        hint,
+        pane_rects,
+    }
+}
+
 /// Pick a grid (rows, cols) for `n` panes that gives each cell an aspect
 /// ratio close to the container's, while keeping `rows * cols >= n`.
 ///
@@ -1430,10 +1519,15 @@ impl App {
                                     &self.visible_sessions,
                                     &target,
                                 );
+                                self.apply_pane_resize();
                                 self.server_render_dirty = true;
                             } else {
-                                // Plain click switches the active session.
+                                // Plain click switches the active session. The
+                                // render set may shrink/grow if the previously-
+                                // active session was not pinned, so recompute
+                                // PTY sizes to match.
                                 self.active_session = Some(target);
+                                self.apply_pane_resize();
                                 self.server_render_dirty = true;
                             }
                         }
@@ -1732,55 +1826,18 @@ impl App {
         let mut active_pane_row_offset: Option<u16> = None;
 
         self.terminal.draw(|frame| {
+            // Compute layout from the frame's actual area, not cached
+            // screen_cols/rows. During terminal resize there's a window where
+            // the cached values lag behind the buffer — using them would index
+            // outside the buffer and panic in ratatui.
             let area = frame.area();
-            let chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Min(1),
-                    Constraint::Length(sidebar_width),
-                ])
-                .split(area);
-
-            // Aspect-ratio-aware grid layout for multi-view. Pick (rows, cols)
-            // so each cell's aspect approximates the container's; fill row-major
-            // with the last row spanning fewer (wider) cells when N isn't a
-            // perfect rectangle. Single pane collapses to the full area.
-            let pane_areas: Vec<Rect> = if panes.len() <= 1 {
-                vec![chunks[0]]
-            } else {
-                let (grid_rows, grid_cols) = compute_grid_dims(
-                    panes.len(),
-                    chunks[0].width,
-                    chunks[0].height,
-                );
-                let row_constraints: Vec<Constraint> = (0..grid_rows)
-                    .map(|_| Constraint::Ratio(1, grid_rows as u32))
-                    .collect();
-                let row_areas = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints(row_constraints)
-                    .split(chunks[0]);
-
-                let mut rects: Vec<Rect> = Vec::with_capacity(panes.len());
-                for r in 0..grid_rows {
-                    let remaining = panes.len().saturating_sub(r * grid_cols);
-                    if remaining == 0 {
-                        break;
-                    }
-                    let cells_in_row = remaining.min(grid_cols);
-                    let col_constraints: Vec<Constraint> = (0..cells_in_row)
-                        .map(|_| Constraint::Ratio(1, cells_in_row as u32))
-                        .collect();
-                    let col_areas = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints(col_constraints)
-                        .split(row_areas[r]);
-                    for c in 0..cells_in_row {
-                        rects.push(col_areas[c]);
-                    }
-                }
-                rects
-            };
+            let layout = compute_pane_layout(
+                area.width,
+                area.height,
+                sidebar_width,
+                panes.len(),
+            );
+            let pane_areas = &layout.pane_rects;
 
             for (i, pane) in panes.iter().enumerate() {
                 let Some(&rect) = pane_areas.get(i) else { break };
@@ -1820,7 +1877,9 @@ impl App {
                 };
                 // Scope highlights to the active pane's Rect so they don't
                 // bleed into other visible panes.
-                let pane = active_pane_rect.unwrap_or(chunks[0]);
+                let pane = active_pane_rect.unwrap_or_else(|| {
+                    layout.pane_rects.first().copied().unwrap_or(layout.hint)
+                });
                 for row in hl.y..hl.y.saturating_add(hl.height) {
                     for col in hl.x..hl.x.saturating_add(hl.width) {
                         let abs_x = pane.x + col;
@@ -1840,34 +1899,28 @@ impl App {
             )
             .build_info(&uptime)
             .visible_ids(&visible_ids_snapshot);
-            frame.render_widget(widget, chunks[1]);
+            frame.render_widget(widget, layout.sidebar);
 
-            // Hint in the bottom status row of the PTY pane.
-            if chunks[0].height > 0 {
-                let hint_area = Rect::new(
-                    chunks[0].x,
-                    chunks[0].y + chunks[0].height.saturating_sub(1),
-                    chunks[0].width,
-                    1,
-                );
+            // Hint in the dedicated row at the bottom of the pane container.
+            if layout.hint.height > 0 {
                 if show_ctrl_c_hint {
                     let msg = hint_message.as_deref()
                         .unwrap_or("Press Ctrl+\\ then ? for help");
                     let hint_widget = Paragraph::new(msg)
                         .style(Style::default().fg(Color::Yellow).bg(Color::Black));
-                    frame.render_widget(hint_widget, hint_area);
+                    frame.render_widget(hint_widget, layout.hint);
                 } else {
                     let hint_text = format!("Press {} ? for help", prefix_name_str);
                     let hint_widget = Paragraph::new(hint_text)
                         .style(Style::default().fg(Color::DarkGray));
-                    frame.render_widget(hint_widget, hint_area);
+                    frame.render_widget(hint_widget, layout.hint);
                 }
             }
 
             // Help overlay popup
             if showing_help {
                 let p = prefix_name.as_deref().unwrap_or("");
-                let popup_area = help_popup_area(area);
+                let popup_area = help_popup_area(frame.area());
 
                 frame.render_widget(Clear, popup_area);
 
@@ -1920,29 +1973,77 @@ impl App {
         self.screen_rows = rows;
         let (pty_cols, pty_rows) = calculate_pane_dimensions(cols, rows, self.config.sidebar_width);
         self.pty_dims = (pty_cols, pty_rows);
-        let resized_ids: Vec<String> = {
-            let mut mgr = self.sessions.lock().unwrap();
-            let ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
-            for id in &ids {
-                if let Ok(session) = mgr.get_mut(id) {
-                    let _ = session.resize(pty_cols, pty_rows);
-                }
-            }
-            ids
-        };
-        let resize_data = format!(
-            r#"{{"type":"resize","cols":{},"rows":{}}}"#,
-            pty_cols, pty_rows
-        ).into_bytes();
-        for id in &resized_ids {
-            let _ = self.logger.log_event(&LogEvent::new(
-                id.clone(), LogDirection::Meta, resize_data.clone(),
-            ));
-        }
-        // Notify ratatui about the resize, then redraw
+        self.apply_pane_resize();
+        // Notify ratatui about the resize, then redraw.
         self.terminal.resize(ratatui::layout::Rect::new(0, 0, cols, rows))?;
         self.render_frame()?;
         Ok(())
+    }
+
+    /// Resize each session's PTY to match the current layout.
+    ///
+    /// Sessions in the effective render list get their grid cell dimensions.
+    /// Sessions NOT in the render list get the full single-pane dimensions so
+    /// they're already correctly sized when the user later activates them
+    /// alone (no extra SIGWINCH on switch). Sessions whose dims are already
+    /// correct are skipped to avoid redundant SIGWINCHes.
+    fn apply_pane_resize(&mut self) {
+        let render_ids = compute_render_session_ids(
+            self.active_session.as_deref(),
+            &self.visible_sessions,
+            &self.session_order,
+        );
+        let layout = compute_pane_layout(
+            self.screen_cols,
+            self.screen_rows,
+            self.config.sidebar_width,
+            render_ids.len(),
+        );
+
+        // Map render_id → assigned (cols, rows). Sessions not in this map get
+        // single-pane dims (i.e., the full grid area).
+        let mut id_to_cell: std::collections::HashMap<&str, (u16, u16)> =
+            std::collections::HashMap::new();
+        for (i, id) in render_ids.iter().enumerate() {
+            if let Some(rect) = layout.pane_rects.get(i) {
+                id_to_cell.insert(id.as_str(), (rect.width, rect.height));
+            }
+        }
+
+        // Single-pane fallback dims = full grid area (one row shy of the
+        // pane container after the hint row is reserved). Use pty_dims as
+        // the source of truth so we stay consistent with the existing
+        // calculation everywhere else.
+        let (single_cols, single_rows) = self.pty_dims;
+
+        let mut to_log: Vec<(String, u16, u16)> = Vec::new();
+        {
+            let mut mgr = self.sessions.lock().unwrap();
+            let ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
+            for id in ids {
+                let (target_cols, target_rows) = id_to_cell
+                    .get(id.as_str())
+                    .copied()
+                    .unwrap_or((single_cols, single_rows));
+                if let Ok(session) = mgr.get_mut(&id) {
+                    let (current_rows, current_cols) = session.screen().screen().size();
+                    if current_cols != target_cols || current_rows != target_rows {
+                        let _ = session.resize(target_cols, target_rows);
+                        to_log.push((id, target_cols, target_rows));
+                    }
+                }
+            }
+        }
+
+        for (id, cols, rows) in to_log {
+            let resize_data = format!(
+                r#"{{"type":"resize","cols":{},"rows":{}}}"#,
+                cols, rows
+            ).into_bytes();
+            let _ = self.logger.log_event(&LogEvent::new(
+                id, LogDirection::Meta, resize_data,
+            ));
+        }
     }
 
     /// Force a full repaint of the host terminal. Used as a recovery shortcut
@@ -2406,6 +2507,13 @@ impl App {
 
     /// Resize the PTY to the minimum size across the main terminal and all connected viewers.
     /// Forces a full ratatui redraw to remove stale content.
+    ///
+    /// When multi-pane is active (`visible_sessions` non-empty), the main TUI's
+    /// per-cell layout owns PTY sizes — uniformly resizing every session to a
+    /// viewer-derived minimum would clobber the cell dimensions. In that case
+    /// we delegate to `apply_pane_resize` and only notify viewers about the
+    /// single-pane fallback dims, which is a known trade-off: viewers paint
+    /// whatever size the main TUI assigned to their active session.
     fn resize_pty_to_min_and_redraw(&mut self) {
         // The PTY can never be larger than the main terminal's usable area
         let (max_pty_cols, max_pty_rows) = calculate_pane_dimensions(
@@ -2422,6 +2530,30 @@ impl App {
 
         let (min_cols, min_rows) =
             calculate_min_dimensions(&viewer_dims, max_pty_cols, max_pty_rows);
+
+        if !self.visible_sessions.is_empty() {
+            // Multi-pane is active: main TUI layout dictates per-session sizes.
+            self.apply_pane_resize();
+            // Notify each viewer with its active session's actual current size
+            // (which apply_pane_resize may have just changed). Falls back to
+            // the single-pane min if the viewer's active session can't be
+            // found.
+            let mgr = self.sessions.lock().unwrap();
+            for client in &mut self.viewer_clients {
+                client.invalidate();
+                let (cols, rows) = client.active_session.as_ref()
+                    .and_then(|sid| mgr.get(sid).ok())
+                    .map(|s| {
+                        let (r, c) = s.screen().screen().size();
+                        (c, r)
+                    })
+                    .unwrap_or((min_cols, min_rows));
+                client.send_window_size(cols, rows);
+            }
+            drop(mgr);
+            let _ = self.render_frame();
+            return;
+        }
 
         // Check if dimensions actually changed
         let (old_cols, old_rows) = self.pty_dims;
@@ -3202,6 +3334,75 @@ mod tests {
             &ss(&["a", "b", "c"]),
         );
         assert_eq!(result, ss(&["a", "c"]));
+    }
+
+    // ── Chunk 3e: compute_pane_layout ────────────────────────────────────────
+
+    #[test]
+    fn test_layout_zero_panes_has_empty_pane_rects() {
+        let l = compute_pane_layout(100, 30, 30, 0);
+        assert!(l.pane_rects.is_empty());
+        assert_eq!(l.hint.height, 1);
+        assert_eq!(l.sidebar.width, 30);
+    }
+
+    #[test]
+    fn test_layout_single_pane_takes_full_grid_area() {
+        let l = compute_pane_layout(100, 30, 30, 1);
+        assert_eq!(l.pane_rects.len(), 1);
+        let p = l.pane_rects[0];
+        // Pane area = (cols - sidebar) wide, (rows - hint) tall.
+        assert_eq!(p.width, 70);
+        assert_eq!(p.height, 29);
+        // Hint is the bottom row.
+        assert_eq!(l.hint.y, p.y + p.height);
+        assert_eq!(l.hint.height, 1);
+    }
+
+    #[test]
+    fn test_layout_four_panes_form_2x2_with_disjoint_cells() {
+        let l = compute_pane_layout(100, 30, 30, 4);
+        assert_eq!(l.pane_rects.len(), 4);
+        // Total width covered must equal pane area width (70), total height
+        // for one column must equal grid height (29).
+        let p0 = l.pane_rects[0];
+        let p1 = l.pane_rects[1];
+        let p2 = l.pane_rects[2];
+        let p3 = l.pane_rects[3];
+        // Top row cells share a y; bottom row cells share a different y.
+        assert_eq!(p0.y, p1.y);
+        assert_eq!(p2.y, p3.y);
+        assert_ne!(p0.y, p2.y);
+        // Cells in a row share an x sequence that tiles the pane width.
+        assert_eq!(p0.x + p0.width, p1.x);
+        assert_eq!(p2.x + p2.width, p3.x);
+    }
+
+    #[test]
+    fn test_layout_three_panes_last_row_spans_remaining_columns() {
+        // 3 panes in a 100x30 container → 2x2 grid, last row has 1 cell
+        // spanning the full grid width (since cells_in_row collapses to 1).
+        let l = compute_pane_layout(100, 30, 30, 3);
+        assert_eq!(l.pane_rects.len(), 3);
+        let bottom = l.pane_rects[2];
+        // Bottom-row pane should span the full pane container width (70).
+        assert_eq!(bottom.width, 70);
+    }
+
+    #[test]
+    fn test_layout_hint_does_not_overlap_panes() {
+        // No pane rect should overlap the hint row vertically.
+        for n in 1..=6 {
+            let l = compute_pane_layout(100, 30, 30, n);
+            for p in &l.pane_rects {
+                assert!(
+                    p.y + p.height <= l.hint.y,
+                    "n={n}: pane {:?} overlaps hint {:?}",
+                    p,
+                    l.hint
+                );
+            }
+        }
     }
 
     // ── Chunk 3d: compute_grid_dims ──────────────────────────────────────────
