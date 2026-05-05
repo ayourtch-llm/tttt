@@ -606,6 +606,14 @@ fn process_jsonrpc_request<H: crate::handler::ToolHandler>(
         }
     };
 
+    // Per JSON-RPC 2.0: a request without an `id` (or with `id: null`) is a
+    // notification and MUST NOT receive a response, not even an error.
+    // Violating this caused MCP clients (e.g. Claude Code sending
+    // `notifications/initialized`) to drop the socket on first contact.
+    if req.id.is_none() {
+        return String::new();
+    }
+
     let id = req.id.clone().unwrap_or(Value::Null);
 
     let result = match req.method.as_str() {
@@ -614,9 +622,7 @@ fn process_jsonrpc_request<H: crate::handler::ToolHandler>(
             "capabilities": { "tools": {} },
             "serverInfo": { "name": server_name, "version": "0.1.0" }
         })),
-        "initialized" => return String::new(), // notification, no response
         "ping" => Ok(json!({})),
-        "notifications/cancelled" => return String::new(),
         "tools/list" => {
             let tools = handler.tool_definitions();
             Ok(json!({"tools": tools}))
@@ -744,6 +750,31 @@ mod tests {
     fn test_process_notifications_cancelled_returns_empty() {
         let mut handler = make_handler();
         let req = r#"{"jsonrpc":"2.0","id":null,"method":"notifications/cancelled","params":{}}"#;
+        let resp = process_jsonrpc_request(req, &mut handler, "srv");
+        assert!(resp.is_empty());
+    }
+
+    #[test]
+    fn test_process_notifications_initialized_returns_empty() {
+        // Regression: Claude Code (MCP protocolVersion 2025-11-25) sends the
+        // namespaced "notifications/initialized". JSON-RPC 2.0 requires that
+        // notifications (no id) never receive a response — not even an error.
+        let mut handler = make_handler();
+        let req = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let resp = process_jsonrpc_request(req, &mut handler, "srv");
+        assert!(
+            resp.is_empty(),
+            "notifications/initialized must not produce a response, got: {}",
+            resp
+        );
+    }
+
+    #[test]
+    fn test_process_unknown_notification_returns_empty() {
+        // Per JSON-RPC 2.0, any request without an `id` is a notification and
+        // must never receive a response, even for unknown methods.
+        let mut handler = make_handler();
+        let req = r#"{"jsonrpc":"2.0","method":"notifications/something_new"}"#;
         let resp = process_jsonrpc_request(req, &mut handler, "srv");
         assert!(resp.is_empty());
     }

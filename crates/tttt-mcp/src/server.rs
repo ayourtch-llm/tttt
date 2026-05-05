@@ -40,15 +40,19 @@ impl<R: BufRead, W: Write, H: ToolHandler> McpServer<R, W, H> {
             }
         };
 
+        // Per JSON-RPC 2.0: a request without an `id` (or with `id: null`) is a
+        // notification and MUST NOT receive a response, not even an error.
+        if request.id.is_none() {
+            return None;
+        }
+
         let id = request.id.clone().unwrap_or(Value::Null);
 
         let result = match request.method.as_str() {
             "initialize" => self.handle_initialize(&request),
-            "initialized" => return None, // notification, no response
             "ping" => Ok(json!({})),
             "tools/list" => self.handle_tools_list(),
             "tools/call" => self.handle_tools_call(&request),
-            "notifications/cancelled" => return None,
             _ => Err(McpError::Protocol(request.method.clone())),
         };
 
@@ -174,6 +178,26 @@ mod tests {
         let mut server = make_server("");
         let resp = server.process_line(r#"{"jsonrpc":"2.0","method":"initialized"}"#);
         assert!(resp.is_none()); // notifications don't get responses
+    }
+
+    #[test]
+    fn test_notifications_initialized_no_response() {
+        // Regression: Claude Code (MCP protocolVersion 2025-11-25) sends the
+        // namespaced "notifications/initialized". JSON-RPC 2.0 requires that
+        // notifications never receive a response — not even an error.
+        let mut server = make_server("");
+        let resp =
+            server.process_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        assert!(resp.is_none(), "got unexpected response: {:?}", resp);
+    }
+
+    #[test]
+    fn test_unknown_notification_no_response() {
+        // Per JSON-RPC 2.0, any request without an `id` is a notification and
+        // must never receive a response, even for unknown methods.
+        let mut server = make_server("");
+        let resp = server.process_line(r#"{"jsonrpc":"2.0","method":"notifications/future"}"#);
+        assert!(resp.is_none());
     }
 
     #[test]
