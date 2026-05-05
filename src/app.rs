@@ -216,19 +216,14 @@ fn reconcile_session_order(current: &[String], actual: &[String]) -> Vec<String>
     result
 }
 
-/// Toggle a session's pinned-visible state.
+/// Toggle a session's pinned-visible (sticky) state.
 ///
-/// Returns the new `visible` Vec. The active session is implicitly always
-/// rendered, so toggling visibility on the active session is a no-op (it
-/// preserves the "active is always shown" invariant).
-fn toggle_session_visibility(
-    visible: &[String],
-    target_id: &str,
-    active_id: Option<&str>,
-) -> Vec<String> {
-    if active_id == Some(target_id) {
-        return visible.to_vec();
-    }
+/// Returns the new `visible` Vec. Sticky membership is independent of which
+/// session is active: ctrl-clicking the active session pins it so it remains
+/// visible after switching active to another session. The active session is
+/// always rendered regardless of `visible`, but its sticky bit only matters
+/// once the user moves on.
+fn toggle_session_visibility(visible: &[String], target_id: &str) -> Vec<String> {
     if visible.iter().any(|s| s == target_id) {
         visible.iter().filter(|s| s.as_str() != target_id).cloned().collect()
     } else {
@@ -1427,12 +1422,13 @@ impl App {
                         if session_idx < self.session_order.len() {
                             let target = self.session_order[session_idx].clone();
                             if modifiers.ctrl {
-                                // Ctrl-click toggles visibility (active is always
-                                // visible, so toggling on the active is a no-op).
+                                // Ctrl-click toggles the session's sticky bit.
+                                // For the currently-active session this means it
+                                // will remain visible after the user switches
+                                // active away.
                                 self.visible_sessions = toggle_session_visibility(
                                     &self.visible_sessions,
                                     &target,
-                                    self.active_session.as_deref(),
                                 );
                                 self.server_render_dirty = true;
                             } else {
@@ -3136,29 +3132,33 @@ mod tests {
 
     #[test]
     fn test_toggle_adds_when_absent() {
-        let result = toggle_session_visibility(&ss(&[]), "b", Some("a"));
+        let result = toggle_session_visibility(&ss(&[]), "b");
         assert_eq!(result, ss(&["b"]));
     }
 
     #[test]
     fn test_toggle_removes_when_present() {
-        let result = toggle_session_visibility(&ss(&["b", "c"]), "b", Some("a"));
+        let result = toggle_session_visibility(&ss(&["b", "c"]), "b");
         assert_eq!(result, ss(&["c"]));
     }
 
     #[test]
-    fn test_toggle_on_active_is_noop() {
-        // Toggling the active session must preserve the visible list unchanged
-        // (preserves the "active is always visible" invariant).
-        let result = toggle_session_visibility(&ss(&["b"]), "a", Some("a"));
-        assert_eq!(result, ss(&["b"]));
+    fn test_toggle_on_active_makes_it_sticky() {
+        // The active session can be pinned. Independent of who is active —
+        // membership in visible is the user's "stay visible after switch"
+        // intent.
+        let result = toggle_session_visibility(&ss(&[]), "a");
+        assert_eq!(result, ss(&["a"]));
     }
 
     #[test]
-    fn test_toggle_with_no_active_session() {
-        // No active session — any target can be toggled freely.
-        let result = toggle_session_visibility(&ss(&[]), "x", None);
-        assert_eq!(result, ss(&["x"]));
+    fn test_toggle_unsticks_active_when_already_sticky() {
+        // Symmetric: a second ctrl-click on a sticky session removes it
+        // from visible. If it happens to be active, it remains rendered
+        // because the active session is implicitly visible — but it loses
+        // its sticky bit, so it disappears once the user switches away.
+        let result = toggle_session_visibility(&ss(&["a", "b"]), "a");
+        assert_eq!(result, ss(&["b"]));
     }
 
     #[test]

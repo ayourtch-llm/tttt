@@ -126,11 +126,11 @@ impl<'a> Widget for SidebarWidget<'a> {
                 }
             };
             let display_name = session.name.as_deref().unwrap_or(&session.id);
-            // Separator between status char and name. Replaced with a visibility
-            // glyph when the session is pinned-visible (non-active). The active
-            // session is already styled with reverse-video, so we don't double-mark.
-            let is_pinned_visible = !is_active
-                && self.visible_ids.iter().any(|v| v == &session.id);
+            // Separator between status char and name. Replaced with a sticky
+            // glyph when the session is pinned-visible. Shown for the active
+            // session too — the reverse-video styling distinguishes active,
+            // while the glyph signals "this stays visible after switching".
+            let is_pinned_visible = self.visible_ids.iter().any(|v| v == &session.id);
             let separator = if is_pinned_visible { '•' } else { ' ' };
             // "{i}{status_char}{separator}{name}" — index + status + separator = 3 chars
             let name_width = usable_width.saturating_sub(3);
@@ -561,12 +561,13 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // test_active_session_does_not_get_glyph
+    // test_active_session_shows_sticky_glyph_when_pinned
     // ------------------------------------------------------------------
     #[test]
-    fn test_active_session_does_not_get_glyph() {
-        // Even if the active session is also in visible_ids, we don't add the
-        // glyph — reverse-video already marks it.
+    fn test_active_session_shows_sticky_glyph_when_pinned() {
+        // The active session shows the • glyph when it's also in visible_ids.
+        // Reverse-video distinguishes active; the glyph signals "stays
+        // visible after switching active away".
         let area = Rect::new(0, 0, 25, 10);
         let mut buf = Buffer::empty(area);
         let sessions = vec![make_meta("pty-1", SessionStatus::Running)];
@@ -579,8 +580,24 @@ mod tests {
 
         let row2 = full_row(&buf, area, 2);
         assert!(
+            row2.contains('•'),
+            "active session that's pinned should show '•', got: {row2:?}"
+        );
+    }
+
+    #[test]
+    fn test_active_session_no_glyph_when_not_pinned() {
+        let area = Rect::new(0, 0, 25, 10);
+        let mut buf = Buffer::empty(area);
+        let sessions = vec![make_meta("pty-1", SessionStatus::Running)];
+        let reminders: Vec<String> = vec![];
+
+        SidebarWidget::new(&sessions, Some("pty-1"), &reminders).render(area, &mut buf);
+
+        let row2 = full_row(&buf, area, 2);
+        assert!(
             !row2.contains('•'),
-            "active session must not show pinned-visible glyph, got: {row2:?}"
+            "active session that's not pinned must not show '•', got: {row2:?}"
         );
     }
 
