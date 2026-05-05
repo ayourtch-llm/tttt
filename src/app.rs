@@ -1493,17 +1493,52 @@ impl App {
                     let sidebar_width = self.config.sidebar_width;
                     let pane_width = self.screen_cols.saturating_sub(sidebar_width);
                     if col < pane_width {
-                        // Click in PTY pane — start text selection
-                        self.selection = Some(tttt_tui::Selection::new(row, col));
-                        self.scroll_offset = 0; // Start from live view
-                        // Snapshot scrollback count to detect new output during selection
-                        self.selection_scroll_base = self.active_session.as_ref()
-                            .and_then(|id| {
-                                let mgr = self.sessions.lock().unwrap();
-                                mgr.get(id).ok().map(|s| s.max_scroll_offset())
-                            })
-                            .unwrap_or(0);
-                        self.server_render_dirty = true;
+                        // Click in the PTY pane area. In split view, hit-test
+                        // the click against each pane's rect: if it landed on a
+                        // non-active pane, switch focus to it instead of
+                        // starting a selection.
+                        let render_ids = compute_render_session_ids(
+                            self.active_session.as_deref(),
+                            &self.visible_sessions,
+                            &self.session_order,
+                        );
+                        let mut focus_switched = false;
+                        if render_ids.len() > 1 {
+                            let layout = compute_pane_layout(
+                                self.screen_cols,
+                                self.screen_rows,
+                                sidebar_width,
+                                render_ids.len(),
+                            );
+                            if let Some(idx) = layout.pane_rects.iter().position(|r| {
+                                col >= r.x
+                                    && col < r.x.saturating_add(r.width)
+                                    && row >= r.y
+                                    && row < r.y.saturating_add(r.height)
+                            }) {
+                                if let Some(hit_id) = render_ids.get(idx) {
+                                    if Some(hit_id.as_str()) != self.active_session.as_deref() {
+                                        self.active_session = Some(hit_id.clone());
+                                        self.apply_pane_resize();
+                                        self.server_render_dirty = true;
+                                        focus_switched = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !focus_switched {
+                            // Active pane (or single-pane): start selection.
+                            self.selection = Some(tttt_tui::Selection::new(row, col));
+                            self.scroll_offset = 0; // Start from live view
+                            // Snapshot scrollback count to detect new output during selection
+                            self.selection_scroll_base = self.active_session.as_ref()
+                                .and_then(|id| {
+                                    let mgr = self.sessions.lock().unwrap();
+                                    mgr.get(id).ok().map(|s| s.max_scroll_offset())
+                                })
+                                .unwrap_or(0);
+                            self.server_render_dirty = true;
+                        }
                     } else if row >= 2 {
                         // Click in sidebar
                         // Sessions start at row 2 (after header + separator)
@@ -3387,6 +3422,31 @@ mod tests {
         let bottom = l.pane_rects[2];
         // Bottom-row pane should span the full pane container width (70).
         assert_eq!(bottom.width, 70);
+    }
+
+    #[test]
+    fn test_layout_pane_rects_partition_grid_area() {
+        // Every cell in the grid area must hit exactly one pane — no gaps,
+        // no overlaps. Click hit-testing relies on this: a single click
+        // resolves to a unique pane.
+        let l = compute_pane_layout(100, 30, 30, 4);
+        let pane_x_max = 70u16; // pane container width
+        let grid_y_max = l.hint.y; // grid area ends where hint starts
+        for y in 0..grid_y_max {
+            for x in 0..pane_x_max {
+                let hits: usize = l
+                    .pane_rects
+                    .iter()
+                    .filter(|r| {
+                        x >= r.x
+                            && x < r.x.saturating_add(r.width)
+                            && y >= r.y
+                            && y < r.y.saturating_add(r.height)
+                    })
+                    .count();
+                assert_eq!(hits, 1, "({x},{y}) should hit exactly one pane");
+            }
+        }
     }
 
     #[test]
