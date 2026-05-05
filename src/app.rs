@@ -76,7 +76,7 @@ enum InputAction {
     /// Send the raw prefix key byte to the active session.
     PrefixEscape,
     /// Mouse events — handled directly, no further mapping needed.
-    MousePress { button: tttt_tui::MouseButton, col: u16, row: u16 },
+    MousePress { button: tttt_tui::MouseButton, modifiers: tttt_tui::MouseModifiers, col: u16, row: u16 },
     MouseDrag { button: tttt_tui::MouseButton, col: u16, row: u16 },
     MouseRelease { col: u16, row: u16 },
     ScrollUp { col: u16, row: u16 },
@@ -100,7 +100,7 @@ fn decide_input_action(event: tttt_tui::InputEvent) -> InputAction {
         tttt_tui::InputEvent::Reload              => InputAction::Reload,
         tttt_tui::InputEvent::Detach              => InputAction::Detach,
         tttt_tui::InputEvent::PrefixEscape        => InputAction::PrefixEscape,
-        tttt_tui::InputEvent::MousePress { button, col, row } => InputAction::MousePress { button, col, row },
+        tttt_tui::InputEvent::MousePress { button, modifiers, col, row } => InputAction::MousePress { button, modifiers, col, row },
         tttt_tui::InputEvent::MouseDrag { button, col, row } => InputAction::MouseDrag { button, col, row },
         tttt_tui::InputEvent::MouseRelease { col, row } => InputAction::MouseRelease { col, row },
         tttt_tui::InputEvent::ScrollUp { col, row } => InputAction::ScrollUp { col, row },
@@ -214,6 +214,70 @@ fn reconcile_session_order(current: &[String], actual: &[String]) -> Vec<String>
         }
     }
     result
+}
+
+/// Toggle a session's pinned-visible state.
+///
+/// Returns the new `visible` Vec. The active session is implicitly always
+/// rendered, so toggling visibility on the active session is a no-op (it
+/// preserves the "active is always shown" invariant).
+fn toggle_session_visibility(
+    visible: &[String],
+    target_id: &str,
+    active_id: Option<&str>,
+) -> Vec<String> {
+    if active_id == Some(target_id) {
+        return visible.to_vec();
+    }
+    if visible.iter().any(|s| s == target_id) {
+        visible.iter().filter(|s| s.as_str() != target_id).cloned().collect()
+    } else {
+        let mut next = visible.to_vec();
+        next.push(target_id.to_string());
+        next
+    }
+}
+
+/// Compute a cursor-aware viewport row offset for rendering a PTY screen
+/// into a smaller display area.
+///
+/// Default policy: keep the cursor visible at (or below) the bottom edge of
+/// the pane while preferring offset=0 when the cursor is high enough that it
+/// already fits. The result is always within `[0, max(0, pty_rows - area_h)]`.
+///
+/// - When `pty_rows <= area_h`, the area can show the full screen → offset 0.
+/// - When the cursor sits within the top `area_h` rows, offset stays 0 so the
+///   top of the screen (header / app UI) remains visible.
+/// - As the cursor moves below the pane, the viewport scrolls down just
+///   enough to keep the cursor on the bottom edge.
+fn compute_pane_row_offset(pty_rows: u16, area_h: u16, cursor_row: u16) -> u16 {
+    if area_h >= pty_rows || area_h == 0 {
+        return 0;
+    }
+    let max_offset = pty_rows - area_h;
+    cursor_row
+        .saturating_sub(area_h.saturating_sub(1))
+        .min(max_offset)
+}
+
+/// Compute the ordered list of session IDs to render in the main viewport.
+///
+/// Walks `session_order` and returns the subset that is either the active
+/// session or in the pinned-visible set. Order matches `session_order` so
+/// the rendered stack mirrors the sidebar layout. The active session is
+/// always included even if not in `visible` (the implicit-visibility invariant).
+fn compute_render_session_ids(
+    active: Option<&str>,
+    visible: &[String],
+    session_order: &[String],
+) -> Vec<String> {
+    session_order
+        .iter()
+        .filter(|id| {
+            active == Some(id.as_str()) || visible.iter().any(|v| v == *id)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Compute the new session index after a relative navigation step.
@@ -383,6 +447,11 @@ pub struct App {
     tui_state: tttt_mcp::SharedTuiState,
     active_session: Option<String>,
     session_order: Vec<String>,
+    /// Sessions explicitly pinned visible in the main viewport, in addition to
+    /// the active session (which is always rendered). Order is preserved but
+    /// the effective render list is reordered against `session_order` at
+    /// render time. Reconciled when sessions are added/removed.
+    visible_sessions: Vec<String>,
     screen_cols: u16,
     screen_rows: u16,
     /// Unix socket listener for viewer connections.
@@ -462,6 +531,7 @@ impl App {
             tui_state: Arc::new(tttt_mcp::TuiState::new()),
             active_session: None,
             session_order: Vec::new(),
+            visible_sessions: Vec::new(),
             screen_cols: cols,
             screen_rows: rows,
             viewer_listener: None,
@@ -713,6 +783,7 @@ impl App {
     #[allow(dead_code)]
     pub fn remove_from_session_order(&mut self, id: &str) {
         self.session_order.retain(|s| s != id);
+        self.visible_sessions.retain(|s| s != id);
         if self.active_session.as_deref() == Some(id) {
             self.active_session = self.session_order.first().cloned();
         }
@@ -1239,6 +1310,7 @@ impl App {
         let actual_ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
         drop(mgr);
         self.session_order = reconcile_session_order(&self.session_order, &actual_ids);
+        self.visible_sessions.retain(|id| actual_ids.contains(id));
     }
 
     fn handle_input_event(&mut self, event: InputEvent) -> Result<bool, Box<dyn std::error::Error>> {
@@ -1279,7 +1351,7 @@ impl App {
                 self.reload_requested = true;
                 return Ok(false);
             }
-            InputAction::MousePress { button, col, row } => {
+            InputAction::MousePress { button, modifiers, col, row } => {
                 if matches!(button, tttt_tui::MouseButton::Left) {
                     let sidebar_width = self.config.sidebar_width;
                     let pane_width = self.screen_cols.saturating_sub(sidebar_width);
@@ -1296,12 +1368,25 @@ impl App {
                             .unwrap_or(0);
                         self.server_render_dirty = true;
                     } else if row >= 2 {
-                        // Click in sidebar — switch to the clicked session
+                        // Click in sidebar
                         // Sessions start at row 2 (after header + separator)
                         let session_idx = (row - 2) as usize;
                         if session_idx < self.session_order.len() {
-                            self.active_session = Some(self.session_order[session_idx].clone());
-                            self.server_render_dirty = true;
+                            let target = self.session_order[session_idx].clone();
+                            if modifiers.ctrl {
+                                // Ctrl-click toggles visibility (active is always
+                                // visible, so toggling on the active is a no-op).
+                                self.visible_sessions = toggle_session_visibility(
+                                    &self.visible_sessions,
+                                    &target,
+                                    self.active_session.as_deref(),
+                                );
+                                self.server_render_dirty = true;
+                            } else {
+                                // Plain click switches the active session.
+                                self.active_session = Some(target);
+                                self.server_render_dirty = true;
+                            }
                         }
                     }
                 }
@@ -1476,42 +1561,73 @@ impl App {
         let selection_base = self.selection_scroll_base;
         let has_selection = self.selection.is_some();
         let mut sync_suppressed = false;
-        // screen_data: (screen, cursor_row, cursor_col, pty_rows)
-        let screen_data: Option<(vt100::Screen, u16, u16, u16)> = self.active_session.as_ref()
-            .and_then(|id| {
-                let mgr = self.sessions.lock().unwrap();
-                mgr.get(id).ok().and_then(|session| {
-                    // Check synchronized output under the SAME lock as the screen
-                    // clone to prevent TOCTOU race with MCP threads pumping data.
-                    if session.synchronized_output() {
-                        sync_suppressed = true;
-                        return None; // suppress: sync bracket still open
-                    }
-                    // Clone screen first, then apply scroll offset on the clone
-                    // so we don't affect the shared session state (viewers see live view)
-                    let mut screen = session.screen().screen().clone();
-                    let effective_scroll = if has_selection {
-                        // Compensate for new output that arrived during selection
-                        compute_selection_scroll_compensation(
-                            selection_base,
-                            session.max_scroll_offset(),
-                            manual_scroll,
-                        )
-                    } else {
-                        manual_scroll
-                    };
-                    if effective_scroll > 0 {
-                        screen.set_scrollback(effective_scroll);
-                    }
-                    let (pty_rows, _) = screen.size();
-                    let (row, col) = if effective_scroll > 0 {
-                        (0, 0) // Hide cursor when scrolled back
-                    } else {
-                        session.cursor_position()
-                    };
-                    Some((screen, row, col, pty_rows))
-                })
-            });
+        let active_id_str = self.active_session.clone();
+        // Effective render list = active + pinned visible, ordered by session_order.
+        let render_ids = compute_render_session_ids(
+            active_id_str.as_deref(),
+            &self.visible_sessions,
+            &self.session_order,
+        );
+
+        // Per-pane render data, ordered by render_ids.
+        struct PaneData {
+            screen: vt100::Screen,
+            is_active: bool,
+            cursor_row: u16,
+            cursor_col: u16,
+            pty_rows: u16,
+            show_cursor: bool,
+        }
+
+        let mut panes: Vec<PaneData> = Vec::with_capacity(render_ids.len());
+        {
+            let mgr = self.sessions.lock().unwrap();
+            for id in &render_ids {
+                let Ok(session) = mgr.get(id) else { continue };
+                let is_active = active_id_str.as_deref() == Some(id);
+                // Sync-output suppression applies only to the active session: if
+                // the active session is mid-bracket, suppress the whole frame to
+                // avoid tearing. Non-active visible panes render live regardless.
+                if is_active && session.synchronized_output() {
+                    sync_suppressed = true;
+                    break;
+                }
+                let mut screen = session.screen().screen().clone();
+                let effective_scroll = if is_active && has_selection {
+                    compute_selection_scroll_compensation(
+                        selection_base,
+                        session.max_scroll_offset(),
+                        manual_scroll,
+                    )
+                } else if is_active {
+                    manual_scroll
+                } else {
+                    0
+                };
+                if effective_scroll > 0 {
+                    screen.set_scrollback(effective_scroll);
+                }
+                let (pty_rows, _) = screen.size();
+                // Track each session's cursor position so we can compute a
+                // viewport offset that keeps the active region visible. For
+                // inactive panes we still use it for viewport selection but
+                // never render the terminal cursor itself.
+                let (cursor_row, cursor_col) = if is_active && effective_scroll > 0 {
+                    (0, 0)
+                } else {
+                    session.cursor_position()
+                };
+                let show_cursor = is_active && effective_scroll == 0;
+                panes.push(PaneData {
+                    screen,
+                    is_active,
+                    cursor_row,
+                    cursor_col,
+                    pty_rows,
+                    show_cursor,
+                });
+            }
+        }
 
         // If sync mode suppressed the render, return false so the caller
         // keeps dirty=true and retries on the next loop iteration.
@@ -1532,6 +1648,7 @@ impl App {
         let uptime = format!("Uptime: {}s", uptime_secs);
         let sidebar_width = self.config.sidebar_width;
         let active_id = self.active_session.clone();
+        let visible_ids_snapshot: Vec<String> = self.visible_sessions.clone();
         let sessions_snapshot = {
             let mgr = self.sessions.lock().unwrap();
             mgr.list()
@@ -1559,6 +1676,12 @@ impl App {
         };
         let hint_message = self.ctrl_c_hint_message.clone();
 
+        // Captured by the closure to extract the active pane's Rect (and the
+        // matching row offset chosen during render) so cursor positioning
+        // after the closure stays in sync with what was actually painted.
+        let mut active_pane_rect: Option<Rect> = None;
+        let mut active_pane_row_offset: Option<u16> = None;
+
         self.terminal.draw(|frame| {
             let area = frame.area();
             let chunks = Layout::default()
@@ -1569,13 +1692,35 @@ impl App {
                 ])
                 .split(area);
 
-            // PTY pane
-            if let Some((ref screen, _, _, _)) = screen_data {
-                let mut widget = PtyWidget::new(screen);
-                if let Some(sel) = selection_ref {
-                    widget = widget.with_selection(sel);
+            // Vertical split of the PTY pane area for multi-view: equal-height
+            // rows, one per visible session. With a single visible session this
+            // collapses to the original full-area render.
+            let pane_areas: std::rc::Rc<[Rect]> = if panes.len() <= 1 {
+                std::rc::Rc::from(vec![chunks[0]])
+            } else {
+                let constraints: Vec<Constraint> = (0..panes.len())
+                    .map(|_| Constraint::Ratio(1, panes.len() as u32))
+                    .collect();
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(constraints)
+                    .split(chunks[0])
+            };
+
+            for (i, pane) in panes.iter().enumerate() {
+                let Some(&rect) = pane_areas.get(i) else { break };
+                let offset = compute_pane_row_offset(pane.pty_rows, rect.height, pane.cursor_row);
+                if pane.is_active {
+                    active_pane_rect = Some(rect);
+                    active_pane_row_offset = Some(offset);
                 }
-                frame.render_widget(widget, chunks[0]);
+                let mut widget = PtyWidget::new(&pane.screen).with_row_offset(offset);
+                if pane.is_active {
+                    if let Some(sel) = selection_ref {
+                        widget = widget.with_selection(sel);
+                    }
+                }
+                frame.render_widget(widget, rect);
             }
 
             // Highlight overlays on the PTY pane
@@ -1598,7 +1743,9 @@ impl App {
                     "light_magenta" | "lightmagenta" => Color::LightMagenta,
                     _ => Color::Yellow, // fallback
                 };
-                let pane = chunks[0];
+                // Scope highlights to the active pane's Rect so they don't
+                // bleed into other visible panes.
+                let pane = active_pane_rect.unwrap_or(chunks[0]);
                 for row in hl.y..hl.y.saturating_add(hl.height) {
                     for col in hl.x..hl.x.saturating_add(hl.width) {
                         let abs_x = pane.x + col;
@@ -1615,7 +1762,9 @@ impl App {
                 &sessions_snapshot,
                 active_id.as_deref(),
                 &reminders,
-            ).build_info(&uptime);
+            )
+            .build_info(&uptime)
+            .visible_ids(&visible_ids_snapshot);
             frame.render_widget(widget, chunks[1]);
 
             // Hint in the bottom status row of the PTY pane.
@@ -1672,14 +1821,19 @@ impl App {
             }
         })?;
 
-        // Position cursor at PTY cursor location, adjusted for row offset
-        // when the PTY is taller than the display pane.
-        if let Some((_, cursor_row, col, pty_rows)) = screen_data {
-            let pane_height = self.screen_rows.saturating_sub(1); // status bar
-            let row_offset = pty_rows.saturating_sub(pane_height);
-            let display_row = cursor_row.saturating_sub(row_offset);
-            self.terminal.set_cursor_position((col, display_row))?;
-            self.terminal.show_cursor()?;
+        // Position cursor at the active pane's PTY cursor location, using the
+        // same row offset that the active PtyWidget was rendered with so the
+        // cursor lands on the row whose content was actually painted.
+        if let Some(pane_data) = panes.iter().find(|p| p.show_cursor) {
+            if let (Some(rect), Some(offset)) = (active_pane_rect, active_pane_row_offset) {
+                let display_row_in_pane = pane_data.cursor_row.saturating_sub(offset);
+                if display_row_in_pane < rect.height {
+                    let display_row = rect.y + display_row_in_pane;
+                    let display_col = rect.x + pane_data.cursor_col;
+                    self.terminal.set_cursor_position((display_col, display_row))?;
+                    self.terminal.show_cursor()?;
+                }
+            }
         }
 
         Ok(true)
@@ -2897,6 +3051,130 @@ mod tests {
     fn test_reconcile_add_and_remove_simultaneously() {
         let result = reconcile_session_order(&ss(&["a", "b"]), &ss(&["b", "c"]));
         assert_eq!(result, ss(&["b", "c"]));
+    }
+
+    // ── Chunk 3b: visible_sessions helpers ───────────────────────────────────
+
+    #[test]
+    fn test_toggle_adds_when_absent() {
+        let result = toggle_session_visibility(&ss(&[]), "b", Some("a"));
+        assert_eq!(result, ss(&["b"]));
+    }
+
+    #[test]
+    fn test_toggle_removes_when_present() {
+        let result = toggle_session_visibility(&ss(&["b", "c"]), "b", Some("a"));
+        assert_eq!(result, ss(&["c"]));
+    }
+
+    #[test]
+    fn test_toggle_on_active_is_noop() {
+        // Toggling the active session must preserve the visible list unchanged
+        // (preserves the "active is always visible" invariant).
+        let result = toggle_session_visibility(&ss(&["b"]), "a", Some("a"));
+        assert_eq!(result, ss(&["b"]));
+    }
+
+    #[test]
+    fn test_toggle_with_no_active_session() {
+        // No active session — any target can be toggled freely.
+        let result = toggle_session_visibility(&ss(&[]), "x", None);
+        assert_eq!(result, ss(&["x"]));
+    }
+
+    #[test]
+    fn test_compute_render_ids_active_only_when_visible_empty() {
+        let result = compute_render_session_ids(
+            Some("b"),
+            &ss(&[]),
+            &ss(&["a", "b", "c"]),
+        );
+        assert_eq!(result, ss(&["b"]));
+    }
+
+    #[test]
+    fn test_compute_render_ids_active_plus_pinned_in_order() {
+        // Active is "b", pinned is ["c"]. Effective render list, in
+        // session_order, is ["b", "c"].
+        let result = compute_render_session_ids(
+            Some("b"),
+            &ss(&["c"]),
+            &ss(&["a", "b", "c"]),
+        );
+        assert_eq!(result, ss(&["b", "c"]));
+    }
+
+    #[test]
+    fn test_compute_render_ids_dedupes_active_when_pinned() {
+        // Active is also in visible — should appear once, in session_order.
+        let result = compute_render_session_ids(
+            Some("b"),
+            &ss(&["b", "c"]),
+            &ss(&["a", "b", "c"]),
+        );
+        assert_eq!(result, ss(&["b", "c"]));
+    }
+
+    #[test]
+    fn test_compute_render_ids_no_active_returns_only_pinned() {
+        let result = compute_render_session_ids(
+            None,
+            &ss(&["a", "c"]),
+            &ss(&["a", "b", "c"]),
+        );
+        assert_eq!(result, ss(&["a", "c"]));
+    }
+
+    // ── Chunk 3c: compute_pane_row_offset ────────────────────────────────────
+
+    #[test]
+    fn test_pane_offset_zero_when_area_fits_pty() {
+        // Area >= PTY → no scrolling needed.
+        assert_eq!(compute_pane_row_offset(10, 10, 5), 0);
+        assert_eq!(compute_pane_row_offset(10, 20, 9), 0);
+    }
+
+    #[test]
+    fn test_pane_offset_zero_when_cursor_in_top_window() {
+        // PTY 32, area 16, cursor at row 10 → cursor already fits, offset 0.
+        assert_eq!(compute_pane_row_offset(32, 16, 10), 0);
+        // Edge: cursor exactly at the bottom of the implicit window (row=15).
+        assert_eq!(compute_pane_row_offset(32, 16, 15), 0);
+    }
+
+    #[test]
+    fn test_pane_offset_scrolls_just_enough_for_cursor() {
+        // PTY 32, area 16, cursor at row 16 → offset 1 keeps cursor at row 15.
+        assert_eq!(compute_pane_row_offset(32, 16, 16), 1);
+        // Cursor at row 25 → offset 10.
+        assert_eq!(compute_pane_row_offset(32, 16, 25), 10);
+    }
+
+    #[test]
+    fn test_pane_offset_clamped_to_max() {
+        // PTY 32, area 16 → max_offset = 16. Cursor at row 31 wants offset 16,
+        // not larger.
+        assert_eq!(compute_pane_row_offset(32, 16, 31), 16);
+        // Pathological: cursor reported beyond pty_rows still clamps.
+        assert_eq!(compute_pane_row_offset(32, 16, 100), 16);
+    }
+
+    #[test]
+    fn test_pane_offset_zero_height_area() {
+        // Defensive: a zero-height pane reports offset 0 (no rows to show).
+        assert_eq!(compute_pane_row_offset(32, 0, 10), 0);
+    }
+
+    #[test]
+    fn test_compute_render_ids_orders_by_session_order_not_visible() {
+        // The order of `visible` should not matter — render order follows
+        // session_order so the rendered stack mirrors the sidebar.
+        let result = compute_render_session_ids(
+            Some("a"),
+            &ss(&["c", "b"]), // reverse of session_order
+            &ss(&["a", "b", "c"]),
+        );
+        assert_eq!(result, ss(&["a", "b", "c"]));
     }
 
     // ── Chunk 2: compute_relative_index ──────────────────────────────────────

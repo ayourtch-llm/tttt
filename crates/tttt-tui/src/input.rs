@@ -50,6 +50,26 @@ pub enum MouseButton {
     Right,
 }
 
+/// Modifier keys held during a mouse event (decoded from SGR Pb bits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MouseModifiers {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+}
+
+impl MouseModifiers {
+    /// Decode modifier bits from the SGR Pb parameter.
+    /// Per xterm: bit 4 (=4) Shift, bit 8 (=8) Meta/Alt, bit 16 (=16) Control.
+    pub fn from_pb(pb: u16) -> Self {
+        Self {
+            shift: pb & 4 != 0,
+            alt: pb & 8 != 0,
+            ctrl: pb & 16 != 0,
+        }
+    }
+}
+
 /// Configuration for the display and input handling.
 #[derive(Debug, Clone)]
 pub struct DisplayConfig {
@@ -99,7 +119,7 @@ pub enum InputEvent {
     /// Live reload: save state and execv the new binary.
     Reload,
     /// Mouse button pressed at (col, row) — 0-indexed.
-    MousePress { button: MouseButton, col: u16, row: u16 },
+    MousePress { button: MouseButton, modifiers: MouseModifiers, col: u16, row: u16 },
     /// Mouse dragged to (col, row) while button held — 0-indexed.
     MouseDrag { button: MouseButton, col: u16, row: u16 },
     /// Mouse button released at (col, row) — 0-indexed.
@@ -173,7 +193,12 @@ pub fn parse_sgr_mouse(bytes: &[u8]) -> Option<(InputEvent, usize)> {
             2 => MouseButton::Right,
             _ => MouseButton::Left,
         };
-        InputEvent::MousePress { button, col, row }
+        InputEvent::MousePress {
+            button,
+            modifiers: MouseModifiers::from_pb(pb),
+            col,
+            row,
+        }
     };
 
     Some((event, consumed))
@@ -641,6 +666,7 @@ mod tests {
             event,
             InputEvent::MousePress {
                 button: MouseButton::Left,
+                modifiers: MouseModifiers::default(),
                 col: 9,
                 row: 4
             }
@@ -695,6 +721,7 @@ mod tests {
             event,
             InputEvent::MousePress {
                 button: MouseButton::Right,
+                modifiers: MouseModifiers::default(),
                 col: 4,
                 row: 2
             }
@@ -710,6 +737,7 @@ mod tests {
             event,
             InputEvent::MousePress {
                 button: MouseButton::Middle,
+                modifiers: MouseModifiers::default(),
                 col: 2,
                 row: 6
             }
@@ -737,6 +765,7 @@ mod tests {
             event,
             InputEvent::MousePress {
                 button: MouseButton::Left,
+                modifiers: MouseModifiers::default(),
                 col: 199,
                 row: 99
             }
@@ -753,10 +782,84 @@ mod tests {
             event,
             InputEvent::MousePress {
                 button: MouseButton::Left,
+                modifiers: MouseModifiers::default(),
                 col: 0,
                 row: 0
             }
         );
+    }
+
+    // --- Modifier decoding tests ---
+
+    #[test]
+    fn test_mouse_modifiers_default_is_empty() {
+        let m = MouseModifiers::default();
+        assert!(!m.ctrl);
+        assert!(!m.shift);
+        assert!(!m.alt);
+    }
+
+    #[test]
+    fn test_mouse_modifiers_from_pb_decodes_ctrl() {
+        // pb=16: ctrl-only (bit 4 = value 16)
+        let m = MouseModifiers::from_pb(16);
+        assert!(m.ctrl);
+        assert!(!m.shift);
+        assert!(!m.alt);
+    }
+
+    #[test]
+    fn test_mouse_modifiers_from_pb_decodes_shift_and_alt() {
+        // pb = 4 | 8 = 12 (shift + alt, no ctrl)
+        let m = MouseModifiers::from_pb(12);
+        assert!(!m.ctrl);
+        assert!(m.shift);
+        assert!(m.alt);
+    }
+
+    #[test]
+    fn test_parse_sgr_mouse_ctrl_left_press() {
+        // pb = 0 (left button) | 16 (ctrl) = 16
+        let bytes = b"\x1b[<16;7;3M";
+        let (event, consumed) = parse_sgr_mouse(bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        let expected_mods = MouseModifiers { ctrl: true, shift: false, alt: false };
+        assert_eq!(
+            event,
+            InputEvent::MousePress {
+                button: MouseButton::Left,
+                modifiers: expected_mods,
+                col: 6,
+                row: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_sgr_mouse_ctrl_right_press() {
+        // pb = 2 (right) | 16 (ctrl) = 18
+        let bytes = b"\x1b[<18;1;1M";
+        let (event, consumed) = parse_sgr_mouse(bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        if let InputEvent::MousePress { button, modifiers, .. } = event {
+            assert_eq!(button, MouseButton::Right);
+            assert!(modifiers.ctrl);
+        } else {
+            panic!("expected MousePress, got {event:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_sgr_mouse_no_modifiers_when_pb_zero() {
+        let bytes = b"\x1b[<0;5;5M";
+        let (event, _) = parse_sgr_mouse(bytes).unwrap();
+        if let InputEvent::MousePress { modifiers, .. } = event {
+            assert!(!modifiers.ctrl);
+            assert!(!modifiers.shift);
+            assert!(!modifiers.alt);
+        } else {
+            panic!("expected MousePress");
+        }
     }
 
     // --- InputParser integration tests for mouse events ---
@@ -769,6 +872,7 @@ mod tests {
             events,
             vec![InputEvent::MousePress {
                 button: MouseButton::Left,
+                modifiers: MouseModifiers::default(),
                 col: 9,
                 row: 4
             }]
@@ -810,6 +914,7 @@ mod tests {
                 InputEvent::PassThrough(b"hi".to_vec()),
                 InputEvent::MousePress {
                     button: MouseButton::Left,
+                    modifiers: MouseModifiers::default(),
                     col: 9,
                     row: 4
                 },
@@ -833,6 +938,7 @@ mod tests {
             events2,
             vec![InputEvent::MousePress {
                 button: MouseButton::Left,
+                modifiers: MouseModifiers::default(),
                 col: 9,
                 row: 4
             }]
@@ -850,6 +956,7 @@ mod tests {
             vec![
                 InputEvent::MousePress {
                     button: MouseButton::Left,
+                    modifiers: MouseModifiers::default(),
                     col: 0,
                     row: 0
                 },

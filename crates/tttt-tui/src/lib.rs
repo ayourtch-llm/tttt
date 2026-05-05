@@ -7,7 +7,7 @@ pub mod viewer;
 pub mod selection;
 pub use selection::Selection;
 
-pub use input::{CtrlCTracker, DisplayConfig, InputEvent, InputParser, MouseButton, RawInput};
+pub use input::{CtrlCTracker, DisplayConfig, InputEvent, InputParser, MouseButton, MouseModifiers, RawInput};
 pub use protocol::{ClientMsg, ServerMsg, SessionInfo, decode_message, encode_message};
 pub use sidebar_widget::SidebarWidget;
 pub use viewer::ViewerClient;

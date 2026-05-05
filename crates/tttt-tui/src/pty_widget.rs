@@ -8,16 +8,28 @@ use ratatui::widgets::Widget;
 pub struct PtyWidget<'a> {
     screen: &'a vt100::Screen,
     selection: Option<&'a Selection>,
+    /// Override the vertical offset into the PTY screen. When `None`, the
+    /// widget defaults to showing the bottom `area.height` rows (cursor-area
+    /// stays visible) — appropriate for the single-pane case where the area
+    /// is at most one row shorter than the PTY. When `Some(offset)`, render
+    /// PTY rows `offset..offset + area.height`, clamped to PTY bounds.
+    row_offset: Option<u16>,
 }
 
 impl<'a> PtyWidget<'a> {
     pub fn new(screen: &'a vt100::Screen) -> Self {
-        Self { screen, selection: None }
+        Self { screen, selection: None, row_offset: None }
     }
 
     /// Set the active selection for visual highlighting.
     pub fn with_selection(mut self, sel: &'a Selection) -> Self {
         self.selection = Some(sel);
+        self
+    }
+
+    /// Override the vertical viewport offset into the PTY screen.
+    pub fn with_row_offset(mut self, offset: u16) -> Self {
+        self.row_offset = Some(offset);
         self
     }
 }
@@ -29,9 +41,12 @@ impl<'a> Widget for PtyWidget<'a> {
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM);
 
-        // When the PTY has more rows than the display area, show the bottom
-        // portion (where the cursor and latest output are) instead of the top.
-        let row_offset = pty_rows.saturating_sub(area.height);
+        // When the PTY has more rows than the display area, default to showing
+        // the bottom portion (the cursor area). Callers may override the offset
+        // via `with_row_offset` — used by multi-pane render to track activity.
+        let row_offset = self
+            .row_offset
+            .unwrap_or_else(|| pty_rows.saturating_sub(area.height));
 
         for row in 0..area.height {
             for col in 0..area.width {
@@ -185,6 +200,31 @@ mod tests {
         assert_eq!(buf[(0, 0)].symbol(), "H");
         assert_eq!(buf[(1, 0)].symbol(), "e");
         assert_eq!(buf[(2, 0)].symbol(), "l");
+    }
+
+    #[test]
+    fn test_with_row_offset_shows_top_rows() {
+        // PTY 5x4, area 5x2 — with row_offset(0) we render the TOP rows
+        // instead of the default bottom rows.
+        let parser = make_screen(b"A\r\nB\r\nC\r\nD", 5, 4);
+        let widget = PtyWidget::new(parser.screen()).with_row_offset(0);
+        let area = Rect::new(0, 0, 5, 2);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "A", "row 0 should show PTY row 0");
+        assert_eq!(buf[(0, 1)].symbol(), "B", "row 1 should show PTY row 1");
+    }
+
+    #[test]
+    fn test_with_row_offset_middle_window() {
+        // PTY 5x4, area 5x2, offset=1 — show PTY rows 1 and 2.
+        let parser = make_screen(b"A\r\nB\r\nC\r\nD", 5, 4);
+        let widget = PtyWidget::new(parser.screen()).with_row_offset(1);
+        let area = Rect::new(0, 0, 5, 2);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "B");
+        assert_eq!(buf[(0, 1)].symbol(), "C");
     }
 
     #[test]

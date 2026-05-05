@@ -11,6 +11,10 @@ pub struct SidebarWidget<'a> {
     active_id: Option<&'a str>,
     reminders: &'a [String],
     build_info: Option<&'a str>,
+    /// Sessions pinned visible in the multi-view viewport. When a session ID
+    /// is in this slice (or matches `active_id`), its sidebar row is marked
+    /// with a visibility glyph.
+    visible_ids: &'a [String],
 }
 
 impl<'a> SidebarWidget<'a> {
@@ -24,11 +28,17 @@ impl<'a> SidebarWidget<'a> {
             active_id,
             reminders,
             build_info: None,
+            visible_ids: &[],
         }
     }
 
     pub fn build_info(mut self, info: &'a str) -> Self {
         self.build_info = Some(info);
+        self
+    }
+
+    pub fn visible_ids(mut self, ids: &'a [String]) -> Self {
+        self.visible_ids = ids;
         self
     }
 }
@@ -116,10 +126,16 @@ impl<'a> Widget for SidebarWidget<'a> {
                 }
             };
             let display_name = session.name.as_deref().unwrap_or(&session.id);
-            // "{i}{status_char} {name}" — the index and status_char take 2 chars, space takes 1 → 3 overhead
+            // Separator between status char and name. Replaced with a visibility
+            // glyph when the session is pinned-visible (non-active). The active
+            // session is already styled with reverse-video, so we don't double-mark.
+            let is_pinned_visible = !is_active
+                && self.visible_ids.iter().any(|v| v == &session.id);
+            let separator = if is_pinned_visible { '•' } else { ' ' };
+            // "{i}{status_char}{separator}{name}" — index + status + separator = 3 chars
             let name_width = usable_width.saturating_sub(3);
             let truncated_name = truncate(display_name, name_width);
-            let label = format!("{}{} {}", i, status_char, truncated_name);
+            let label = format!("{}{}{}{}", i, status_char, separator, truncated_name);
             let padded_label = format!("{:width$}", &label[..floor_char_boundary(&label, usable_width)], width = usable_width);
             render_line(row, &padded_label, style, buf);
             row += 1;
@@ -504,6 +520,91 @@ mod tests {
             assert_eq!(
                 prefix, "| ",
                 "filler row {r} should start with '| ', got: {prefix:?}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // test_pinned_visible_shows_glyph
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_pinned_visible_shows_glyph() {
+        // pty-2 is pinned visible (non-active). It should show '•' between
+        // the status char and the name; pty-1 (also non-active, not pinned)
+        // should still show a plain space.
+        let area = Rect::new(0, 0, 25, 10);
+        let mut buf = Buffer::empty(area);
+        let sessions = vec![
+            make_meta("pty-1", SessionStatus::Running),
+            make_meta("pty-2", SessionStatus::Running),
+        ];
+        let reminders: Vec<String> = vec![];
+        let visible = vec!["pty-2".to_string()];
+
+        SidebarWidget::new(&sessions, None, &reminders)
+            .visible_ids(&visible)
+            .render(area, &mut buf);
+
+        // pty-1 is at row 2, pty-2 at row 3. Layout: "| {i}{status_char}{sep}{name}".
+        // The separator is at offset 4 (col 0 = '|', col 1 = ' ', col 2 = idx,
+        // col 3 = status_char, col 4 = separator).
+        let row2 = full_row(&buf, area, 2);
+        let row3 = full_row(&buf, area, 3);
+        assert!(
+            !row2.contains('•'),
+            "non-pinned session should not have '•', got: {row2:?}"
+        );
+        assert!(
+            row3.contains('•'),
+            "pinned-visible session should have '•', got: {row3:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // test_active_session_does_not_get_glyph
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_active_session_does_not_get_glyph() {
+        // Even if the active session is also in visible_ids, we don't add the
+        // glyph — reverse-video already marks it.
+        let area = Rect::new(0, 0, 25, 10);
+        let mut buf = Buffer::empty(area);
+        let sessions = vec![make_meta("pty-1", SessionStatus::Running)];
+        let reminders: Vec<String> = vec![];
+        let visible = vec!["pty-1".to_string()];
+
+        SidebarWidget::new(&sessions, Some("pty-1"), &reminders)
+            .visible_ids(&visible)
+            .render(area, &mut buf);
+
+        let row2 = full_row(&buf, area, 2);
+        assert!(
+            !row2.contains('•'),
+            "active session must not show pinned-visible glyph, got: {row2:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // test_no_visible_ids_renders_unchanged
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_no_visible_ids_renders_unchanged() {
+        // When visible_ids is empty, no glyph is shown anywhere.
+        let area = Rect::new(0, 0, 25, 10);
+        let mut buf = Buffer::empty(area);
+        let sessions = vec![
+            make_meta("pty-1", SessionStatus::Running),
+            make_meta("pty-2", SessionStatus::Running),
+        ];
+        let reminders: Vec<String> = vec![];
+
+        SidebarWidget::new(&sessions, Some("pty-1"), &reminders).render(area, &mut buf);
+
+        for r in 2..=3u16 {
+            let row = full_row(&buf, area, r);
+            assert!(
+                !row.contains('•'),
+                "row {r} should not contain '•', got: {row:?}"
             );
         }
     }
