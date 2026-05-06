@@ -1,6 +1,6 @@
 # tttt User Stories Index
 
-**Source:** Real 8+ hour medical research session (2026-03-22) where a root Claude instance drove an executor Claude instance via tmux PTY to run 60+ survival prediction experiments.
+**Source:** Real 8+ hour medical research session (2026-03-22) (https://challengedata.ens.fr/challenges/162) where a root Claude instance drove an executor Claude instance via tmux PTY to run 60+ survival prediction experiments.
 
 **Key outcome:** The two-Claude collaboration beat the competition winner (0.7231) with a score of 0.7424. The interaction patterns, pain points, and lessons learned form the basis for these user stories.
 
