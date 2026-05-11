@@ -2557,11 +2557,11 @@ impl App {
     /// Forces a full ratatui redraw to remove stale content.
     ///
     /// When multi-pane is active (`visible_sessions` non-empty), the main TUI's
-    /// per-cell layout owns PTY sizes — uniformly resizing every session to a
-    /// viewer-derived minimum would clobber the cell dimensions. In that case
-    /// we delegate to `apply_pane_resize` and only notify viewers about the
-    /// single-pane fallback dims, which is a known trade-off: viewers paint
-    /// whatever size the main TUI assigned to their active session.
+    /// grid layout determines each pane's nominal size via `apply_pane_resize`.
+    /// We then **clamp** every visible session's PTY dimensions so they never
+    /// exceed what the smallest viewer (or the server itself) can display.
+    /// This ensures viewers with small screens (e.g. phones) see content that
+    /// fits their terminal rather than truncated/clipped output.
     fn resize_pty_to_min_and_redraw(&mut self) {
         // The PTY can never be larger than the main terminal's usable area
         let (max_pty_cols, max_pty_rows) = calculate_pane_dimensions(
@@ -2582,23 +2582,47 @@ impl App {
         if !self.visible_sessions.is_empty() {
             // Multi-pane is active: main TUI layout dictates per-session sizes.
             self.apply_pane_resize();
-            // Notify each viewer with its active session's actual current size
-            // (which apply_pane_resize may have just changed). Falls back to
-            // the single-pane min if the viewer's active session can't be
-            // found.
-            let mgr = self.sessions.lock().unwrap();
-            for client in &mut self.viewer_clients {
-                client.invalidate();
-                let (cols, rows) = client.active_session.as_ref()
-                    .and_then(|sid| mgr.get(sid).ok())
-                    .map(|s| {
-                        let (r, c) = s.screen().screen().size();
-                        (c, r)
-                    })
-                    .unwrap_or((min_cols, min_rows));
-                client.send_window_size(cols, rows);
+
+            // After apply_pane_resize, sessions have been set to server grid cell
+            // sizes.  Clamp each *visible* session so it never exceeds what the
+            // smallest viewer (or the server itself) can display.  Sessions not
+            // in the render list retain their single-pane fallback size (already
+            // computed by apply_pane_resize) and are also clamped.
+            let render_ids = compute_render_session_ids(
+                self.active_session.as_deref(),
+                &self.visible_sessions,
+                &self.session_order,
+            );
+            {
+                let mut mgr = self.sessions.lock().unwrap();
+                for id in &render_ids {
+                    if let Ok(session) = mgr.get_mut(id) {
+                        let (r, c) = session.screen().screen().size();
+                        let clamped_cols = c.min(min_cols);
+                        let clamped_rows = r.min(min_rows);
+                        if clamped_cols != c || clamped_rows != r {
+                            let _ = session.resize(clamped_cols, clamped_rows);
+                        }
+                    }
+                }
             }
-            drop(mgr);
+
+            // Notify each viewer with the clamped size (or fallback to min).
+            {
+                let mgr = self.sessions.lock().unwrap();
+                for client in &mut self.viewer_clients {
+                    client.invalidate();
+                    let (cols, rows) = client.active_session.as_ref()
+                        .and_then(|sid| mgr.get(sid).ok())
+                        .map(|s| {
+                            let (r, c) = s.screen().screen().size();
+                            (c, r)
+                        })
+                        .unwrap_or((min_cols, min_rows));
+                    client.send_window_size(cols, rows);
+                }
+            }
+
             let _ = self.render_frame();
             return;
         }
