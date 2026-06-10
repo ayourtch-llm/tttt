@@ -137,11 +137,30 @@ pub fn clear_cloexec(fd: RawFd) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Resolve the path to re-exec. After `cargo build` replaces the binary,
+/// `/proc/self/exe` reads "<path> (deleted)" — strip the suffix so we exec
+/// the freshly built binary at the original path.
+fn fix_deleted_exe_path(exe: std::path::PathBuf) -> std::path::PathBuf {
+    let s = exe.to_string_lossy();
+    let mut stripped = s.as_ref();
+    while let Some(rest) = stripped.strip_suffix(" (deleted)") {
+        stripped = rest;
+    }
+    if stripped.len() == s.len() {
+        exe
+    } else {
+        std::path::PathBuf::from(stripped)
+    }
+}
+
 /// Perform execv() to replace the current process.
 ///
 /// This function does not return on success.
 pub fn exec_self() -> Result<(), Box<dyn std::error::Error>> {
-    let exe = std::env::current_exe()?;
+    let exe = fix_deleted_exe_path(std::env::current_exe()?);
+    if !exe.exists() {
+        return Err(format!("reload binary not found: {}", exe.display()).into());
+    }
     let exe_cstr = std::ffi::CString::new(exe.to_string_lossy().as_bytes())?;
     let args: Vec<std::ffi::CString> = std::env::args()
         .map(|a| std::ffi::CString::new(a).unwrap())
@@ -169,6 +188,25 @@ mod base64_bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fix_deleted_exe_path() {
+        use std::path::PathBuf;
+        assert_eq!(
+            fix_deleted_exe_path(PathBuf::from("/x/target/debug/tttt (deleted)")),
+            PathBuf::from("/x/target/debug/tttt")
+        );
+        assert_eq!(
+            fix_deleted_exe_path(PathBuf::from("/x/target/debug/tttt")),
+            PathBuf::from("/x/target/debug/tttt")
+        );
+        // A staged "<name> (deleted)" file that itself got replaced gains a
+        // second suffix; strip them all back to the real binary name.
+        assert_eq!(
+            fix_deleted_exe_path(PathBuf::from("/x/target/debug/tttt (deleted) (deleted)")),
+            PathBuf::from("/x/target/debug/tttt")
+        );
+    }
 
     #[test]
     fn test_saved_state_roundtrip() {
