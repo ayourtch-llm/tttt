@@ -547,10 +547,15 @@ impl PtyToolHandler<MockPty> {
         let command = args["command"].as_str().unwrap_or("bash").to_string();
         let name = args["name"].as_str().map(|s| s.to_string());
 
+        let working_dir = args["working_dir"].as_str().map(|s| s.to_string());
+
         let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
         let id = mgr.generate_id();
         let mock = MockPty::new(cols, rows);
-        let session = PtySession::new(id.clone(), mock, command.clone(), cols, rows);
+        let mut session = PtySession::new(id.clone(), mock, command.clone(), cols, rows);
+        if let Some(ref wd) = working_dir {
+            session.set_working_dir(wd.clone());
+        }
         if let Some(n) = name.clone() {
             mgr.add_session_with_name(session, n)?;
         } else {
@@ -558,11 +563,15 @@ impl PtyToolHandler<MockPty> {
         }
         drop(mgr);
         if let Some(ref logger) = self.sqlite_logger {
-            let _ = logger.lock().unwrap().log_session_start(&id, &command, cols, rows, name.as_deref());
+            let _ = logger.lock().unwrap().log_session_start_with_dir(
+                &id, &command, cols, rows, name.as_deref(), working_dir.as_deref());
         }
         let mut resp = json!({"session_id": id});
         if let Some(n) = name {
             resp["name"] = json!(n);
+        }
+        if let Some(wd) = working_dir {
+            resp["working_dir"] = json!(wd);
         }
         Ok(resp)
     }
@@ -594,9 +603,13 @@ impl PtyToolHandler<tttt_pty::RealPty> {
             cols,
             rows,
         )?;
+        let working_dir = cwd.as_deref().map(|p| p.to_string_lossy().into_owned());
         let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
         let id = mgr.generate_id();
-        let session = PtySession::new(id.clone(), backend, command.to_string(), cols, rows);
+        let mut session = PtySession::new(id.clone(), backend, command.to_string(), cols, rows);
+        if let Some(ref wd) = working_dir {
+            session.set_working_dir(wd.clone());
+        }
         if let Some(n) = name.clone() {
             mgr.add_session_with_name(session, n)?;
         } else {
@@ -604,11 +617,15 @@ impl PtyToolHandler<tttt_pty::RealPty> {
         }
         drop(mgr);
         if let Some(ref logger) = self.sqlite_logger {
-            let _ = logger.lock().unwrap().log_session_start(&id, command, cols, rows, name.as_deref());
+            let _ = logger.lock().unwrap().log_session_start_with_dir(
+                &id, command, cols, rows, name.as_deref(), working_dir.as_deref());
         }
         let mut resp = json!({"session_id": id});
         if let Some(n) = name {
             resp["name"] = json!(n);
+        }
+        if let Some(wd) = working_dir {
+            resp["working_dir"] = json!(wd);
         }
         Ok(resp)
     }
@@ -672,9 +689,13 @@ impl PtyToolHandler<tttt_pty::AnyPty> {
             rows,
         )?;
         let backend = tttt_pty::AnyPty::Real(real_backend);
+        let working_dir = cwd.as_deref().map(|p| p.to_string_lossy().into_owned());
         let mut mgr = self.manager.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
         let id = mgr.generate_id();
-        let session = PtySession::new(id.clone(), backend, command.to_string(), cols, rows);
+        let mut session = PtySession::new(id.clone(), backend, command.to_string(), cols, rows);
+        if let Some(ref wd) = working_dir {
+            session.set_working_dir(wd.clone());
+        }
         if let Some(n) = name.clone() {
             mgr.add_session_with_name(session, n)?;
         } else {
@@ -682,11 +703,15 @@ impl PtyToolHandler<tttt_pty::AnyPty> {
         }
         drop(mgr);
         if let Some(ref logger) = self.sqlite_logger {
-            let _ = logger.lock().unwrap().log_session_start(&id, command, cols, rows, name.as_deref());
+            let _ = logger.lock().unwrap().log_session_start_with_dir(
+                &id, command, cols, rows, name.as_deref(), working_dir.as_deref());
         }
         let mut resp = json!({"session_id": id});
         if let Some(n) = name {
             resp["name"] = json!(n);
+        }
+        if let Some(wd) = working_dir {
+            resp["working_dir"] = json!(wd);
         }
         Ok(resp)
     }
@@ -1376,6 +1401,7 @@ impl<B: PtyBackend> TuiToolHandler<B> {
                 "cols": m.cols,
                 "rows": m.rows,
                 "root": m.root,
+                "working_dir": m.working_dir,
             })
         }).collect();
         drop(mgr);
@@ -1502,6 +1528,32 @@ mod tests {
         let meta = session.metadata();
         assert_eq!(meta.cols, 120);
         assert_eq!(meta.rows, 40);
+    }
+
+    #[test]
+    fn test_pty_launch_with_working_dir() {
+        let handler = make_handler();
+        let result = handler
+            .handle_pty_launch_mock(&json!({"working_dir": "/proj/x", "name": "wd-test"}))
+            .unwrap();
+        assert_eq!(result["working_dir"], "/proj/x");
+
+        // working_dir must also surface in pty_list metadata
+        let list = handler.handle_pty_list().unwrap();
+        let sessions = list.as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["working_dir"], "/proj/x");
+        assert_eq!(sessions[0]["name"], "wd-test");
+    }
+
+    #[test]
+    fn test_pty_launch_without_working_dir_omits_field() {
+        let handler = make_handler();
+        let result = handler.handle_pty_launch_mock(&json!({})).unwrap();
+        assert!(result.get("working_dir").is_none());
+        let list = handler.handle_pty_list().unwrap();
+        // serde skips None working_dir, keeping old clients' parsing intact
+        assert!(list.as_array().unwrap()[0].get("working_dir").is_none());
     }
 
     #[test]

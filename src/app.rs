@@ -738,6 +738,11 @@ impl App {
                     // Restore root flag
                     session.set_root(saved.root);
 
+                    // Restore working directory
+                    if let Some(ref wd) = saved.working_dir {
+                        session.set_working_dir(wd.clone());
+                    }
+
                     // Replay formatted screen contents to restore visual state
                     if !saved.screen_contents_formatted.is_empty() {
                         session.inject_screen_data(&saved.screen_contents_formatted);
@@ -977,13 +982,15 @@ impl App {
         let id = mgr.generate_id();
         let mut session = PtySession::new(id.clone(), backend, self.config.root_command.clone(), pty_cols, pty_rows);
         session.set_root(true);
+        let work_dir = self.config.work_dir.to_string_lossy().into_owned();
+        session.set_working_dir(work_dir.clone());
         mgr.add_session(session)?;
         drop(mgr);
         self.session_order.push(id.clone());
         self.active_session = Some(id.clone());
         if let Some(ref logger) = self.sqlite_logger {
-            let _ = logger.lock().unwrap().log_session_start(
-                &id, &self.config.root_command, pty_cols, pty_rows, None,
+            let _ = logger.lock().unwrap().log_session_start_with_dir(
+                &id, &self.config.root_command, pty_cols, pty_rows, None, Some(&work_dir),
             );
         }
         Ok(id)
@@ -1035,7 +1042,8 @@ impl App {
         let backend = AnyPty::Real(real_backend);
         let mut mgr = self.sessions.lock().unwrap();
         let id = mgr.generate_id();
-        let session = PtySession::new(id.clone(), backend, default_shell, pty_cols, pty_rows);
+        let mut session = PtySession::new(id.clone(), backend, default_shell, pty_cols, pty_rows);
+        session.set_working_dir(self.config.work_dir.to_string_lossy().into_owned());
         mgr.add_session(session)?;
         drop(mgr);
         self.session_order.push(id.clone());
@@ -1070,6 +1078,7 @@ impl App {
                     child_pid,
                     screen_contents_formatted,
                     root: session.is_root(),
+                    working_dir: session.working_dir().map(|s| s.to_string()),
                 });
             }
         }
@@ -3096,6 +3105,7 @@ mod tests {
                 name: None,
                 created_at: None,
                 root: false,
+                working_dir: None,
             },
             tttt_pty::SessionMetadata {
                 id: "beta".to_string(),
@@ -3106,6 +3116,7 @@ mod tests {
                 name: None,
                 created_at: None,
                 root: false,
+                working_dir: None,
             },
         ];
         let dump = format_diagnostic_dump(&make_test_inputs(

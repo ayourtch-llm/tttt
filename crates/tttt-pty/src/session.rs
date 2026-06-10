@@ -31,6 +31,9 @@ pub struct SessionMetadata {
     /// True if this is the root session.
     #[serde(default)]
     pub root: bool,
+    /// Working directory the session was launched in, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
 }
 
 /// A terminal session combining a PTY backend with a VT100 screen buffer.
@@ -52,6 +55,8 @@ pub struct PtySession<B: PtyBackend> {
     capture_bytes: u64,
     /// True if this is the root session (the first session launched by tttt).
     root: bool,
+    /// Working directory the session was launched in, if known.
+    working_dir: Option<String>,
 }
 
 impl<B: PtyBackend> PtySession<B> {
@@ -71,6 +76,7 @@ impl<B: PtyBackend> PtySession<B> {
             capture_path: None,
             capture_bytes: 0,
             root: false,
+            working_dir: None,
         }
     }
 
@@ -87,6 +93,16 @@ impl<B: PtyBackend> PtySession<B> {
     /// Set the optional name for this session.
     pub fn set_name(&mut self, name: String) {
         self.name = Some(name);
+    }
+
+    /// Record the working directory this session was launched in.
+    pub fn set_working_dir(&mut self, dir: impl Into<String>) {
+        self.working_dir = Some(dir.into());
+    }
+
+    /// Working directory the session was launched in, if known.
+    pub fn working_dir(&self) -> Option<&str> {
+        self.working_dir.as_deref()
     }
 
     /// Read available output from the PTY and feed it to the screen buffer.
@@ -217,6 +233,7 @@ impl<B: PtyBackend> PtySession<B> {
             name: self.name.clone(),
             created_at: Some(self.created_at),
             root: self.root,
+            working_dir: self.working_dir.clone(),
         }
     }
 
@@ -339,6 +356,28 @@ mod tests {
         assert_eq!(meta.status, SessionStatus::Running);
         assert_eq!(meta.cols, 80);
         assert_eq!(meta.rows, 24);
+    }
+
+    #[test]
+    fn test_session_working_dir() {
+        let mut session = make_session();
+        assert_eq!(session.working_dir(), None);
+        assert_eq!(session.metadata().working_dir, None);
+        session.set_working_dir("/proj/x");
+        assert_eq!(session.working_dir(), Some("/proj/x"));
+        assert_eq!(session.metadata().working_dir.as_deref(), Some("/proj/x"));
+    }
+
+    #[test]
+    fn test_session_metadata_serde_working_dir_compat() {
+        // None working_dir is skipped on serialize (old-client compatibility)
+        let session = make_session();
+        let json = serde_json::to_string(&session.metadata()).unwrap();
+        assert!(!json.contains("working_dir"));
+        // Metadata JSON from older versions (no working_dir) still parses
+        let old_json = r#"{"id":"x","command":"sh","status":"Running","cols":80,"rows":24}"#;
+        let meta: SessionMetadata = serde_json::from_str(old_json).unwrap();
+        assert_eq!(meta.working_dir, None);
     }
 
     #[test]
@@ -693,6 +732,7 @@ mod tests {
             name: name.map(|s| s.to_string()),
             created_at: None,
             root: false,
+            working_dir: None,
         }
     }
 

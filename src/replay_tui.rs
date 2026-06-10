@@ -835,6 +835,7 @@ mod tests {
             ended_at_ms: Some(2000),
             name: None,
             pid: None,
+            working_dir: None,
         };
         let entry = SessionListEntry {
             info,
@@ -1210,6 +1211,7 @@ mod tests {
                 ended_at_ms: ended,
                 name: None,
                 pid: None,
+                working_dir: None,
             },
             event_count: 0,
             load_strategy: LoadStrategy::ByPid,

@@ -13,6 +13,9 @@ pub struct SessionInfo {
     pub name: Option<String>,
     /// PID of the process that created this session. None for legacy data.
     pub pid: Option<u32>,
+    /// Working directory the session was launched in. None for legacy data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
 }
 
 /// Direction of terminal I/O.
@@ -229,6 +232,7 @@ mod tests {
             ended_at_ms: Some(2000),
             name: Some("my session".to_string()),
             pid: None,
+            working_dir: None,
         };
         assert_eq!(info.session_id, "abc");
         assert_eq!(info.cols, 80);
@@ -248,6 +252,7 @@ mod tests {
             ended_at_ms: None,
             name: None,
             pid: None,
+            working_dir: None,
         };
         assert!(info.ended_at_ms.is_none());
         assert!(info.name.is_none());
@@ -264,6 +269,7 @@ mod tests {
             ended_at_ms: None,
             name: Some("test".to_string()),
             pid: Some(12345),
+            working_dir: Some("/home/user/project".to_string()),
         };
         let json = serde_json::to_string(&info).unwrap();
         let parsed: SessionInfo = serde_json::from_str(&json).unwrap();

@@ -73,6 +73,9 @@ pub struct SavedSession {
     /// True if this is the root session (launched by tttt, not by MCP).
     #[serde(default)]
     pub root: bool,
+    /// Working directory the session was launched in, if known.
+    #[serde(default)]
+    pub working_dir: Option<String>,
 }
 
 /// Saved cron job.
@@ -190,6 +193,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_saved_session_backwards_compat_no_working_dir() {
+        // State files written by older binaries lack working_dir entirely.
+        let json = r#"{
+            "id": "pty-1",
+            "name": null,
+            "command": "bash",
+            "status": "Running",
+            "cols": 80,
+            "rows": 24,
+            "master_fd": 5,
+            "child_pid": 123,
+            "screen_contents_formatted": ""
+        }"#;
+        let restored: SavedSession = serde_json::from_str(json).unwrap();
+        assert_eq!(restored.working_dir, None);
+        assert!(!restored.root);
+    }
+
+    #[test]
+    fn test_saved_session_working_dir_roundtrip() {
+        let session = SavedSession {
+            id: "pty-1".to_string(),
+            name: None,
+            command: "bash".to_string(),
+            status: SessionStatus::Running,
+            cols: 80,
+            rows: 24,
+            master_fd: 5,
+            child_pid: None,
+            screen_contents_formatted: Vec::new(),
+            root: false,
+            working_dir: Some("/proj/x".to_string()),
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        let restored: SavedSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.working_dir.as_deref(), Some("/proj/x"));
+    }
+
+    #[test]
     fn test_fix_deleted_exe_path() {
         use std::path::PathBuf;
         assert_eq!(
@@ -223,6 +265,7 @@ mod tests {
                 child_pid: Some(12345),
                 screen_contents_formatted: b"\x1b[1mhello\x1b[0m world".to_vec(),
                 root: true,
+                working_dir: Some("/home/user/project".to_string()),
             }],
             active_session: Some("pty-1".to_string()),
             session_order: vec!["pty-1".to_string()],

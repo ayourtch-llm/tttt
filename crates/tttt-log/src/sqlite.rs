@@ -28,6 +28,7 @@ pub struct SqliteLogger {
     events_has_pid: bool,
     /// Whether the sessions table has a pid column (migration applied).
     sessions_has_pid: bool,
+    sessions_has_working_dir: bool,
 }
 
 impl SqliteLogger {
@@ -61,6 +62,9 @@ impl SqliteLogger {
         if !column_exists(&conn, "sessions", "pid") {
             let _ = conn.execute("ALTER TABLE sessions ADD COLUMN pid INTEGER", []);
         }
+        if !column_exists(&conn, "sessions", "working_dir") {
+            let _ = conn.execute("ALTER TABLE sessions ADD COLUMN working_dir TEXT", []);
+        }
         // Create index on (session_id, pid) after pid column is guaranteed to exist.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_events_session_pid
@@ -71,6 +75,7 @@ impl SqliteLogger {
             pid: Some(std::process::id()),
             events_has_pid: true,
             sessions_has_pid: true,
+            sessions_has_working_dir: true,
         })
     }
 
@@ -96,7 +101,8 @@ impl SqliteLogger {
                 started_at_ms INTEGER NOT NULL,
                 ended_at_ms INTEGER,
                 name TEXT,
-                pid INTEGER
+                pid INTEGER,
+                working_dir TEXT
             );",
         )?;
         Ok(Self {
@@ -104,6 +110,7 @@ impl SqliteLogger {
             pid: Some(std::process::id()),
             events_has_pid: true,
             sessions_has_pid: true,
+            sessions_has_working_dir: true,
         })
     }
 
@@ -115,11 +122,13 @@ impl SqliteLogger {
         )?;
         let events_has_pid = column_exists(&conn, "events", "pid");
         let sessions_has_pid = column_exists(&conn, "sessions", "pid");
+        let sessions_has_working_dir = column_exists(&conn, "sessions", "working_dir");
         Ok(Self {
             conn,
             pid: None,
             events_has_pid,
             sessions_has_pid,
+            sessions_has_working_dir,
         })
     }
 
@@ -191,14 +200,28 @@ impl SqliteLogger {
         rows: u16,
         name: Option<&str>,
     ) -> Result<()> {
+        self.log_session_start_with_dir(session_id, command, cols, rows, name, None)
+    }
+
+    /// Record the start of a session, including the working directory it was
+    /// launched in (used by reports to group sessions into logical bundles).
+    pub fn log_session_start_with_dir(
+        &mut self,
+        session_id: &str,
+        command: &str,
+        cols: u16,
+        rows: u16,
+        name: Option<&str>,
+        working_dir: Option<&str>,
+    ) -> Result<()> {
         let started_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         self.conn.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, command, cols, rows, started_at_ms, ended_at_ms, name, pid)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
-            rusqlite::params![session_id, command, cols, rows, started_at_ms, name, self.pid],
+            "INSERT OR REPLACE INTO sessions (session_id, command, cols, rows, started_at_ms, ended_at_ms, name, pid, working_dir)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)",
+            rusqlite::params![session_id, command, cols, rows, started_at_ms, name, self.pid, working_dir],
         )?;
         Ok(())
     }
@@ -233,47 +256,31 @@ impl SqliteLogger {
         if !self.has_sessions_table() {
             return Ok(Vec::new());
         }
-        if self.sessions_has_pid {
-            let mut stmt = self.conn.prepare(
-                "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name, pid
-                 FROM sessions ORDER BY started_at_ms",
-            )?;
-            let sessions = stmt
-                .query_map([], |row| {
-                    Ok(SessionInfo {
-                        session_id: row.get(0)?,
-                        command: row.get(1)?,
-                        cols: row.get::<_, u16>(2)?,
-                        rows: row.get::<_, u16>(3)?,
-                        started_at_ms: row.get(4)?,
-                        ended_at_ms: row.get(5)?,
-                        name: row.get(6)?,
-                        pid: row.get(7)?,
-                    })
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok(sessions)
-        } else {
-            let mut stmt = self.conn.prepare(
-                "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name
-                 FROM sessions ORDER BY started_at_ms",
-            )?;
-            let sessions = stmt
-                .query_map([], |row| {
-                    Ok(SessionInfo {
-                        session_id: row.get(0)?,
-                        command: row.get(1)?,
-                        cols: row.get::<_, u16>(2)?,
-                        rows: row.get::<_, u16>(3)?,
-                        started_at_ms: row.get(4)?,
-                        ended_at_ms: row.get(5)?,
-                        name: row.get(6)?,
-                        pid: None,
-                    })
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok(sessions)
-        }
+        // Columns added by later schema versions may be absent in old
+        // read-only databases; select NULL in their place.
+        let pid_col = if self.sessions_has_pid { "pid" } else { "NULL" };
+        let wd_col = if self.sessions_has_working_dir { "working_dir" } else { "NULL" };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name, {}, {}
+             FROM sessions ORDER BY started_at_ms",
+            pid_col, wd_col
+        ))?;
+        let sessions = stmt
+            .query_map([], |row| {
+                Ok(SessionInfo {
+                    session_id: row.get(0)?,
+                    command: row.get(1)?,
+                    cols: row.get::<_, u16>(2)?,
+                    rows: row.get::<_, u16>(3)?,
+                    started_at_ms: row.get(4)?,
+                    ended_at_ms: row.get(5)?,
+                    name: row.get(6)?,
+                    pid: row.get(7)?,
+                    working_dir: row.get(8)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(sessions)
     }
 
     /// List (session_id, pid) pairs that have events but no entry in the sessions table.
@@ -365,6 +372,7 @@ impl SqliteLogger {
                 ended_at_ms: Some(max_ts),
                 name: None,
                 pid,
+                working_dir: None,
             })),
         }
     }
@@ -438,6 +446,7 @@ impl SqliteLogger {
                 ended_at_ms: Some(end_ms),
                 name: None,
                 pid: None,
+                working_dir: None,
             })
             .collect())
     }
@@ -558,50 +567,30 @@ impl SqliteLogger {
         if !self.has_sessions_table() {
             return Ok(None);
         }
-        if self.sessions_has_pid {
-            let mut stmt = self.conn.prepare(
-                "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name, pid
-                 FROM sessions WHERE session_id = ?1",
-            )?;
-            let mut rows = stmt.query_map([session_id], |row| {
-                Ok(SessionInfo {
-                    session_id: row.get(0)?,
-                    command: row.get(1)?,
-                    cols: row.get::<_, u16>(2)?,
-                    rows: row.get::<_, u16>(3)?,
-                    started_at_ms: row.get(4)?,
-                    ended_at_ms: row.get(5)?,
-                    name: row.get(6)?,
-                    pid: row.get(7)?,
-                })
-            })?;
-            match rows.next() {
-                Some(Ok(info)) => Ok(Some(info)),
-                Some(Err(e)) => Err(e.into()),
-                None => Ok(None),
-            }
-        } else {
-            let mut stmt = self.conn.prepare(
-                "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name
-                 FROM sessions WHERE session_id = ?1",
-            )?;
-            let mut rows = stmt.query_map([session_id], |row| {
-                Ok(SessionInfo {
-                    session_id: row.get(0)?,
-                    command: row.get(1)?,
-                    cols: row.get::<_, u16>(2)?,
-                    rows: row.get::<_, u16>(3)?,
-                    started_at_ms: row.get(4)?,
-                    ended_at_ms: row.get(5)?,
-                    name: row.get(6)?,
-                    pid: None,
-                })
-            })?;
-            match rows.next() {
-                Some(Ok(info)) => Ok(Some(info)),
-                Some(Err(e)) => Err(e.into()),
-                None => Ok(None),
-            }
+        let pid_col = if self.sessions_has_pid { "pid" } else { "NULL" };
+        let wd_col = if self.sessions_has_working_dir { "working_dir" } else { "NULL" };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT session_id, command, cols, rows, started_at_ms, ended_at_ms, name, {}, {}
+             FROM sessions WHERE session_id = ?1",
+            pid_col, wd_col
+        ))?;
+        let mut rows = stmt.query_map([session_id], |row| {
+            Ok(SessionInfo {
+                session_id: row.get(0)?,
+                command: row.get(1)?,
+                cols: row.get::<_, u16>(2)?,
+                rows: row.get::<_, u16>(3)?,
+                started_at_ms: row.get(4)?,
+                ended_at_ms: row.get(5)?,
+                name: row.get(6)?,
+                pid: row.get(7)?,
+                working_dir: row.get(8)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(info)) => Ok(Some(info)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
         }
     }
 }
@@ -889,7 +878,7 @@ mod tests {
             CREATE INDEX idx_events_session ON events(session_id, timestamp_ms);",
         )
         .unwrap();
-        SqliteLogger { conn, pid: None, events_has_pid: false, sessions_has_pid: false }
+        SqliteLogger { conn, pid: None, events_has_pid: false, sessions_has_pid: false, sessions_has_working_dir: false }
     }
 
     // --- has_sessions_table tests ---
@@ -984,6 +973,98 @@ mod tests {
         assert_eq!(orphans.len(), 1);
         assert_eq!(orphans[0].0, "s1");
         assert_eq!(orphans[0].1, None);
+    }
+
+    // --- working_dir tests ---
+
+    #[test]
+    fn test_session_working_dir_roundtrip() {
+        let mut logger = SqliteLogger::in_memory().unwrap();
+        logger.log_session_start_with_dir("s1", "bash", 80, 24, None, Some("/proj/a")).unwrap();
+        logger.log_session_start("s2", "zsh", 80, 24, None).unwrap();
+
+        let sessions = logger.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].working_dir.as_deref(), Some("/proj/a"));
+        assert_eq!(sessions[1].working_dir, None);
+
+        let info = logger.get_session_info("s1").unwrap().unwrap();
+        assert_eq!(info.working_dir.as_deref(), Some("/proj/a"));
+    }
+
+    #[test]
+    fn test_open_read_only_db_without_working_dir_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-wd.db");
+        // Simulate a DB created before the working_dir migration.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    direction TEXT NOT NULL,
+                    data BLOB NOT NULL,
+                    pid INTEGER
+                );
+                CREATE TABLE sessions (
+                    session_id TEXT PRIMARY KEY,
+                    command TEXT NOT NULL,
+                    cols INTEGER NOT NULL,
+                    rows INTEGER NOT NULL,
+                    started_at_ms INTEGER NOT NULL,
+                    ended_at_ms INTEGER,
+                    name TEXT,
+                    pid INTEGER
+                );
+                INSERT INTO sessions VALUES ('s1', 'bash', 80, 24, 1000, NULL, NULL, 42);",
+            ).unwrap();
+        }
+        let ro = SqliteLogger::open_read_only(&path).unwrap();
+        let sessions = ro.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].working_dir, None);
+        assert_eq!(sessions[0].pid, Some(42));
+        let info = ro.get_session_info("s1").unwrap().unwrap();
+        assert_eq!(info.working_dir, None);
+    }
+
+    #[test]
+    fn test_working_dir_migration_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("migrate.db");
+        // Old-schema DB (no pid, no working_dir).
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    direction TEXT NOT NULL,
+                    data BLOB NOT NULL
+                );
+                CREATE TABLE sessions (
+                    session_id TEXT PRIMARY KEY,
+                    command TEXT NOT NULL,
+                    cols INTEGER NOT NULL,
+                    rows INTEGER NOT NULL,
+                    started_at_ms INTEGER NOT NULL,
+                    ended_at_ms INTEGER,
+                    name TEXT
+                );
+                INSERT INTO sessions VALUES ('old', 'sh', 80, 24, 500, NULL, NULL);",
+            ).unwrap();
+        }
+        // Opening read-write applies the migrations.
+        let mut logger = SqliteLogger::new(&path).unwrap();
+        logger.log_session_start_with_dir("new", "bash", 80, 24, None, Some("/proj/b")).unwrap();
+        let sessions = logger.list_sessions().unwrap();
+        let old = sessions.iter().find(|s| s.session_id == "old").unwrap();
+        let new = sessions.iter().find(|s| s.session_id == "new").unwrap();
+        assert_eq!(old.working_dir, None);
+        assert_eq!(new.working_dir.as_deref(), Some("/proj/b"));
     }
 
     // --- Orphan session tests ---
