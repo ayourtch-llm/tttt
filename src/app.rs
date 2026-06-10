@@ -601,7 +601,7 @@ pub struct App {
     /// When the last PTY data was received (for burst-end detection).
     last_pty_data_time: Option<Instant>,
     /// Queued notification injections, drained one at a time to avoid garbling input.
-    pending_injection_queue: Vec<(String, String)>,
+    pending_injection_queue: std::collections::VecDeque<(String, String)>,
     /// When the last injection was performed (for pacing).
     last_injection_time: Option<Instant>,
     /// Set to true when a live reload has been requested (prefix+R or SIGUSR1).
@@ -632,6 +632,10 @@ pub struct App {
 }
 
 impl App {
+    /// Upper bound on queued notification injections. With 100ms pacing this
+    /// is ~26s of backlog; beyond that a runaway watcher is just filling RAM.
+    const MAX_PENDING_INJECTIONS: usize = 256;
+
     pub fn new(config: Config) -> Self {
         let display_config = config.display_config();
         let (cols, rows) = terminal_size();
@@ -670,7 +674,7 @@ impl App {
             server_render_dirty: false,
             last_root_screen: None,
             first_dirty_time: None,
-            pending_injection_queue: Vec::new(),
+            pending_injection_queue: std::collections::VecDeque::new(),
             last_injection_time: None,
             last_pty_data_time: None,
             reload_requested: false,
@@ -757,6 +761,9 @@ impl App {
                     }
                 }
                 Err(e) => {
+                    // from_raw_fd does not take ownership on failure — close the
+                    // inherited FD here or it leaks until process exit.
+                    unsafe { libc::close(saved.master_fd); }
                     errors.push(format!("session {} (fd {}): {}", saved.id, saved.master_fd, e));
                 }
             }
@@ -909,7 +916,15 @@ impl App {
 
     /// Queue a text injection into a session. Will be drained by the event loop.
     pub fn queue_injection(&mut self, session_id: &str, text: &str) {
-        self.pending_injection_queue.push((session_id.to_string(), text.to_string()));
+        if self.pending_injection_queue.len() >= Self::MAX_PENDING_INJECTIONS {
+            let _ = self.logger.log_event(&LogEvent::new(
+                session_id.to_string(), LogDirection::Meta,
+                format!("[NOTIFICATION-DROPPED] injection queue full ({} entries): {}",
+                    Self::MAX_PENDING_INJECTIONS, text).into_bytes(),
+            ));
+            return;
+        }
+        self.pending_injection_queue.push_back((session_id.to_string(), text.to_string()));
     }
 
     /// Remove a session ID from the session order list.
@@ -1383,16 +1398,22 @@ impl App {
 
             // Check notification watchers against all sessions — queue new injections
             {
-                let mgr = self.sessions.lock().unwrap();
-                let ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
-                let mut notif = self.notifications.lock().unwrap();
-                for sid in &ids {
-                    if let Ok(session) = mgr.get(sid) {
-                        let screen_text = session.get_screen();
-                        for inj in notif.check_session(sid, &screen_text) {
-                            self.pending_injection_queue.push((inj.target_session_id, inj.text));
+                let mut new_injections = Vec::new();
+                {
+                    let mgr = self.sessions.lock().unwrap();
+                    let ids: Vec<String> = mgr.list().iter().map(|m| m.id.clone()).collect();
+                    let mut notif = self.notifications.lock().unwrap();
+                    for sid in &ids {
+                        if let Ok(session) = mgr.get(sid) {
+                            let screen_text = session.get_screen();
+                            for inj in notif.check_session(sid, &screen_text) {
+                                new_injections.push((inj.target_session_id, inj.text));
+                            }
                         }
                     }
+                }
+                for (target_id, text) in new_injections {
+                    self.queue_injection(&target_id, &text);
                 }
             }
             // Drain one queued injection per tick with pacing (100ms between injections)
@@ -1402,24 +1423,34 @@ impl App {
                 let can_inject = self.last_injection_time
                     .map_or(true, |t| t.elapsed() >= std::time::Duration::from_millis(INJECTION_PACE_MS));
                 if can_inject {
-                    let (target_id, text) = self.pending_injection_queue.remove(0);
-                    let mut mgr = self.sessions.lock().unwrap();
-                    if let Ok(session) = mgr.get_mut(&target_id) {
-                        // Send text via send_keys (without auto-appending Enter).
-                        // Strip trailing \r/\n — a delayed [ENTER] will be queued below.
-                        let clean = text.trim_end_matches(|c| c == '\r' || c == '\n');
-                        let _ = session.send_keys(clean);
+                    if let Some((target_id, text)) = self.pending_injection_queue.pop_front() {
+                        let mut mgr = self.sessions.lock().unwrap();
+                        let sent = if let Ok(session) = mgr.get_mut(&target_id) {
+                            // Send text via send_keys (without auto-appending Enter).
+                            // Strip trailing \r/\n — a delayed [ENTER] will be queued below.
+                            let clean = text.trim_end_matches(|c| c == '\r' || c == '\n');
+                            session.send_keys(clean).is_ok()
+                        } else {
+                            false
+                        };
+                        drop(mgr);
+                        if sent {
+                            let _ = self.logger.log_event(&LogEvent::new(
+                                target_id.clone(), LogDirection::Meta,
+                                format!("[NOTIFICATION] {}", text).into_bytes(),
+                            ));
+                            self.pending_delayed_enters.push((
+                                target_id,
+                                Instant::now() + std::time::Duration::from_millis(100),
+                            ));
+                        } else {
+                            let _ = self.logger.log_event(&LogEvent::new(
+                                target_id.clone(), LogDirection::Meta,
+                                format!("[NOTIFICATION-DROPPED] target session gone or send failed: {}", text).into_bytes(),
+                            ));
+                        }
+                        self.last_injection_time = Some(Instant::now());
                     }
-                    drop(mgr);
-                    let _ = self.logger.log_event(&LogEvent::new(
-                        target_id.clone(), LogDirection::Meta,
-                        format!("[NOTIFICATION] {}", text).into_bytes(),
-                    ));
-                    self.pending_delayed_enters.push((
-                        target_id,
-                        Instant::now() + std::time::Duration::from_millis(100),
-                    ));
-                    self.last_injection_time = Some(Instant::now());
                 }
             }
 
@@ -2376,8 +2407,16 @@ impl App {
         for (session_id, fire_at) in std::mem::take(&mut self.pending_delayed_enters) {
             if now >= fire_at {
                 let mut mgr = self.sessions.lock().unwrap();
-                if let Ok(session) = mgr.get_mut(&session_id) {
-                    let _ = session.send_keys("[ENTER]");
+                let sent = match mgr.get_mut(&session_id) {
+                    Ok(session) => session.send_keys("[ENTER]").is_ok(),
+                    Err(_) => false,
+                };
+                drop(mgr);
+                if !sent {
+                    let _ = self.logger.log_event(&LogEvent::new(
+                        session_id.clone(), LogDirection::Meta,
+                        b"[NOTIFICATION-DROPPED] delayed Enter: target session gone".to_vec(),
+                    ));
                 }
             } else {
                 remaining.push((session_id, fire_at));
