@@ -267,7 +267,8 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         let re = regex::Regex::new(pattern)
             .map_err(|e| McpError::InvalidParams(format!("invalid regex '{}': {}", pattern, e)))?;
 
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(timeout_ms);
 
         loop {
             if self.is_cancelled() {
@@ -279,7 +280,13 @@ impl<B: PtyBackend> PtyToolHandler<B> {
                 session.pump()?;
                 let screen = session.get_screen();
                 if re.is_match(&screen) {
-                    return Ok(json!({"status": "matched", "screen": screen}));
+                    // elapsed_ms ~0 means the pattern was already on screen
+                    // when the call was made (no state transition observed).
+                    return Ok(json!({
+                        "status": "matched",
+                        "screen": screen,
+                        "elapsed_ms": start.elapsed().as_millis() as u64,
+                    }));
                 }
             }
             if Instant::now() >= deadline {
@@ -1385,7 +1392,7 @@ impl<B: PtyBackend> TuiToolHandler<B> {
         })?.to_string();
         drop(mgr);
 
-        *self.tui_state.pending_switch.lock().unwrap() = Some(resolved_id.clone());
+        *self.tui_state.pending_switch.lock().map_err(|e| McpError::Protocol(e.to_string()))? = Some(resolved_id.clone());
         self.tui_state.dirty.store(true, Ordering::Relaxed);
         Ok(json!({"status": "ok", "switched_to": resolved_id}))
     }
@@ -1408,7 +1415,7 @@ impl<B: PtyBackend> TuiToolHandler<B> {
 
         // Read active session from pending switch or current state is not available here,
         // but we can report screen dimensions and session list.
-        let highlights = self.tui_state.highlights.lock().unwrap();
+        let highlights = self.tui_state.highlights.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
         let highlight_count: usize = highlights.values().map(|v| v.len()).sum();
 
         Ok(json!({
@@ -1438,7 +1445,7 @@ impl<B: PtyBackend> TuiToolHandler<B> {
             .ok_or_else(|| McpError::InvalidParams("color required".into()))?
             .to_string();
 
-        let mut highlights = self.tui_state.highlights.lock().unwrap();
+        let mut highlights = self.tui_state.highlights.lock().map_err(|e| McpError::Protocol(e.to_string()))?;
 
         if color.is_empty() {
             // Remove highlight by id
@@ -1554,6 +1561,18 @@ mod tests {
         let list = handler.handle_pty_list().unwrap();
         // serde skips None working_dir, keeping old clients' parsing intact
         assert!(list.as_array().unwrap()[0].get("working_dir").is_none());
+    }
+
+    #[test]
+    fn test_pty_wait_for_reports_elapsed_ms() {
+        let handler = make_handler_with_session();
+        let id = handler.manager().lock().unwrap().list()[0].id.clone();
+        // MockPty screen is empty; wait for the always-matching empty pattern
+        let result = handler
+            .handle_pty_wait_for(&json!({"session_id": id, "pattern": "", "timeout_ms": 1000}))
+            .unwrap();
+        assert_eq!(result["status"], "matched");
+        assert!(result["elapsed_ms"].is_u64());
     }
 
     #[test]
