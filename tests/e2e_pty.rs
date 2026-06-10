@@ -36,6 +36,23 @@ fn wait_for_screen(session: &mut PtySession<RealPty>, pattern: &str, timeout_ms:
     false
 }
 
+/// Like wait_for_screen, but also searches scrollback — needed when the
+/// output is larger than the visible screen (e.g. the tools/list JSON
+/// response) so the pattern may have already scrolled off.
+fn wait_for_output(session: &mut PtySession<RealPty>, pattern: &str, timeout_ms: u64) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed().as_millis() < timeout_ms as u128 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = session.pump();
+        if session.get_screen().contains(pattern)
+            || session.get_scrollback(10000).join("\n").contains(pattern)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn detach_and_wait(session: &mut PtySession<RealPty>) {
     let _ = session.send_raw(&[0x1c, b'd']);
     for _ in 0..30 {
@@ -92,7 +109,7 @@ fn test_e2e_mcp_server() {
     session.send_raw(b"\n").unwrap();
 
     assert!(
-        wait_for_screen(&mut session, "tttt_pty_launch", 5000),
+        wait_for_output(&mut session, "tttt_pty_launch", 5000),
         "should list tools: {:?}",
         session.get_screen()
     );
