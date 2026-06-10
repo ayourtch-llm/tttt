@@ -8,7 +8,7 @@
 /// - `[UP]`, `[DOWN]`, `[LEFT]`, `[RIGHT]` — arrow keys
 /// - `[HOME]`, `[END]`, `[PGUP]`, `[PGDN]` — navigation
 /// - `[F1]`..`[F12]` — function keys
-/// - `[TAB]`, `[ENTER]`, `[ESCAPE]`, `[BACKSPACE]`, `[DELETE]` — special keys
+/// - `[TAB]`, `[ENTER]`, `[ESC]`/`[ESCAPE]`, `[BACKSPACE]`, `[DELETE]` — special keys
 pub fn process_special_keys(input: &str) -> Vec<u8> {
     let mut result = Vec::with_capacity(input.len());
     let bytes = input.as_bytes();
@@ -45,7 +45,10 @@ pub fn process_special_keys(input: &str) -> Vec<u8> {
                     i += 2;
                     continue;
                 }
-                b'x' if i + 3 < bytes.len() => {
+                b'x' if i + 3 < bytes.len()
+                    && bytes[i + 2].is_ascii_hexdigit()
+                    && bytes[i + 3].is_ascii_hexdigit() =>
+                {
                     let hex = &input[i + 2..i + 4];
                     if let Ok(val) = u8::from_str_radix(hex, 16) {
                         result.push(val);
@@ -90,7 +93,7 @@ fn bracket_sequence(tag: &str) -> Option<&'static [u8]> {
         "TAB" => Some(b"\t"),
         "SHIFT+TAB" => Some(b"\x1b[Z"),
         "ENTER" => Some(b"\r"),
-        "ESCAPE" => Some(b"\x1b"),
+        "ESCAPE" | "ESC" => Some(b"\x1b"),
         "F1" => Some(b"\x1bOP"),
         "F2" => Some(b"\x1bOQ"),
         "F3" => Some(b"\x1bOR"),
@@ -209,6 +212,7 @@ mod tests {
         assert_eq!(process_special_keys("[TAB]"), b"\t");
         assert_eq!(process_special_keys("[ENTER]"), b"\r");
         assert_eq!(process_special_keys("[ESCAPE]"), b"\x1b");
+        assert_eq!(process_special_keys("[ESC]"), b"\x1b");
     }
 
     #[test]
@@ -234,6 +238,14 @@ mod tests {
     fn test_incomplete_hex_passthrough() {
         // \x with less than 2 following chars
         assert_eq!(process_special_keys("\\x"), b"\\x");
+    }
+
+    #[test]
+    fn test_hex_escape_multibyte_no_panic() {
+        // \x followed by non-hex multi-byte chars must not panic on a
+        // mid-character byte slice and should pass through unchanged.
+        assert_eq!(process_special_keys("\\x€"), "\\x€".as_bytes());
+        assert_eq!(process_special_keys("\\xzz"), b"\\xzz");
     }
 
     #[test]

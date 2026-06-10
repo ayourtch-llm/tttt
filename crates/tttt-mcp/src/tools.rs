@@ -33,7 +33,7 @@ pub fn pty_tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string", "description": "Target session ID" },
-                    "keys": { "type": "string", "description": "Keys to send (supports [UP], [ENTER], [CTRL+C], ^C, etc.)" }
+                    "keys": { "type": "string", "description": "Keys to send (supports [UP], [ENTER], [ESC], [CTRL+C], ^C, etc.)" }
                 },
                 "required": ["session_id", "keys"]
             }
