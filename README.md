@@ -161,9 +161,14 @@ When no arguments are given, the entrypoint launches `tttt -e docker`. Any argum
 
 ### MCP Configuration
 
-tttt automatically generates an MCP config and injects `--mcp-config` when it detects Claude as the root command. The root agent gets all `tttt_*` tools available immediately.
+tttt automatically generates an MCP config and injects it when it detects a supported root command:
 
-For external MCP tools (e.g., Webex messaging), add them to `~/.claude.json`:
+- **Claude Code**: injects `--mcp-config` with a generated config file containing the `tttt` MCP server.
+- **opencode**: injects the `tttt` MCP server via the `OPENCODE_CONFIG_CONTENT` environment variable (merged with any existing opencode config).
+
+The root agent gets all `tttt_*` tools available immediately.
+
+For external MCP tools (e.g., Webex messaging), add them to `~/.claude.json` (Claude) or your `opencode.json` (opencode):
 
 ```json
 {

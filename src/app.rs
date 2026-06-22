@@ -884,6 +884,58 @@ impl App {
         Ok(config_path)
     }
 
+    /// Generate the opencode MCP config JSON content for the OPENCODE_CONFIG_CONTENT
+    /// env var. Returns a JSON string with the tttt MCP server in opencode format,
+    /// merged with any existing OPENCODE_CONFIG_CONTENT value from the environment.
+    ///
+    /// opencode merges config from multiple sources (global, project, inline), so
+    /// we only need to specify the tttt MCP server here — the user's own config is
+    /// loaded from other config files and merged with this inline override.
+    pub fn generate_opencode_mcp_config_content(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let mcp_socket = self.mcp_socket_path.as_ref()
+            .ok_or("MCP listener not started")?;
+
+        let tttt_bin = std::env::current_exe()
+            .unwrap_or_else(|_| std::path::PathBuf::from("tttt"));
+
+        let tttt_entry = serde_json::json!({
+            "type": "local",
+            "command": [
+                tttt_bin.to_string_lossy(),
+                "mcp-server",
+                "--connect",
+                mcp_socket,
+            ],
+            "enabled": true,
+        });
+
+        // Start with existing OPENCODE_CONFIG_CONTENT if present, otherwise start fresh.
+        let mut config: serde_json::Value = match std::env::var("OPENCODE_CONFIG_CONTENT") {
+            Ok(s) if !s.is_empty() => {
+                serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({}))
+            }
+            _ => serde_json::json!({}),
+        };
+
+        // Ensure config is a JSON object
+        if !config.is_object() {
+            config = serde_json::json!({});
+        }
+
+        // Merge tttt into the mcp section
+        let mcp_map = config.as_object_mut().unwrap();
+        if !mcp_map.contains_key("mcp") {
+            mcp_map.insert("mcp".to_string(), serde_json::json!({}));
+        }
+        let mcp_obj = mcp_map.get_mut("mcp").unwrap();
+        if !mcp_obj.is_object() {
+            *mcp_obj = serde_json::json!({});
+        }
+        mcp_obj.as_object_mut().unwrap().insert("tttt".to_string(), tttt_entry);
+
+        Ok(serde_json::to_string(&config)?)
+    }
+
     pub fn init_loggers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(&self.config.log_dir)?;
         if let Some(parent) = self.config.db_path.parent() {
@@ -940,49 +992,60 @@ impl App {
     /// Build args and spawn a new root PTY backend.
     fn spawn_root_backend(&mut self, pty_cols: u16, pty_rows: u16) -> Result<AnyPty, Box<dyn std::error::Error>> {
         // If MCP socket is available, generate config and inject --mcp-config
-        // for agents that support it (e.g., claude)
+        // for agents that support it (e.g., claude, opencode)
         let mut args: Vec<String> = self.config.root_args.clone();
+        let mut env_vars: Vec<(String, String)> = vec![
+            ("TTTT_PID".to_string(), std::process::id().to_string()),
+        ];
+
         if self.mcp_socket_path.is_some() {
-            if let Ok(config_path) = self.generate_mcp_config() {
-                let cmd = &self.config.root_command;
-                if cmd.contains("claude") && !args.iter().any(|a| a.contains("mcp-config")) {
-                    // Claude uses --mcp-config with a JSON file
+            let cmd = &self.config.root_command;
+            if cmd.contains("claude") && !args.iter().any(|a| a.contains("mcp-config")) {
+                // Claude uses --mcp-config with a JSON file
+                if let Ok(config_path) = self.generate_mcp_config() {
                     args.push("--mcp-config".to_string());
                     args.push(config_path);
-                } else if cmd.contains("apchat") {
-                    // For apchat: load extra args from tmp/apchat.args or APCHAT_ARGS env var
-                    let extra_args_str = std::env::var("APCHAT_ARGS").ok().or_else(|| {
-                        let args_file = self.config.work_dir.join("tmp/apchat.args");
-                        std::fs::read_to_string(&args_file).ok().map(|s| s.trim().to_string())
-                    });
-                    if let Some(extra) = extra_args_str {
-                        if let Ok(parsed) = shell_words::split(&extra) {
-                            args.extend(parsed);
-                        }
+                }
+            } else if cmd.contains("opencode") {
+                // opencode: inject the tttt MCP server via OPENCODE_CONFIG_CONTENT env var.
+                // opencode merges config from multiple sources, so we only need to specify
+                // the tttt MCP server here — the user's own config is loaded from other
+                // config files and merged with this inline override.
+                if let Ok(content) = self.generate_opencode_mcp_config_content() {
+                    env_vars.push(("OPENCODE_CONFIG_CONTENT".to_string(), content));
+                }
+            } else if cmd.contains("apchat") {
+                // For apchat: load extra args from tmp/apchat.args or APCHAT_ARGS env var
+                let extra_args_str = std::env::var("APCHAT_ARGS").ok().or_else(|| {
+                    let args_file = self.config.work_dir.join("tmp/apchat.args");
+                    std::fs::read_to_string(&args_file).ok().map(|s| s.trim().to_string())
+                });
+                if let Some(extra) = extra_args_str {
+                    if let Ok(parsed) = shell_words::split(&extra) {
+                        args.extend(parsed);
                     }
-                    // Inject --mcp-server with quoted command string
-                    if !args.iter().any(|a| a.contains("mcp-server")) {
-                        let mcp_socket = self.mcp_socket_path.as_ref().unwrap();
-                        let tttt_bin = std::env::current_exe()
-                            .unwrap_or_else(|_| std::path::PathBuf::from("tttt"));
-                        let mcp_server_cmd = shell_words::join(&[
-                            tttt_bin.to_string_lossy().as_ref(),
-                            "mcp-server",
-                            "--connect",
-                            mcp_socket.as_str(),
-                        ]);
-                        args.push("--mcp-server".to_string());
-                        args.push(mcp_server_cmd);
-                    }
+                }
+                // Inject --mcp-server with quoted command string
+                if !args.iter().any(|a| a.contains("mcp-server")) {
+                    let mcp_socket = self.mcp_socket_path.as_ref().unwrap();
+                    let tttt_bin = std::env::current_exe()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("tttt"));
+                    let mcp_server_cmd = shell_words::join(&[
+                        tttt_bin.to_string_lossy().as_ref(),
+                        "mcp-server",
+                        "--connect",
+                        mcp_socket.as_str(),
+                    ]);
+                    args.push("--mcp-server".to_string());
+                    args.push(mcp_server_cmd);
                 }
             }
         }
 
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let tttt_pid = std::process::id();
         let real_backend = RealPty::spawn_with_cwd_and_env(
             &self.config.root_command, &args_refs, Some(&self.config.work_dir), pty_cols, pty_rows,
-            [("TTTT_PID".to_string(), tttt_pid.to_string())],
+            env_vars,
         )?;
         Ok(AnyPty::Real(real_backend))
     }
