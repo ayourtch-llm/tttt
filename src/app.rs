@@ -58,6 +58,18 @@ fn terminal_size() -> (u16, u16) {
     }
 }
 
+fn codex_mcp_config_args(tttt_bin: &std::path::Path, mcp_socket: &str) -> Vec<String> {
+    let command = serde_json::to_string(&tttt_bin.to_string_lossy()).unwrap();
+    let server_args = serde_json::to_string(&vec!["mcp-server", "--connect", mcp_socket]).unwrap();
+
+    vec![
+        "--config".to_string(),
+        format!("mcp_servers.tttt.command={command}"),
+        "--config".to_string(),
+        format!("mcp_servers.tttt.args={server_args}"),
+    ]
+}
+
 /// Pure mapping of a parsed `InputEvent` to the action that should be taken.
 ///
 /// This function contains no I/O; it is a pure data transformation.
@@ -936,6 +948,18 @@ impl App {
         Ok(serde_json::to_string(&config)?)
     }
 
+    /// Generate invocation-scoped Codex config overrides for the tttt MCP server.
+    /// Codex accepts TOML values through `--config key=value`, so this leaves the
+    /// user's persistent `~/.codex/config.toml` untouched.
+    pub fn generate_codex_mcp_config_args(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mcp_socket = self.mcp_socket_path.as_ref()
+            .ok_or("MCP listener not started")?;
+        let tttt_bin = std::env::current_exe()
+            .unwrap_or_else(|_| std::path::PathBuf::from("tttt"));
+
+        Ok(codex_mcp_config_args(&tttt_bin, mcp_socket))
+    }
+
     pub fn init_loggers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(&self.config.log_dir)?;
         if let Some(parent) = self.config.db_path.parent() {
@@ -992,7 +1016,7 @@ impl App {
     /// Build args and spawn a new root PTY backend.
     fn spawn_root_backend(&mut self, pty_cols: u16, pty_rows: u16) -> Result<AnyPty, Box<dyn std::error::Error>> {
         // If MCP socket is available, generate config and inject --mcp-config
-        // for agents that support it (e.g., claude, opencode)
+        // for agents that support it (e.g., claude, opencode, codex)
         let mut args: Vec<String> = self.config.root_args.clone();
         let mut env_vars: Vec<(String, String)> = vec![
             ("TTTT_PID".to_string(), std::process::id().to_string()),
@@ -1013,6 +1037,15 @@ impl App {
                 // config files and merged with this inline override.
                 if let Ok(content) = self.generate_opencode_mcp_config_content() {
                     env_vars.push(("OPENCODE_CONFIG_CONTENT".to_string(), content));
+                }
+            } else if cmd == "codex"
+                && !args.iter().any(|a| a.contains("mcp_servers.tttt"))
+            {
+                // Codex accepts per-invocation config overrides. Prepend them so
+                // existing arguments (including an initial prompt) retain their meaning.
+                if let Ok(mut config_args) = self.generate_codex_mcp_config_args() {
+                    config_args.extend(args);
+                    args = config_args;
                 }
             } else if cmd.contains("apchat") {
                 // For apchat: load extra args from tmp/apchat.args or APCHAT_ARGS env var
@@ -2922,6 +2955,21 @@ fn copy_to_clipboard_osc52(text: &str) -> ClipboardResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_codex_mcp_config_args_are_invocation_scoped() {
+        let args = codex_mcp_config_args(
+            std::path::Path::new("/opt/tttt bin/tttt"),
+            "/tmp/tttt-mcp-42.sock",
+        );
+
+        assert_eq!(args, vec![
+            "--config",
+            "mcp_servers.tttt.command=\"/opt/tttt bin/tttt\"",
+            "--config",
+            "mcp_servers.tttt.args=[\"mcp-server\",\"--connect\",\"/tmp/tttt-mcp-42.sock\"]",
+        ]);
+    }
 
     // ── Chunk 1: prefix_key_name / help popup ────────────────────────────────
 

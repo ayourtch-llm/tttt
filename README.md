@@ -165,10 +165,11 @@ tttt automatically generates an MCP config and injects it when it detects a supp
 
 - **Claude Code**: injects `--mcp-config` with a generated config file containing the `tttt` MCP server.
 - **opencode**: injects the `tttt` MCP server via the `OPENCODE_CONFIG_CONTENT` environment variable (merged with any existing opencode config).
+- **Codex CLI**: injects invocation-scoped `--config` overrides for the `tttt` MCP server, without modifying `~/.codex/config.toml`.
 
 The root agent gets all `tttt_*` tools available immediately.
 
-For external MCP tools (e.g., Webex messaging), add them to `~/.claude.json` (Claude) or your `opencode.json` (opencode):
+For external MCP tools (e.g., Webex messaging), add them to `~/.claude.json` (Claude), your `opencode.json` (opencode), or `~/.codex/config.toml` (Codex):
 
 ```json
 {
