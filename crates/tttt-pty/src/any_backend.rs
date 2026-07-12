@@ -32,6 +32,13 @@ impl PtyBackend for AnyPty {
         }
     }
 
+    fn try_write(&mut self, data: &[u8]) -> Result<usize> {
+        match self {
+            AnyPty::Real(pty) => pty.try_write(data),
+            AnyPty::Restored(pty) => pty.try_write(data),
+        }
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         match self {
             AnyPty::Real(pty) => pty.read(buf),

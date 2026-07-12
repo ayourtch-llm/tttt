@@ -204,6 +204,7 @@ mod tests {
             name: None,
             created_at: None,
             root: false,
+            working_dir: None,
         }
     }
 
@@ -217,6 +218,7 @@ mod tests {
             name: Some(name.to_string()),
             created_at: None,
             root: false,
+            working_dir: None,
         }
     }
 

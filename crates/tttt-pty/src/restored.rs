@@ -109,6 +109,17 @@ impl PtyBackend for RestoredPty {
         Ok(())
     }
 
+    fn try_write(&mut self, data: &[u8]) -> Result<usize> {
+        use std::os::unix::io::BorrowedFd;
+
+        let borrowed = unsafe { BorrowedFd::borrow_raw(self.master_fd) };
+        match nix::unistd::write(borrowed, data) {
+            Ok(n) => Ok(n),
+            Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EINTR) => Ok(0),
+            Err(e) => Err(PtyError::Io(std::io::Error::from(e))),
+        }
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         match nix::unistd::read(self.master_fd, buf) {
             Ok(n) => Ok(n),

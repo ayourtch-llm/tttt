@@ -641,6 +641,10 @@ pub struct App {
     /// Pending Enter keystrokes for injections (cron, reminder, notification),
     /// sent after a delay so the target app processes the text before submission.
     pending_delayed_enters: Vec<(String, Instant)>,
+    /// Direct keyboard input waiting for a non-blocking PTY write. Bytes are
+    /// ordered per session so a busy child cannot stall the TUI event loop.
+    pending_user_input:
+        std::collections::HashMap<String, std::collections::VecDeque<u8>>,
 }
 
 impl App {
@@ -701,6 +705,7 @@ impl App {
             last_session_snapshot: Vec::new(),
             deferred_scheduler_events: Vec::new(),
             pending_delayed_enters: Vec::new(),
+            pending_user_input: std::collections::HashMap::new(),
             config,
         }
     }
@@ -1278,6 +1283,8 @@ impl App {
         self.render_frame()?;
 
         loop {
+            self.drain_pending_user_input();
+
             // Get active PTY fd for polling (short lock)
             let pty_fd = self.active_session.as_ref().and_then(|id| {
                 let mgr = self.sessions.lock().unwrap();
@@ -1288,7 +1295,12 @@ impl App {
                 unsafe { BorrowedFd::borrow_raw(stdin_fd) }, PollFlags::POLLIN,
             );
             // Shorter poll timeout when we have a pending render (for debounce responsiveness)
-            let poll_timeout_ms = if self.server_render_dirty { 10u16 } else { 50u16 };
+            let poll_timeout_ms =
+                if self.server_render_dirty || !self.pending_user_input.is_empty() {
+                    10u16
+                } else {
+                    50u16
+                };
 
             let poll_result = if let Some(pty_raw_fd) = pty_fd {
                 let pty_pfd = PollFd::new(
@@ -1319,6 +1331,36 @@ impl App {
                 self.reload_requested = true;
                 self.restart_root_requested = true;
                 break;
+            }
+
+            // Input gets priority over PTY output and rendering. In particular,
+            // a continuously-redrawing TUI must not starve keyboard handling.
+            if let Some(flags) = poll_result.1 {
+                if flags.contains(PollFlags::POLLIN) {
+                    let mut buf = [0u8; 4096];
+                    match nix::unistd::read(stdin_fd, &mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let raw = RawInput { bytes: buf[..n].to_vec() };
+                            let events = self.input_parser.process(&raw);
+                            for event in events {
+                                match self.handle_input_event(event) {
+                                    Ok(true) => {}
+                                    Ok(false) => return Ok(()),
+                                    Err(e) => {
+                                        let _ = self.logger.log_event(&LogEvent::new(
+                                            "system".to_string(), LogDirection::Meta,
+                                            format!("Input error: {}", e).into_bytes(),
+                                        ));
+                                    }
+                                }
+                            }
+                            self.drain_pending_user_input();
+                        }
+                        Err(nix::errno::Errno::EAGAIN) => {}
+                        Err(e) => return Err(Box::new(e)),
+                    }
+                }
             }
 
             // Read PTY output — pump into screen buffer but defer rendering.
@@ -1418,34 +1460,6 @@ impl App {
                 }
             }
 
-            // Read stdin
-            if let Some(flags) = poll_result.1 {
-                if flags.contains(PollFlags::POLLIN) {
-                    let mut buf = [0u8; 4096];
-                    match nix::unistd::read(stdin_fd, &mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let raw = RawInput { bytes: buf[..n].to_vec() };
-                            let events = self.input_parser.process(&raw);
-                            for event in events {
-                                match self.handle_input_event(event) {
-                                    Ok(true) => {}
-                                    Ok(false) => return Ok(()),
-                                    Err(e) => {
-                                        let _ = self.logger.log_event(&LogEvent::new(
-                                            "system".to_string(), LogDirection::Meta,
-                                            format!("Input error: {}", e).into_bytes(),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        Err(nix::errno::Errno::EAGAIN) => {}
-                        Err(e) => return Err(Box::new(e)),
-                    }
-                }
-            }
-
             // Accept new MCP proxy connections (each runs in its own thread)
             self.accept_mcp_connections();
 
@@ -1493,7 +1507,7 @@ impl App {
             }
 
             // Check notification watchers against all sessions — queue new injections
-            {
+            if self.notifications.lock().unwrap().watcher_count() > 0 {
                 let mut new_injections = Vec::new();
                 {
                     let mgr = self.sessions.lock().unwrap();
@@ -1590,17 +1604,60 @@ impl App {
         self.visible_sessions.retain(|id| actual_ids.contains(id));
     }
 
+    fn queue_user_input(&mut self, session_id: &str, data: &[u8]) {
+        self.pending_user_input
+            .entry(session_id.to_string())
+            .or_default()
+            .extend(data);
+    }
+
+    /// Make one non-blocking write attempt for each session with queued input.
+    fn drain_pending_user_input(&mut self) {
+        let ids: Vec<String> = self.pending_user_input.keys().cloned().collect();
+        let mut failed = Vec::new();
+        {
+            let mut mgr = self.sessions.lock().unwrap();
+            for id in &ids {
+                let Some(queue) = self.pending_user_input.get_mut(id) else {
+                    continue;
+                };
+                let result = match mgr.get_mut(id) {
+                    Ok(session) => session.try_send_raw(queue.make_contiguous()),
+                    Err(e) => Err(e),
+                };
+                match result {
+                    Ok(n) => {
+                        queue.drain(..n.min(queue.len()));
+                    }
+                    Err(e) => failed.push((id.clone(), e.to_string())),
+                }
+            }
+        }
+
+        self.pending_user_input.retain(|id, queue| {
+            !queue.is_empty() && !failed.iter().any(|(failed_id, _)| failed_id == id)
+        });
+        for (id, error) in failed {
+            let _ = self.logger.log_event(&LogEvent::new(
+                id,
+                LogDirection::Meta,
+                format!("Interactive input dropped: {error}").into_bytes(),
+            ));
+        }
+    }
+
     fn handle_input_event(&mut self, event: InputEvent) -> Result<bool, Box<dyn std::error::Error>> {
         match decide_input_action(event) {
             InputAction::SendToSession(data) => {
-                if let Some(ref id) = self.active_session {
+                if let Some(id) = self.active_session.clone() {
                     if self.config.log_input {
-                        let _ = self.logger.log_event(&LogEvent::new(id.clone(), LogDirection::Input, data.clone()));
+                        let _ = self.logger.log_event(&LogEvent::new(
+                            id.clone(),
+                            LogDirection::Input,
+                            data.clone(),
+                        ));
                     }
-                    let mut mgr = self.sessions.lock().unwrap();
-                    if let Ok(session) = mgr.get_mut(id) {
-                        session.send_raw(&data)?;
-                    }
+                    self.queue_user_input(&id, &data);
                 }
             }
             InputAction::SwitchSession(n) => {
@@ -1612,12 +1669,9 @@ impl App {
             InputAction::PrevSession => self.switch_relative(-1)?,
             InputAction::ShowHelp => self.show_help()?,
             InputAction::PrefixEscape => {
-                if let Some(ref id) = self.active_session {
+                if let Some(id) = self.active_session.clone() {
                     let prefix = vec![self.config.prefix_key];
-                    let mut mgr = self.sessions.lock().unwrap();
-                    if let Ok(session) = mgr.get_mut(id) {
-                        session.send_raw(&prefix)?;
-                    }
+                    self.queue_user_input(&id, &prefix);
                 }
             }
             InputAction::Detach => return Ok(false),
@@ -1656,11 +1710,9 @@ impl App {
                                     && row >= r.y
                                     && row < r.y.saturating_add(r.height)
                             }) {
-                                if let Some(hit_id) = render_ids.get(idx) {
+                                if let Some(hit_id) = render_ids.get(idx).cloned() {
                                     if Some(hit_id.as_str()) != self.active_session.as_deref() {
-                                        self.active_session = Some(hit_id.clone());
-                                        self.apply_pane_resize();
-                                        self.server_render_dirty = true;
+                                        self.switch_to_session(&hit_id)?;
                                         focus_switched = true;
                                     }
                                 }
@@ -1701,9 +1753,7 @@ impl App {
                                 // render set may shrink/grow if the previously-
                                 // active session was not pinned, so recompute
                                 // PTY sizes to match.
-                                self.active_session = Some(target);
-                                self.apply_pane_resize();
-                                self.server_render_dirty = true;
+                                self.switch_to_session(&target)?;
                             }
                         }
                     }
@@ -1848,7 +1898,14 @@ impl App {
         let exists = self.sessions.lock().unwrap().exists(id);
         if exists {
             self.active_session = Some(id.to_string());
-            self.render_frame()?;
+            self.apply_pane_resize();
+            if self.render_frame()? {
+                self.server_render_dirty = false;
+                self.first_dirty_time = None;
+            } else {
+                self.server_render_dirty = true;
+                self.first_dirty_time.get_or_insert_with(Instant::now);
+            }
         }
         Ok(())
     }

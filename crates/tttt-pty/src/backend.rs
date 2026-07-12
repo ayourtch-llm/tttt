@@ -8,6 +8,16 @@ pub trait PtyBackend: Send {
     /// Write data to the PTY's stdin.
     fn write(&mut self, data: &[u8]) -> Result<()>;
 
+    /// Attempt one non-blocking write to the PTY's stdin.
+    ///
+    /// Returns the number of bytes written, or zero when the PTY would block.
+    /// The default is suitable for backends whose `write` implementation never
+    /// blocks (such as the test backend). Real PTYs override this method.
+    fn try_write(&mut self, data: &[u8]) -> Result<usize> {
+        self.write(data)?;
+        Ok(data.len())
+    }
+
     /// Read available data from the PTY's stdout. Returns number of bytes read.
     /// Non-blocking: returns 0 if no data available.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
@@ -182,6 +192,21 @@ impl PtyBackend for RealPty {
         }
         self.writer.flush()?;
         Ok(())
+    }
+
+    fn try_write(&mut self, data: &[u8]) -> Result<usize> {
+        match self.writer.write(data) {
+            Ok(n) => Ok(n),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(0)
+            }
+            Err(e) => Err(PtyError::Io(e)),
+        }
     }
 
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -383,6 +408,14 @@ mod tests {
     fn test_mock_pty_write_captures_input() {
         let mut pty = MockPty::new(80, 24);
         pty.write(b"hello").unwrap();
+        assert_eq!(pty.input_buf, b"hello");
+    }
+
+    #[test]
+    fn test_mock_pty_try_write_reports_progress() {
+        let mut pty = MockPty::new(80, 24);
+        let n = pty.try_write(b"hello").unwrap();
+        assert_eq!(n, 5);
         assert_eq!(pty.input_buf, b"hello");
     }
 

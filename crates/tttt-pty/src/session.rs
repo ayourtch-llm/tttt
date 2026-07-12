@@ -183,6 +183,18 @@ impl<B: PtyBackend> PtySession<B> {
         self.backend.write(data)
     }
 
+    /// Attempt one non-blocking raw write, returning the number of bytes sent.
+    pub fn try_send_raw(&mut self, data: &[u8]) -> Result<usize> {
+        if self.status != SessionStatus::Running {
+            return Err(PtyError::SessionExited);
+        }
+        let n = self.backend.try_write(data)?;
+        if n > 0 {
+            self.last_input_time = Instant::now();
+        }
+        Ok(n)
+    }
+
     /// Get the plain text contents of the screen.
     pub fn get_screen(&self) -> String {
         self.screen.contents()
@@ -564,6 +576,14 @@ mod tests {
         let mut session = PtySession::new("t1".to_string(), mock, "bash".to_string(), 80, 24);
         let large_data = vec![b'A'; 4096];
         session.send_raw(&large_data).unwrap();
+    }
+
+    #[test]
+    fn test_session_try_send_raw_reports_progress() {
+        let mock = MockPty::new(80, 24);
+        let mut session = PtySession::new("t1".to_string(), mock, "bash".to_string(), 80, 24);
+        assert_eq!(session.try_send_raw(b"abc").unwrap(), 3);
+        assert_eq!(session.backend().input_buf, b"abc");
     }
 
     #[test]
