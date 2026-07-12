@@ -21,6 +21,7 @@ use std::time::Instant;
 use tttt_log::{Direction as LogDirection, LogEvent, LogSink, MultiLogger, SharedSqliteLogSink, SqliteLogger, TextLogger};
 use tttt_mcp::notification::NotificationRegistry;
 use tttt_mcp::{SharedNotificationRegistry, SharedScheduler, SharedScratchpad, SharedSidebarMessages};
+use tttt_mcp::SharedContextRefreshQueue;
 use tttt_pty::{AnyPty, PtySession, RealPty, SessionManager, SessionStatus};
 use tttt_scheduler::{Scheduler, SchedulerEvent};
 use std::os::unix::net::UnixListener;
@@ -230,6 +231,35 @@ fn reconcile_session_order(current: &[String], actual: &[String]) -> Vec<String>
         }
     }
     result
+}
+
+/// Advance one context refresh request. Returns true once both stages complete.
+fn advance_context_refresh_request(
+    request: &mut tttt_mcp::ContextRefreshRequest,
+    now: Instant,
+    mut inject: impl FnMut(&str, &str) -> bool,
+) -> bool {
+    if !request.clear_sent && now >= request.clear_at {
+        if inject("/clear", "clear") {
+            request.clear_sent = true;
+            request.restore_at = Some(now + request.followup_delay);
+        }
+    }
+
+    let restore_due = request.clear_sent
+        && request
+            .restore_at
+            .map(|deadline| now >= deadline)
+            .unwrap_or(false);
+    if !restore_due {
+        return false;
+    }
+
+    let instruction = format!(
+        "CONTEXT REFRESH: Please read {} to restore the context, then continue from the handoff.",
+        request.filename
+    );
+    inject(&instruction, "restore")
 }
 
 /// Toggle a session's pinned-visible (sticky) state.
@@ -645,6 +675,8 @@ pub struct App {
     /// ordered per session so a busy child cannot stall the TUI event loop.
     pending_user_input:
         std::collections::HashMap<String, std::collections::VecDeque<u8>>,
+    /// Context refresh requests scheduled by the MCP handoff tool.
+    context_refresh_queue: SharedContextRefreshQueue,
 }
 
 impl App {
@@ -706,6 +738,7 @@ impl App {
             deferred_scheduler_events: Vec::new(),
             pending_delayed_enters: Vec::new(),
             pending_user_input: std::collections::HashMap::new(),
+            context_refresh_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             config,
         }
     }
@@ -1572,6 +1605,7 @@ impl App {
             let events = self.scheduler.lock().unwrap().tick(std::time::Instant::now());
             for event in events { self.handle_scheduler_event(event); }
             self.drain_deferred_scheduler_events();
+            self.drain_context_refresh_requests();
             self.drain_pending_delayed_enters();
         }
 
@@ -2578,6 +2612,54 @@ impl App {
         self.pending_delayed_enters = remaining;
     }
 
+    fn inject_context_refresh_text(&mut self, text: &str, stage: &str) -> bool {
+        let Some(session_id) = self.session_order.first().cloned() else {
+            return false;
+        };
+        let sent = {
+            let mut mgr = self.sessions.lock().unwrap();
+            mgr.get_mut(&session_id)
+                .map(|session| session.send_keys(text).is_ok())
+                .unwrap_or(false)
+        };
+        if sent {
+            self.pending_delayed_enters.push((
+                session_id.clone(),
+                Instant::now() + std::time::Duration::from_millis(100),
+            ));
+            let _ = self.logger.log_event(&LogEvent::new(
+                session_id,
+                LogDirection::Meta,
+                format!("[CONTEXT-REFRESH] {stage}: {text}").into_bytes(),
+            ));
+        }
+        sent
+    }
+
+    /// Advance scheduled context refreshes without blocking the event loop.
+    fn drain_context_refresh_requests(&mut self) {
+        let mut requests = {
+            let mut queue = self.context_refresh_queue.lock().unwrap();
+            std::mem::take(&mut *queue)
+        };
+        if requests.is_empty() {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut remaining = std::collections::VecDeque::new();
+        while let Some(mut request) = requests.pop_front() {
+            let complete = advance_context_refresh_request(&mut request, now, |text, stage| {
+                self.inject_context_refresh_text(text, stage)
+            });
+            if !complete {
+                remaining.push_back(request);
+            }
+        }
+
+        self.context_refresh_queue.lock().unwrap().extend(remaining);
+    }
+
     // === MCP proxy management ===
 
     fn accept_mcp_connections(&mut self) {
@@ -2594,6 +2676,7 @@ impl App {
                         let sidebar_messages = self.sidebar_messages.clone();
                         let sidebar_dirty = self.sidebar_dirty.clone();
                         let tui_state = self.tui_state.clone();
+                        let context_refresh_queue = self.context_refresh_queue.clone();
                         let tui_tools_enabled = self.config.tui_tools;
                         let screen_cols = self.screen_cols;
                         let screen_rows = self.screen_rows;
@@ -2603,11 +2686,15 @@ impl App {
                         let sqlite_logger = self.sqlite_logger.clone();
                         std::thread::spawn(move || {
                             use tttt_mcp::proxy::handle_proxy_client;
-                            use tttt_mcp::{PtyToolHandler, ReplayToolHandler, SchedulerToolHandler, NotificationToolHandler, ScratchpadToolHandler, SidebarMessageToolHandler, TuiToolHandler, CompositeToolHandler};
+                            use tttt_mcp::{PtyToolHandler, ReplayToolHandler, SchedulerToolHandler, NotificationToolHandler, ScratchpadToolHandler, SidebarMessageToolHandler, TuiToolHandler, CompositeToolHandler, ContextRefreshToolHandler};
 
                             // Set the stream to blocking mode for the handler
                             let _ = stream.set_nonblocking(false);
 
+                            let context_refresh_handler = ContextRefreshToolHandler::new(
+                                context_refresh_queue,
+                                work_dir.clone(),
+                            );
                             let pty_handler = PtyToolHandler::new(sessions.clone(), work_dir)
                                 .with_default_dims(pty_cols, pty_rows)
                                 .with_sqlite_logger(sqlite_logger);
@@ -2620,6 +2707,7 @@ impl App {
                             composite.add_handler(Box::new(pty_handler));
                             composite.add_handler(Box::new(scheduler_handler));
                             composite.add_handler(Box::new(notif_handler));
+                            composite.add_handler(Box::new(context_refresh_handler));
                             composite.add_handler(Box::new(scratchpad_handler));
                             composite.add_handler(Box::new(sidebar_handler));
                             composite.add_handler(Box::new(replay_handler));
@@ -3518,6 +3606,73 @@ mod tests {
         let first_dirty_recent = now - std::time::Duration::from_millis(10);
         // burst not ended, max latency not exceeded → do not render
         assert!(!should_render_now(true, Some(burst_recent), Some(first_dirty_recent), now, 50));
+    }
+
+    fn context_refresh_request(clear_at: Instant) -> tttt_mcp::ContextRefreshRequest {
+        tttt_mcp::ContextRefreshRequest {
+            filename: "HANDOFF.md".to_string(),
+            clear_at,
+            followup_delay: std::time::Duration::from_secs(12),
+            clear_sent: false,
+            restore_at: None,
+        }
+    }
+
+    #[test]
+    fn test_context_refresh_waits_then_clears_then_restores() {
+        let start = Instant::now();
+        let mut request = context_refresh_request(start + std::time::Duration::from_secs(15));
+        let mut injected = Vec::new();
+
+        assert!(!advance_context_refresh_request(
+            &mut request,
+            start + std::time::Duration::from_secs(14),
+            |text, stage| {
+                injected.push((stage.to_string(), text.to_string()));
+                true
+            },
+        ));
+        assert!(injected.is_empty());
+
+        let clear_time = start + std::time::Duration::from_secs(15);
+        assert!(!advance_context_refresh_request(
+            &mut request,
+            clear_time,
+            |text, stage| {
+                injected.push((stage.to_string(), text.to_string()));
+                true
+            },
+        ));
+        assert_eq!(injected, vec![("clear".to_string(), "/clear".to_string())]);
+        assert_eq!(
+            request.restore_at,
+            Some(clear_time + std::time::Duration::from_secs(12))
+        );
+
+        assert!(advance_context_refresh_request(
+            &mut request,
+            clear_time + std::time::Duration::from_secs(12),
+            |text, stage| {
+                injected.push((stage.to_string(), text.to_string()));
+                true
+            },
+        ));
+        assert_eq!(injected[1].0, "restore");
+        assert!(injected[1].1.contains("HANDOFF.md"));
+        assert!(injected[1].1.starts_with("CONTEXT REFRESH:"));
+    }
+
+    #[test]
+    fn test_context_refresh_retries_failed_clear() {
+        let now = Instant::now();
+        let mut request = context_refresh_request(now);
+        assert!(!advance_context_refresh_request(
+            &mut request,
+            now,
+            |_text, _stage| false,
+        ));
+        assert!(!request.clear_sent);
+        assert!(request.restore_at.is_none());
     }
 
     // ── Chunk 3: reconcile_session_order ─────────────────────────────────────

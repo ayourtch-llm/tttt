@@ -330,6 +330,24 @@ pub fn notification_tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// Returns tool definitions for agent context refresh workflows.
+pub fn context_refresh_tool_definitions() -> Vec<Value> {
+    vec![json!({
+        "name": "tttt_clear_and_read_handoff_md",
+        "description": "Schedule a two-stage context refresh in the first terminal. Before calling this tool, the agent must write its current state, decisions, and next steps to a handoff Markdown file such as HANDOFF.md. Then call this tool with that filename; the file must exist, be readable, and be nonempty. After 15-20 seconds tttt submits /clear; 10-15 seconds after that it submits an instruction to read the handoff file and continue. The tool returns immediately after scheduling.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "Path to the handoff Markdown file already written by the agent, for example HANDOFF.md or docs/HANDOFF.md."
+                }
+            },
+            "required": ["filename"]
+        }
+    })]
+}
+
 /// Returns tool definitions for session replay tools.
 pub fn replay_tool_definitions() -> Vec<Value> {
     vec![
@@ -494,6 +512,17 @@ mod tests {
     }
 
     #[test]
+    fn test_context_refresh_tool_definition() {
+        let tools = context_refresh_tool_definitions();
+        assert_eq!(tools.len(), 1);
+        let tool = &tools[0];
+        assert_eq!(tool["name"], "tttt_clear_and_read_handoff_md");
+        assert!(tool["description"].as_str().unwrap().contains("HANDOFF.md"));
+        let required = tool["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.contains(&Value::from("filename")));
+    }
+
+    #[test]
     fn test_sidebar_message_tool_present() {
         let tools = sidebar_tool_definitions();
         let tool = tools.iter().find(|t| t["name"] == "tttt_sidebar_message").unwrap();
@@ -527,6 +556,7 @@ mod tests {
             .into_iter()
             .chain(scheduler_tool_definitions())
             .chain(notification_tool_definitions())
+            .chain(context_refresh_tool_definitions())
             .chain(scratchpad_tool_definitions())
             .chain(sidebar_tool_definitions())
             .chain(replay_tool_definitions())

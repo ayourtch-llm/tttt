@@ -1096,6 +1096,136 @@ impl<B: PtyBackend + 'static> ToolHandler for NotificationToolHandler<B> {
     }
 }
 
+// === Context refresh tool handler ===
+
+/// A scheduled two-stage context refresh consumed by the main TUI event loop.
+#[derive(Debug, Clone)]
+pub struct ContextRefreshRequest {
+    pub filename: String,
+    pub clear_at: Instant,
+    pub followup_delay: Duration,
+    pub clear_sent: bool,
+    pub restore_at: Option<Instant>,
+}
+
+pub type SharedContextRefreshQueue = Arc<Mutex<std::collections::VecDeque<ContextRefreshRequest>>>;
+
+pub struct ContextRefreshToolHandler {
+    queue: SharedContextRefreshQueue,
+    work_dir: PathBuf,
+}
+
+impl ContextRefreshToolHandler {
+    pub fn new(queue: SharedContextRefreshQueue, work_dir: PathBuf) -> Self {
+        Self { queue, work_dir }
+    }
+
+    fn choose_delays() -> (Duration, Duration) {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64;
+        (
+            Duration::from_secs(15 + seed % 6),
+            Duration::from_secs(10 + (seed / 7) % 6),
+        )
+    }
+
+    fn handle_clear_and_read_handoff(&self, args: &Value) -> Result<Value> {
+        let filename = args["filename"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("filename required".into()))?
+            .trim();
+        if filename.is_empty() {
+            return Err(McpError::InvalidParams("filename must not be empty".into()));
+        }
+        if filename.chars().any(|c| c == '\r' || c == '\n' || c.is_control()) {
+            return Err(McpError::InvalidParams(
+                "filename must be a single line without control characters".into(),
+            ));
+        }
+        if !filename.to_ascii_lowercase().ends_with(".md") {
+            return Err(McpError::InvalidParams(
+                "filename must refer to a Markdown (.md) file".into(),
+            ));
+        }
+
+        let path = {
+            let candidate = PathBuf::from(filename);
+            if candidate.is_absolute() {
+                candidate
+            } else {
+                self.work_dir.join(candidate)
+            }
+        };
+        let metadata = std::fs::metadata(&path).map_err(|e| {
+            McpError::InvalidParams(format!(
+                "handoff file is not accessible: {}: {e}",
+                path.display()
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(McpError::InvalidParams(format!(
+                "handoff path is not a regular file: {}",
+                path.display()
+            )));
+        }
+        if metadata.len() == 0 {
+            return Err(McpError::InvalidParams(format!(
+                "handoff file is empty: {}",
+                path.display()
+            )));
+        }
+        let mut file = std::fs::File::open(&path).map_err(|e| {
+            McpError::InvalidParams(format!(
+                "handoff file is not readable: {}: {e}",
+                path.display()
+            ))
+        })?;
+        let mut first_byte = [0u8; 1];
+        std::io::Read::read_exact(&mut file, &mut first_byte).map_err(|e| {
+            McpError::InvalidParams(format!(
+                "handoff file could not be read: {}: {e}",
+                path.display()
+            ))
+        })?;
+
+        let (clear_delay, followup_delay) = Self::choose_delays();
+        let request = ContextRefreshRequest {
+            filename: filename.to_string(),
+            clear_at: Instant::now() + clear_delay,
+            followup_delay,
+            clear_sent: false,
+            restore_at: None,
+        };
+        self.queue
+            .lock()
+            .map_err(|e| McpError::Protocol(e.to_string()))?
+            .push_back(request);
+
+        Ok(json!({
+            "status": "scheduled",
+            "filename": filename,
+            "target": "first terminal",
+            "clear_delay_seconds": clear_delay.as_secs(),
+            "followup_delay_seconds": followup_delay.as_secs(),
+        }))
+    }
+}
+
+impl ToolHandler for ContextRefreshToolHandler {
+    fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
+        match name {
+            "tttt_clear_and_read_handoff_md" => self.handle_clear_and_read_handoff(args),
+            _ => Err(McpError::ToolNotFound(name.to_string())),
+        }
+    }
+
+    fn tool_definitions(&self) -> Vec<Value> {
+        crate::tools::context_refresh_tool_definitions()
+    }
+}
+
 // === Sidebar message tool handler ===
 
 /// Shared sidebar messages type.
@@ -2201,6 +2331,106 @@ mod tests {
             backend.input_buf, b"world\r",
             "should not double the \\r"
         );
+    }
+
+    fn make_context_refresh_handler(
+        work_dir: &std::path::Path,
+    ) -> (ContextRefreshToolHandler, SharedContextRefreshQueue) {
+        let queue = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        (
+            ContextRefreshToolHandler::new(queue.clone(), work_dir.to_path_buf()),
+            queue,
+        )
+    }
+
+    #[test]
+    fn test_context_refresh_schedules_valid_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("HANDOFF.md"), "# Handoff\nContinue here.\n").unwrap();
+        let (mut handler, queue) = make_context_refresh_handler(dir.path());
+        let before = Instant::now();
+
+        let result = handler
+            .handle_tool_call(
+                "tttt_clear_and_read_handoff_md",
+                &json!({"filename": "HANDOFF.md"}),
+            )
+            .unwrap();
+
+        assert_eq!(result["status"], "scheduled");
+        assert_eq!(result["filename"], "HANDOFF.md");
+        let clear_delay = result["clear_delay_seconds"].as_u64().unwrap();
+        let followup_delay = result["followup_delay_seconds"].as_u64().unwrap();
+        assert!((15..=20).contains(&clear_delay));
+        assert!((10..=15).contains(&followup_delay));
+
+        let queue = queue.lock().unwrap();
+        assert_eq!(queue.len(), 1);
+        let request = queue.front().unwrap();
+        assert_eq!(request.filename, "HANDOFF.md");
+        assert!(request.clear_at >= before + Duration::from_secs(15));
+        assert!(request.clear_at <= Instant::now() + Duration::from_secs(20));
+        assert_eq!(request.followup_delay, Duration::from_secs(followup_delay));
+        assert!(!request.clear_sent);
+        assert!(request.restore_at.is_none());
+    }
+
+    #[test]
+    fn test_context_refresh_rejects_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut handler, queue) = make_context_refresh_handler(dir.path());
+        let result = handler.handle_tool_call(
+            "tttt_clear_and_read_handoff_md",
+            &json!({"filename": "MISSING.md"}),
+        );
+        assert!(matches!(result, Err(McpError::InvalidParams(_))));
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_context_refresh_rejects_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("HANDOFF.md"), "").unwrap();
+        let (mut handler, queue) = make_context_refresh_handler(dir.path());
+        let result = handler.handle_tool_call(
+            "tttt_clear_and_read_handoff_md",
+            &json!({"filename": "HANDOFF.md"}),
+        );
+        assert!(matches!(result, Err(McpError::InvalidParams(_))));
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_context_refresh_rejects_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("HANDOFF.md")).unwrap();
+        let (mut handler, _) = make_context_refresh_handler(dir.path());
+        let result = handler.handle_tool_call(
+            "tttt_clear_and_read_handoff_md",
+            &json!({"filename": "HANDOFF.md"}),
+        );
+        assert!(matches!(result, Err(McpError::InvalidParams(_))));
+    }
+
+    #[test]
+    fn test_context_refresh_rejects_non_markdown_and_multiline_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("HANDOFF.txt"), "handoff").unwrap();
+        let (mut handler, _) = make_context_refresh_handler(dir.path());
+        assert!(matches!(
+            handler.handle_tool_call(
+                "tttt_clear_and_read_handoff_md",
+                &json!({"filename": "HANDOFF.txt"}),
+            ),
+            Err(McpError::InvalidParams(_))
+        ));
+        assert!(matches!(
+            handler.handle_tool_call(
+                "tttt_clear_and_read_handoff_md",
+                &json!({"filename": "HANDOFF.md\n/clear"}),
+            ),
+            Err(McpError::InvalidParams(_))
+        ));
     }
 
     // --- Scratchpad tool handler tests ---
