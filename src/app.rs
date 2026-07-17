@@ -59,6 +59,16 @@ fn terminal_size() -> (u16, u16) {
     }
 }
 
+/// True when the root command is the Codex CLI, whether invoked bare
+/// ("codex") or via a path ("/opt/homebrew/bin/codex"). Matches on the
+/// basename only, so wrappers like "codex-wrapper" are not treated as Codex.
+fn is_codex_command(cmd: &str) -> bool {
+    std::path::Path::new(cmd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "codex")
+}
+
 fn codex_mcp_config_args(tttt_bin: &std::path::Path, mcp_socket: &str) -> Vec<String> {
     let command = serde_json::to_string(&tttt_bin.to_string_lossy()).unwrap();
     let server_args = serde_json::to_string(&vec!["mcp-server", "--connect", mcp_socket]).unwrap();
@@ -1076,7 +1086,7 @@ impl App {
                 if let Ok(content) = self.generate_opencode_mcp_config_content() {
                     env_vars.push(("OPENCODE_CONFIG_CONTENT".to_string(), content));
                 }
-            } else if cmd == "codex"
+            } else if is_codex_command(cmd)
                 && !args.iter().any(|a| a.contains("mcp_servers.tttt"))
             {
                 // Codex accepts per-invocation config overrides. Prepend them so
@@ -3114,6 +3124,26 @@ mod tests {
             "--config",
             "mcp_servers.tttt.args=[\"mcp-server\",\"--connect\",\"/tmp/tttt-mcp-42.sock\"]",
         ]);
+    }
+
+    #[test]
+    fn test_is_codex_command_matches_bare_invocation() {
+        assert!(is_codex_command("codex"));
+    }
+
+    #[test]
+    fn test_is_codex_command_matches_path_invocations() {
+        assert!(is_codex_command("/opt/homebrew/bin/codex"));
+        assert!(is_codex_command("./codex"));
+    }
+
+    #[test]
+    fn test_is_codex_command_rejects_other_commands() {
+        assert!(!is_codex_command("claude"));
+        assert!(!is_codex_command("opencode"));
+        assert!(!is_codex_command("codex-wrapper"));
+        assert!(!is_codex_command("/bin/my-codex"));
+        assert!(!is_codex_command(""));
     }
 
     // ── Chunk 1: prefix_key_name / help popup ────────────────────────────────
