@@ -48,25 +48,37 @@ impl Drop for App {
     }
 }
 
+/// Replace zero dimensions with defaults. A PTY whose winsize was never
+/// set reports 0x0, which the vt100 grid cannot represent (rows - 1
+/// underflows).
+fn normalize_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
+    (
+        if cols == 0 { 80 } else { cols },
+        if rows == 0 { 24 } else { rows },
+    )
+}
+
 fn terminal_size() -> (u16, u16) {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
         if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
-            (ws.ws_col, ws.ws_row)
+            normalize_terminal_size(ws.ws_col, ws.ws_row)
         } else {
             (80, 24)
         }
     }
 }
 
-/// True when the root command is the Codex CLI, whether invoked bare
-/// ("codex") or via a path ("/opt/homebrew/bin/codex"). Matches on the
-/// basename only, so wrappers like "codex-wrapper" are not treated as Codex.
-fn is_codex_command(cmd: &str) -> bool {
+/// Basename of a root command, for app detection: "/opt/homebrew/bin/codex"
+/// and "codex" both yield "codex". Matching on the basename (rather than a
+/// substring of the whole path) keeps a binary that merely lives under a
+/// directory named after another app (e.g. /tmp/claude-501/bin/codex) from
+/// being detected as that app.
+fn command_basename(cmd: &str) -> &str {
     std::path::Path::new(cmd)
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n == "codex")
+        .unwrap_or(cmd)
 }
 
 fn codex_mcp_config_args(tttt_bin: &std::path::Path, mcp_socket: &str) -> Vec<String> {
@@ -1071,14 +1083,14 @@ impl App {
         ];
 
         if self.mcp_socket_path.is_some() {
-            let cmd = &self.config.root_command;
-            if cmd.contains("claude") && !args.iter().any(|a| a.contains("mcp-config")) {
+            let cmd = command_basename(&self.config.root_command);
+            if cmd == "claude" && !args.iter().any(|a| a.contains("mcp-config")) {
                 // Claude uses --mcp-config with a JSON file
                 if let Ok(config_path) = self.generate_mcp_config() {
                     args.push("--mcp-config".to_string());
                     args.push(config_path);
                 }
-            } else if cmd.contains("opencode") {
+            } else if cmd == "opencode" {
                 // opencode: inject the tttt MCP server via OPENCODE_CONFIG_CONTENT env var.
                 // opencode merges config from multiple sources, so we only need to specify
                 // the tttt MCP server here — the user's own config is loaded from other
@@ -1086,7 +1098,7 @@ impl App {
                 if let Ok(content) = self.generate_opencode_mcp_config_content() {
                     env_vars.push(("OPENCODE_CONFIG_CONTENT".to_string(), content));
                 }
-            } else if is_codex_command(cmd)
+            } else if cmd == "codex"
                 && !args.iter().any(|a| a.contains("mcp_servers.tttt"))
             {
                 // Codex accepts per-invocation config overrides. Prepend them so
@@ -3127,23 +3139,47 @@ mod tests {
     }
 
     #[test]
-    fn test_is_codex_command_matches_bare_invocation() {
-        assert!(is_codex_command("codex"));
+    fn test_command_basename_bare_invocation() {
+        assert_eq!(command_basename("codex"), "codex");
+        assert_eq!(command_basename("claude"), "claude");
+        assert_eq!(command_basename("opencode"), "opencode");
     }
 
     #[test]
-    fn test_is_codex_command_matches_path_invocations() {
-        assert!(is_codex_command("/opt/homebrew/bin/codex"));
-        assert!(is_codex_command("./codex"));
+    fn test_command_basename_path_invocations() {
+        assert_eq!(command_basename("/opt/homebrew/bin/codex"), "codex");
+        assert_eq!(command_basename("./claude"), "claude");
+        assert_eq!(command_basename("/usr/local/bin/opencode"), "opencode");
     }
 
     #[test]
-    fn test_is_codex_command_rejects_other_commands() {
-        assert!(!is_codex_command("claude"));
-        assert!(!is_codex_command("opencode"));
-        assert!(!is_codex_command("codex-wrapper"));
-        assert!(!is_codex_command("/bin/my-codex"));
-        assert!(!is_codex_command(""));
+    fn test_command_basename_does_not_match_on_directory_names() {
+        // A binary under a path containing an app name must not be
+        // detected as that app (e.g. /tmp/claude-501/bin/codex is codex).
+        assert_eq!(command_basename("/tmp/claude-501/bin/codex"), "codex");
+        assert_eq!(command_basename("/home/claude/opencode"), "opencode");
+    }
+
+    #[test]
+    fn test_command_basename_wrappers_keep_their_own_name() {
+        assert_eq!(command_basename("codex-wrapper"), "codex-wrapper");
+        assert_eq!(command_basename("/bin/my-codex"), "my-codex");
+        assert_eq!(command_basename(""), "");
+    }
+
+    #[test]
+    fn test_normalize_terminal_size_passes_through_sane_sizes() {
+        assert_eq!(normalize_terminal_size(120, 40), (120, 40));
+        assert_eq!(normalize_terminal_size(1, 1), (1, 1));
+    }
+
+    #[test]
+    fn test_normalize_terminal_size_defaults_zero_dimensions() {
+        // A PTY with no winsize set reports 0x0; assume a default size
+        // instead of panicking downstream (vt100 grid underflows on 0 rows).
+        assert_eq!(normalize_terminal_size(0, 0), (80, 24));
+        assert_eq!(normalize_terminal_size(0, 40), (80, 40));
+        assert_eq!(normalize_terminal_size(120, 0), (120, 24));
     }
 
     // ── Chunk 1: prefix_key_name / help popup ────────────────────────────────
