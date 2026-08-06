@@ -413,7 +413,12 @@ fn build_updates(
     let Ok(session) = mgr.get(&sid) else {
         return;
     };
-    let content = session.get_screen_formatted();
+    // Send the formatted contents PLUS the terminal input modes (bracketed
+    // paste, application keypad/cursor, mouse). xterm.js uses the bracketed
+    // paste mode flag to wrap pastes in \x1b[200~...\x1b[201~ so multi-line
+    // pastes aren't executed line-by-line by the shell.
+    let mut content = session.get_screen_formatted();
+    content.extend_from_slice(&session.screen().screen().input_mode_formatted());
     let hash = fnv1a(&content);
     let cursor = session.cursor_position();
     if hash == viewer.last_content_hash && cursor == viewer.last_cursor {
