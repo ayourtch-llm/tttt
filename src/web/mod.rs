@@ -161,15 +161,38 @@ struct WebState {
 /// read loop (for responses to CreateSession/KillSession).
 type WsSender = tokio::sync::Mutex<futures_util::stream::SplitSink<WebSocket, Message>>;
 
+/// Shared cell for asynchronous status/errors from the web server thread;
+/// the App drains it into the root terminal.
+pub type WebStatus = Arc<Mutex<Option<String>>>;
+
 /// Start the web server in a background thread. Returns the URL to open.
+/// Configuration problems (bad host, TLS misconfiguration) are validated
+/// here, synchronously; later runtime errors are posted to `status`.
 pub fn start_web_server(
     cfg: WebConfig,
     sessions: Arc<Mutex<SessionManager<AnyPty>>>,
+    status: WebStatus,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if cfg.tls_cert.is_some() != cfg.tls_key.is_some() {
         return Err("--tls-cert and --tls-key must be supplied together".into());
     }
     let (auth, generated_token) = cfg.resolved_auth()?;
+
+    // Resolve via ToSocketAddrs so hostnames and bare IPv6 work; refuse to
+    // start rather than silently binding a different address than requested.
+    use std::net::ToSocketAddrs;
+    let addr: SocketAddr = (cfg.host.as_str(), cfg.port)
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve bind address {}:{}: {}", cfg.host, cfg.port, e))?
+        .next()
+        .ok_or_else(|| format!("no address found for {}:{}", cfg.host, cfg.port))?;
+
+    // Build the TLS config up front so certificate problems surface now.
+    let tls_config = if cfg.secure {
+        Some(build_tls_config(&cfg)?)
+    } else {
+        None
+    };
 
     let scheme = if cfg.secure { "https" } else { "http" };
     let display_host = if cfg.host == "0.0.0.0" {
@@ -195,7 +218,6 @@ pub fn start_web_server(
         watched: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    let cfg = Arc::new(cfg);
     std::thread::Builder::new()
         .name("tttt-web".to_string())
         .spawn(move || {
@@ -204,16 +226,18 @@ pub fn start_web_server(
                 .worker_threads(2)
                 .build()
                 .expect("failed to build web runtime");
-            rt.block_on(serve(cfg, state, snapshot_tx));
+            rt.block_on(serve(addr, tls_config, state, snapshot_tx, status));
         })?;
 
     Ok(url)
 }
 
 async fn serve(
-    cfg: Arc<WebConfig>,
+    addr: SocketAddr,
+    tls_config: Option<rustls::ServerConfig>,
     state: WebState,
     snapshot_tx: tokio::sync::watch::Sender<Arc<Snapshot>>,
+    status: WebStatus,
 ) {
     tokio::spawn(publisher(
         Arc::clone(&state.sessions),
@@ -229,46 +253,20 @@ async fn serve(
         .route("/ws", get(ws_handler))
         .with_state(state);
 
-    // Resolve via ToSocketAddrs so hostnames and bare IPv6 work; refuse to
-    // start rather than silently binding a different address than requested.
-    use std::net::ToSocketAddrs;
-    let addr: SocketAddr = match (cfg.host.as_str(), cfg.port).to_socket_addrs() {
-        Ok(mut addrs) => match addrs.next() {
-            Some(a) => a,
-            None => {
-                eprintln!("[tttt web] no address found for {}:{}", cfg.host, cfg.port);
-                return;
-            }
-        },
-        Err(e) => {
-            eprintln!(
-                "[tttt web] cannot resolve bind address {}:{}: {}",
-                cfg.host, cfg.port, e
-            );
-            return;
+    let result = match tls_config {
+        Some(sc) => {
+            let tls = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(sc));
+            axum_server::bind_rustls(addr, tls)
+                .serve(app.into_make_service())
+                .await
         }
+        None => axum_server::bind(addr).serve(app.into_make_service()).await,
     };
 
-    let result = if cfg.secure {
-        let server_config = build_tls_config(&cfg);
-        match server_config {
-            Ok(sc) => {
-                let tls = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(sc));
-                axum_server::bind_rustls(addr, tls)
-                    .serve(app.into_make_service())
-                    .await
-            }
-            Err(e) => {
-                eprintln!("[tttt web] TLS setup failed: {}", e);
-                return;
-            }
-        }
-    } else {
-        axum_server::bind(addr).serve(app.into_make_service()).await
-    };
-
+    // Runtime failures (e.g. port already in use) are drained by the App
+    // into the root terminal; the TUI owns the screen, so no eprintln here.
     if let Err(e) = result {
-        eprintln!("[tttt web] server error: {}", e);
+        *status.lock().unwrap() = Some(format!("web server error: {}", e));
     }
 }
 
@@ -1041,7 +1039,8 @@ mod tests {
         };
         let sessions: Arc<Mutex<SessionManager<AnyPty>>> =
             Arc::new(Mutex::new(SessionManager::new()));
-        assert!(start_web_server(cfg, sessions).is_err());
+        let status: WebStatus = Arc::new(Mutex::new(None));
+        assert!(start_web_server(cfg, sessions, status).is_err());
     }
 
     #[test]

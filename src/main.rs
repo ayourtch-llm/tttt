@@ -195,8 +195,9 @@ fn main() {
     }
 }
 
-/// Start the web UI server if configured. Prints the access URL to stderr.
-fn start_web_from_config(app: &app::App, config: &config::Config) {
+/// Start the web UI server if configured. The access URL (or the failure)
+/// is queued as a startup message shown at the top of the root terminal.
+fn start_web_from_config(app: &mut app::App, config: &config::Config) {
     let Some(port) = config.http_port else {
         return;
     };
@@ -216,12 +217,14 @@ fn start_web_from_config(app: &app::App, config: &config::Config) {
         work_dir: config.work_dir.clone(),
     };
 
-    match web::start_web_server(web_cfg, app.shared_sessions()) {
+    let status: web::WebStatus = std::sync::Arc::new(std::sync::Mutex::new(None));
+    match web::start_web_server(web_cfg, app.shared_sessions(), std::sync::Arc::clone(&status)) {
         Ok(url) => {
-            eprintln!("[tttt] Web UI: {}", url);
+            app.queue_startup_message(format!("Web UI: {}", url));
+            app.set_web_info(Some(url), status);
         }
         Err(e) => {
-            eprintln!("Warning: failed to start web server: {}", e);
+            app.queue_startup_message(format!("failed to start web server: {}", e));
         }
     }
 }
@@ -293,26 +296,29 @@ fn run_tui(cli: Cli) {
     let mut app = app::App::new(config.clone());
 
     if let Err(e) = app.init_loggers() {
-        eprintln!("Warning: failed to initialize loggers: {}", e);
+        app.queue_startup_message(format!("Warning: failed to initialize loggers: {}", e));
     }
 
     // Start MCP proxy socket listener
     if let Err(e) = app.start_mcp_listener() {
-        eprintln!("Warning: failed to start MCP listener: {}", e);
+        app.queue_startup_message(format!("Warning: failed to start MCP listener: {}", e));
     }
 
     // Start viewer socket listener
     if let Err(e) = app.start_viewer_listener() {
-        eprintln!("Warning: failed to start viewer listener: {}", e);
+        app.queue_startup_message(format!("Warning: failed to start viewer listener: {}", e));
     }
 
     // Start web UI server (if configured)
-    start_web_from_config(&app, &config);
+    start_web_from_config(&mut app, &config);
 
     if let Err(e) = app.launch_root() {
         eprintln!("Failed to launch root session: {}", e);
         std::process::exit(1);
     }
+    // Show queued startup info (web URL, warnings) at the top of the root
+    // terminal — stderr is invisible under the alternate screen.
+    app.flush_startup_messages();
 
     if let Err(e) = app.run() {
         eprintln!("\nError: {}", e);
@@ -384,7 +390,7 @@ fn run_restored(restore_file: &str) {
     let mut app = app::App::new(config.clone());
 
     if let Err(e) = app.init_loggers() {
-        eprintln!("Warning: failed to initialize loggers: {}", e);
+        app.queue_startup_message(format!("Warning: failed to initialize loggers: {}", e));
     }
 
     // Restore all sessions from inherited FDs (including root).
@@ -394,19 +400,19 @@ fn run_restored(restore_file: &str) {
         .map(|s| s.id.clone());
 
     if let Err(e) = app.restore_sessions(&state) {
-        eprintln!("Warning: failed to restore some sessions: {}", e);
+        app.queue_startup_message(format!("Warning: failed to restore some sessions: {}", e));
     }
 
     // Re-create socket listeners
     if let Err(e) = app.start_mcp_listener() {
-        eprintln!("Warning: failed to start MCP listener: {}", e);
+        app.queue_startup_message(format!("Warning: failed to start MCP listener: {}", e));
     }
     if let Err(e) = app.start_viewer_listener() {
-        eprintln!("Warning: failed to start viewer listener: {}", e);
+        app.queue_startup_message(format!("Warning: failed to start viewer listener: {}", e));
     }
 
     // Restart the web UI server (config preserved in saved state)
-    start_web_from_config(&app, &config);
+    start_web_from_config(&mut app, &config);
 
     // For SIGUSR2: kill the old root child and respawn a fresh one in the same
     // session slot. This preserves the session ID, position, and sidebar order.
@@ -440,6 +446,9 @@ fn run_restored(restore_file: &str) {
 
     // Restore sidebar messages
     app.restore_sidebar_messages(&state.sidebar_messages);
+
+    // Show queued startup info (web URL, warnings) in the root terminal.
+    app.flush_startup_messages();
 
     if let Err(e) = app.run() {
         eprintln!("\nError: {}", e);

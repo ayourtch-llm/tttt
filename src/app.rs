@@ -699,6 +699,14 @@ pub struct App {
         std::collections::HashMap<String, std::collections::VecDeque<u8>>,
     /// Context refresh requests scheduled by the MCP handoff tool.
     context_refresh_queue: SharedContextRefreshQueue,
+    /// Startup messages (web URL, listener warnings) queued before the root
+    /// session exists; injected into the top of the root terminal on flush.
+    startup_messages: Vec<String>,
+    /// Async status/errors posted by the web server thread; drained into
+    /// the root terminal by the main loop.
+    web_status: Option<crate::web::WebStatus>,
+    /// URL of the web UI, when enabled (shown in the help overlay).
+    web_url: Option<String>,
 }
 
 impl App {
@@ -761,8 +769,75 @@ impl App {
             pending_delayed_enters: Vec::new(),
             pending_user_input: std::collections::HashMap::new(),
             context_refresh_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            startup_messages: Vec::new(),
+            web_status: None,
+            web_url: None,
             config,
         }
+    }
+
+    /// Queue a message to be shown at the top of the root terminal once it
+    /// launches. Used instead of eprintln for startup info/warnings: the
+    /// alternate screen is already active, so stderr output is either lost
+    /// or lingers as stale artifacts under the TUI.
+    pub fn queue_startup_message(&mut self, msg: impl Into<String>) {
+        self.startup_messages.push(msg.into());
+    }
+
+    /// Record the web UI url and the status cell its thread reports into.
+    pub fn set_web_info(&mut self, url: Option<String>, status: crate::web::WebStatus) {
+        self.web_url = url;
+        self.web_status = Some(status);
+    }
+
+    /// Inject queued startup messages into the root terminal's screen so
+    /// they appear at the top, before the root command's own output.
+    pub fn flush_startup_messages(&mut self) {
+        if self.startup_messages.is_empty() {
+            return;
+        }
+        let messages = std::mem::take(&mut self.startup_messages);
+        for msg in &messages {
+            let _ = self.logger.log_event(&LogEvent::new(
+                "startup".to_string(),
+                LogDirection::Meta,
+                msg.clone().into_bytes(),
+            ));
+        }
+        self.inject_root_text(&messages);
+    }
+
+    /// Drain any pending async web-server status message into the root
+    /// terminal. Called from the main event loop.
+    fn drain_web_status(&mut self) {
+        let msg = self
+            .web_status
+            .as_ref()
+            .and_then(|s| s.lock().unwrap().take());
+        if let Some(msg) = msg {
+            let _ = self.logger.log_event(&LogEvent::new(
+                "web".to_string(),
+                LogDirection::Meta,
+                msg.clone().into_bytes(),
+            ));
+            self.inject_root_text(std::slice::from_ref(&msg));
+        }
+    }
+
+    /// Write informational lines into the root session's screen buffer
+    /// (dim style, one per line). Bypasses the PTY child entirely.
+    fn inject_root_text(&mut self, lines: &[String]) {
+        let root_id = {
+            let mgr = self.sessions.lock().unwrap();
+            mgr.list().iter().find(|m| m.root).map(|m| m.id.clone())
+        };
+        let Some(root_id) = root_id else { return };
+        let data = format_startup_lines(lines);
+        let mut mgr = self.sessions.lock().unwrap();
+        if let Ok(session) = mgr.get_mut(&root_id) {
+            session.inject_screen_data(&data);
+        }
+        self.server_render_dirty = true;
     }
 
     /// Get a shared reference to the session manager (for the MCP server thread).
@@ -1622,6 +1697,9 @@ impl App {
             // Sync session order (MCP may have added new ones)
             self.sync_session_order();
 
+            // Surface any async web-server error in the root terminal.
+            self.drain_web_status();
+
             if self.check_session_exit() { break; }
 
             let events = self.scheduler.lock().unwrap().tick(std::time::Instant::now());
@@ -2093,6 +2171,7 @@ impl App {
             mgr.list()
         };
         let showing_help = self.showing_help;
+        let web_url = self.web_url.clone();
         let prefix_name_str = prefix_key_name(self.config.prefix_key);
         let prefix_name = if showing_help {
             Some(prefix_name_str.clone())
@@ -2220,9 +2299,14 @@ impl App {
 
                 frame.render_widget(Clear, popup_area);
 
-                let help_text = vec![
+                let mut help_text = vec![
                     Line::from(vec![Span::styled("tttt help", Style::default().add_modifier(Modifier::BOLD))]),
                     Line::from(format!("prefix: {}", p)),
+                ];
+                if let Some(url) = web_url.as_deref() {
+                    help_text.push(Line::from(format!("web: {}", url)));
+                }
+                help_text.extend(vec![
                     Line::from(""),
                     Line::from("  0-9  Switch to terminal N"),
                     Line::from("  n    Next terminal"),
@@ -2237,7 +2321,7 @@ impl App {
                     Line::from(format!("  {p}{p}  Send literal prefix")),
                     Line::from(""),
                     Line::from("Press any key to dismiss..."),
-                ];
+                ]);
 
                 let help_widget = Paragraph::new(help_text)
                     .block(Block::bordered().title(" Help "))
@@ -3112,6 +3196,16 @@ fn tmux_passthrough_enabled() -> bool {
         })
 }
 
+/// Format startup/status lines for injection into the root terminal's
+/// screen buffer: dim-styled, "[tttt] " prefixed, one per line.
+fn format_startup_lines(lines: &[String]) -> Vec<u8> {
+    let mut data = Vec::new();
+    for line in lines {
+        data.extend_from_slice(format!("\x1b[2m[tttt] {}\x1b[0m\r\n", line).as_bytes());
+    }
+    data
+}
+
 fn copy_to_clipboard_osc52(text: &str) -> ClipboardResult {
     use base64::Engine;
     use std::io::Write;
@@ -3145,6 +3239,17 @@ fn copy_to_clipboard_osc52(text: &str) -> ClipboardResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_startup_lines() {
+        let lines = vec!["Web UI: http://x".to_string(), "warn".to_string()];
+        let out = String::from_utf8(format_startup_lines(&lines)).unwrap();
+        assert_eq!(
+            out,
+            "\x1b[2m[tttt] Web UI: http://x\x1b[0m\r\n\x1b[2m[tttt] warn\x1b[0m\r\n"
+        );
+        assert!(format_startup_lines(&[]).is_empty());
+    }
 
     #[test]
     fn test_codex_mcp_config_args_are_invocation_scoped() {
