@@ -34,6 +34,24 @@ pub enum ServerMsg {
         /// PTY rows.
         rows: u16,
     },
+
+    /// Acknowledges a `ClientMsg::CreateSession`.
+    SessionCreated {
+        /// The new session id, or None on failure.
+        session_id: Option<String>,
+        /// Error message on failure, if any.
+        error: Option<String>,
+    },
+
+    /// Acknowledges a `ClientMsg::KillSession`.
+    SessionKilled {
+        /// The session id that was closed.
+        session_id: String,
+        /// True if the session was found and closed.
+        success: bool,
+        /// Error message on failure, if any.
+        error: Option<String>,
+    },
 }
 
 /// Compact session info sent to viewers.
@@ -58,6 +76,25 @@ pub enum ClientMsg {
 
     /// Client is disconnecting.
     Detach,
+
+    /// Client wants to create a new session (launch a command in a new PTY).
+    CreateSession {
+        /// Command to run (defaults to the user's shell if empty).
+        command: String,
+        /// Arguments to the command.
+        #[serde(default)]
+        args: Vec<String>,
+        /// PTY columns.
+        cols: u16,
+        /// PTY rows.
+        rows: u16,
+    },
+
+    /// Client wants to close (kill) a session.
+    KillSession {
+        /// Session id to close.
+        session_id: String,
+    },
 }
 
 /// Encode a message as length-prefixed JSON.
@@ -217,5 +254,63 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_create_session_roundtrip() {
+        let msg = ClientMsg::CreateSession {
+            command: "bash".into(),
+            args: vec!["-l".into()],
+            cols: 100,
+            rows: 30,
+        };
+        let encoded = encode_message(&msg);
+        let (decoded, _): (ClientMsg, usize) = decode_message(&encoded).unwrap();
+        match decoded {
+            ClientMsg::CreateSession { command, args, cols, rows } => {
+                assert_eq!(command, "bash");
+                assert_eq!(args, vec!["-l"]);
+                assert_eq!(cols, 100);
+                assert_eq!(rows, 30);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_kill_session_roundtrip() {
+        let msg = ClientMsg::KillSession { session_id: "pty-2".into() };
+        let encoded = encode_message(&msg);
+        let (decoded, _): (ClientMsg, usize) = decode_message(&encoded).unwrap();
+        assert!(matches!(decoded, ClientMsg::KillSession { session_id } if session_id == "pty-2"));
+    }
+
+    #[test]
+    fn test_session_created_roundtrip() {
+        let msg = ServerMsg::SessionCreated {
+            session_id: Some("pty-3".into()),
+            error: None,
+        };
+        let encoded = encode_message(&msg);
+        let (decoded, _): (ServerMsg, usize) = decode_message(&encoded).unwrap();
+        match decoded {
+            ServerMsg::SessionCreated { session_id, error } => {
+                assert_eq!(session_id.as_deref(), Some("pty-3"));
+                assert!(error.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_session_killed_roundtrip() {
+        let msg = ServerMsg::SessionKilled {
+            session_id: "pty-1".into(),
+            success: true,
+            error: None,
+        };
+        let encoded = encode_message(&msg);
+        let (decoded, _): (ServerMsg, usize) = decode_message(&encoded).unwrap();
+        assert!(matches!(decoded, ServerMsg::SessionKilled { success: true, .. }));
     }
 }

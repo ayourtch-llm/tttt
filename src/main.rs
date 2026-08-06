@@ -213,6 +213,7 @@ fn start_web_from_config(app: &app::App, config: &config::Config) {
         tls_key: config.tls_key.clone(),
         htpasswd: config.htpasswd.clone(),
         token: config.token.clone(),
+        work_dir: config.work_dir.clone(),
     };
 
     match web::start_web_server(web_cfg, app.shared_sessions()) {

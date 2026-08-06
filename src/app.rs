@@ -2846,6 +2846,10 @@ impl App {
                         protocol::ClientMsg::Detach => {
                             self.viewer_clients[i].send_goodbye();
                         }
+                        // Session create/kill is a web-UI feature; not used by
+                        // `tttt attach` clients, so ignore it here.
+                        protocol::ClientMsg::CreateSession { .. }
+                        | protocol::ClientMsg::KillSession { .. } => {}
                     }
                 } else {
                     break;

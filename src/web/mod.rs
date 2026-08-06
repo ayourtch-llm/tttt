@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tttt_pty::{AnyPty, SessionManager, SessionStatus};
+use tttt_pty::{AnyPty, PtySession, RealPty, SessionManager, SessionStatus};
 use tttt_tui::protocol::{ClientMsg, ServerMsg, SessionInfo};
 
 /// Configuration for the web server.
@@ -39,6 +39,8 @@ pub struct WebConfig {
     pub htpasswd: Option<PathBuf>,
     /// Explicit token, if any.
     pub token: Option<String>,
+    /// Working directory for newly-created sessions.
+    pub work_dir: PathBuf,
 }
 
 impl WebConfig {
@@ -85,7 +87,12 @@ fn random_token() -> String {
 struct WebState {
     sessions: Arc<Mutex<SessionManager<AnyPty>>>,
     auth: Arc<auth::Auth>,
+    work_dir: PathBuf,
 }
+
+/// Shared WebSocket sender (split sink) used by both the push loop and the
+/// read loop (for responses to CreateSession/KillSession).
+type WsSender = tokio::sync::Mutex<futures_util::stream::SplitSink<WebSocket, Message>>;
 
 /// Start the web server in a background thread. Returns the URL to open.
 pub fn start_web_server(
@@ -110,6 +117,7 @@ pub fn start_web_server(
     let state = WebState {
         sessions,
         auth: Arc::new(auth),
+        work_dir: cfg.work_dir.clone(),
     };
 
     let cfg = Arc::new(cfg);
@@ -335,12 +343,12 @@ async fn handle_ws(socket: WebSocket, state: WebState) {
         };
         match msg {
             Message::Text(t) => {
-                if handle_incoming(&state, &viewer, t.as_bytes()).await {
+                if handle_incoming(&state, &viewer, &sender, t.as_bytes()).await {
                     break;
                 }
             }
             Message::Binary(b) => {
-                if handle_incoming(&state, &viewer, b.as_ref()).await {
+                if handle_incoming(&state, &viewer, &sender, b.as_ref()).await {
                     break;
                 }
             }
@@ -360,11 +368,12 @@ async fn handle_ws(socket: WebSocket, state: WebState) {
 async fn handle_incoming(
     state: &WebState,
     viewer: &Arc<tokio::sync::Mutex<WebViewer>>,
+    sender: &Arc<WsSender>,
     data: &[u8],
 ) -> bool {
     let parsed: Option<ClientMsg> = serde_json::from_slice(data).ok();
     match parsed {
-        Some(cmsg) => handle_client_msg(state, viewer, cmsg).await,
+        Some(cmsg) => handle_client_msg(state, viewer, sender, cmsg).await,
         None => false,
     }
 }
@@ -423,6 +432,7 @@ fn build_updates(
 async fn handle_client_msg(
     state: &WebState,
     viewer: &Arc<tokio::sync::Mutex<WebViewer>>,
+    sender: &Arc<WsSender>,
     msg: ClientMsg,
 ) -> bool {
     match msg {
@@ -458,9 +468,106 @@ async fn handle_client_msg(
                 }
             }
         }
+        ClientMsg::CreateSession {
+            command,
+            args,
+            cols,
+            rows,
+        } => {
+            let result = create_session(state, &command, &args, cols, rows);
+            match result {
+                Ok(new_id) => {
+                    // Auto-switch this viewer to the freshly created session.
+                    {
+                        let mut v = viewer.lock().await;
+                        v.active_session = Some(new_id.clone());
+                        v.invalidate();
+                    }
+                    let resp = ServerMsg::SessionCreated {
+                        session_id: Some(new_id),
+                        error: None,
+                    };
+                    send_server_msg(sender, &resp).await;
+                }
+                Err(e) => {
+                    let resp = ServerMsg::SessionCreated {
+                        session_id: None,
+                        error: Some(e),
+                    };
+                    send_server_msg(sender, &resp).await;
+                }
+            }
+        }
+        ClientMsg::KillSession { session_id } => {
+            let kill_result = {
+                let mut mgr = state.sessions.lock().unwrap();
+                mgr.kill_session(&session_id)
+            };
+            // If this viewer was watching the killed session, switch it away.
+            {
+                let mut v = viewer.lock().await;
+                if v.active_session.as_deref() == Some(session_id.as_str()) {
+                    let mgr = state.sessions.lock().unwrap();
+                    let list = mgr.list();
+                    v.active_session = list
+                        .iter()
+                        .find(|m| m.id != session_id)
+                        .map(|m| m.id.clone());
+                    v.invalidate();
+                }
+            }
+            let resp = match kill_result {
+                Ok(_) => ServerMsg::SessionKilled {
+                    session_id,
+                    success: true,
+                    error: None,
+                },
+                Err(e) => ServerMsg::SessionKilled {
+                    session_id,
+                    success: false,
+                    error: Some(e.to_string()),
+                },
+            };
+            send_server_msg(sender, &resp).await;
+        }
         ClientMsg::Detach => return true,
     }
     false
+}
+
+/// Launch a new PTY session in the web server's working directory.
+fn create_session(
+    state: &WebState,
+    command: &str,
+    args: &[String],
+    cols: u16,
+    rows: u16,
+) -> Result<String, String> {
+    let cols = cols.max(2);
+    let rows = rows.max(2);
+    let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let cmd = if command.trim().is_empty() {
+        default_shell
+    } else {
+        command.to_string()
+    };
+    let cmd_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let backend = RealPty::spawn_with_cwd(&cmd, &cmd_args, Some(&state.work_dir), cols, rows)
+        .map_err(|e| e.to_string())?;
+    let mut mgr = state.sessions.lock().unwrap();
+    let id = mgr.generate_id();
+    let session = PtySession::new(id.clone(), AnyPty::Real(backend), cmd, cols, rows);
+    mgr.add_session(session).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// Send a ServerMsg back to the client (for create/kill acknowledgements).
+async fn send_server_msg(sender: &Arc<WsSender>, msg: &ServerMsg) {
+    use futures_util::SinkExt;
+    let text = serde_json::to_string(msg).unwrap_or_default();
+    let mut s = sender.lock().await;
+    let _ = s.send(Message::Text(text)).await;
 }
 
 fn status_str(status: &SessionStatus) -> String {
@@ -517,6 +624,7 @@ mod tests {
             tls_key: None,
             htpasswd: None,
             token: None,
+            work_dir: std::path::PathBuf::from("."),
         };
         let (auth, gen) = cfg.resolved_auth().unwrap();
         assert!(!auth.required());
@@ -533,6 +641,7 @@ mod tests {
             tls_key: None,
             htpasswd: None,
             token: None,
+            work_dir: std::path::PathBuf::from("."),
         };
         let (auth, gen) = cfg.resolved_auth().unwrap();
         assert!(auth.required());

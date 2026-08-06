@@ -31,8 +31,14 @@
     #toolbar .spacer { flex: 1; }
     #conn { color: #a6e3a1; }
     #conn.disconnected { color: #f38ba8; }
+    #new-session { background: #89b4fa; color: #11111b; border: none; border-radius: 4px;
+                   padding: 5px 10px; font-weight: 600; font-size: 12px; cursor: pointer; }
+    #new-session:hover { background: #a6c8ff; }
     #term-wrap { flex: 1; padding: 8px; overflow: hidden; }
     #term { width: 100%; height: 100%; }
+    .session .close { float: right; margin-left: 6px; background: none; border: none;
+                      color: #6c7086; font-size: 12px; cursor: pointer; padding: 0 2px; }
+    .session .close:hover { color: #f38ba8; }
     #login-overlay { position: fixed; inset: 0; background: rgba(30,30,46,0.96);
                      display: flex; align-items: center; justify-content: center; z-index: 10; }
     #login-box { background: #181825; border: 1px solid #313244; border-radius: 8px;
@@ -59,6 +65,7 @@
     <div id="main">
       <div id="toolbar">
         <span>tttt</span>
+        <button id="new-session" title="Create a new terminal session">+ New session</button>
         <span class="spacer"></span>
         <span id="conn">connecting…</span>
       </div>

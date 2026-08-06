@@ -71,9 +71,17 @@
       div.className = "session" + (info.active_id === s.id ? " active" : "");
       div.dataset.id = s.id;
       div.innerHTML =
+        '<button class="close" title="Close session">&times;</button>' +
         '<div class="name">' + escapeHtml(s.id) + "</div>" +
         '<div class="cmd">' + escapeHtml(s.command || "") + "</div>" +
         '<div class="status' + (s.status.indexOf("running") === -1 ? " exited" : "") + '">' + escapeHtml(s.status) + "</div>";
+      var closeBtn = div.querySelector(".close");
+      closeBtn.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        if (confirm("Close session " + s.id + "?")) {
+          send({ KillSession: { session_id: s.id } });
+        }
+      });
       div.addEventListener("click", function () {
         send({ SwitchSession: { session_id: s.id } });
         Array.prototype.forEach.call(sessionListEl.children, function (c) {
@@ -107,6 +115,19 @@
       var cols = msg.WindowSize.cols, rows = msg.WindowSize.rows;
       if (term.cols !== cols || term.rows !== rows) {
         term.resize(cols, rows);
+      }
+    } else if (msg.SessionCreated) {
+      var sc = msg.SessionCreated;
+      if (sc.error) {
+        setConn("create failed: " + sc.error, false);
+      } else if (sc.session_id) {
+        term.reset();
+        setConn("connected", true);
+      }
+    } else if (msg.SessionKilled) {
+      var sk = msg.SessionKilled;
+      if (!sk.success) {
+        setConn("close failed: " + (sk.error || "unknown"), false);
       }
     } else if (msg.Goodbye) {
       setConn("server closed", false);
@@ -215,6 +236,50 @@
         startWithCredential({ user: u, pass: p });
       }
     });
+
+    // Create a new session: prompt for a command (empty = default shell).
+    document.getElementById("new-session").addEventListener("click", function () {
+      var cmd = prompt("Command to run (empty for default shell):", "");
+      if (cmd === null) return; // cancelled
+      var parts = splitCommand(cmd);
+      send({
+        CreateSession: {
+          command: parts[0],
+          args: parts.slice(1),
+          cols: term.cols,
+          rows: term.rows,
+        }
+      });
+    });
+
+    // Keep keyboard input in the terminal.
+    document.getElementById("term").addEventListener("click", function () {
+      term.focus();
+    });
+    term.focus();
+  }
+
+  // Minimal shell-style split supporting quotes (no escapes).
+  function splitCommand(s) {
+    s = (s || "").trim();
+    if (!s) return [""];
+    var out = [], cur = "", quote = null;
+    for (var i = 0; i < s.length; i++) {
+      var c = s[i];
+      if (quote) {
+        if (c === quote) { quote = null; }
+        else { cur += c; }
+      } else if (c === '"' || c === "'") {
+        quote = c;
+      } else if (c === " " || c === "\t") {
+        if (cur) { out.push(cur); cur = ""; }
+      } else {
+        cur += c;
+      }
+    }
+    if (cur) out.push(cur);
+    if (!out.length) out = [""];
+    return out;
   }
 
   if (document.readyState === "loading") {

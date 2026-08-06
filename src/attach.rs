@@ -705,6 +705,8 @@ fn run_attach_loop(
                     virtual_dirty = true;
                 }
                 ServerMsg::Goodbye => return AttachLoopExit::Disconnected,
+                // Session create/kill acknowledgements are web-UI only; ignore.
+                ServerMsg::SessionCreated { .. } | ServerMsg::SessionKilled { .. } => {}
             }
         }
 
