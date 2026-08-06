@@ -44,6 +44,34 @@ pub struct Config {
     /// Enable TUI control MCP tools (tui_switch, tui_get_info, tui_highlight).
     #[serde(default)]
     pub tui_tools: bool,
+
+    /// Port for the web UI HTTP server. `None` disables the web server.
+    #[serde(default)]
+    pub http_port: Option<u16>,
+
+    /// Host/address to bind the web UI HTTP server to.
+    #[serde(default)]
+    pub http_host: Option<String>,
+
+    /// Serve the web UI over HTTPS (self-signed cert unless tls_cert/tls_key given).
+    #[serde(default)]
+    pub secure: bool,
+
+    /// TLS certificate (PEM) for the web UI.
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS private key (PEM) for the web UI.
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+
+    /// htpasswd file (username:hash) for web UI basic auth.
+    #[serde(default)]
+    pub htpasswd: Option<PathBuf>,
+
+    /// Access token for the web UI (auto-generated when binding non-loopback).
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 impl Default for Config {
@@ -64,6 +92,13 @@ impl Default for Config {
             default_rows: 24,
             log_input: false,
             tui_tools: false,
+            http_port: None,
+            http_host: None,
+            secure: false,
+            tls_cert: None,
+            tls_key: None,
+            htpasswd: None,
+            token: None,
         }
     }
 }
@@ -126,6 +161,17 @@ impl Config {
             if let Ok(n) = val.parse::<usize>() {
                 self.max_sessions = n;
             }
+        }
+        if let Ok(val) = std::env::var("TTTT_HTTP_PORT") {
+            if let Ok(n) = val.parse::<u16>() {
+                self.http_port = Some(n);
+            }
+        }
+        if let Ok(val) = std::env::var("TTTT_HTTP_HOST") {
+            self.http_host = Some(val);
+        }
+        if let Ok(val) = std::env::var("TTTT_SECURE") {
+            self.secure = val == "1" || val.eq_ignore_ascii_case("true");
         }
     }
 

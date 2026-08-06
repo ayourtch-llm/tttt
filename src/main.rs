@@ -5,6 +5,7 @@ pub mod ctl;
 mod diag;
 mod reload;
 mod replay_tui;
+mod web;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -36,6 +37,35 @@ struct Cli {
     /// Enable TUI control MCP tools (tui_switch, tui_get_info, tui_highlight)
     #[arg(long)]
     tui_tools: bool,
+
+    /// Enable the web UI and bind it to this HTTP port (e.g. 8080)
+    #[arg(long)]
+    http_port: Option<u16>,
+
+    /// Host/address to bind the web UI HTTP server to (default: 127.0.0.1)
+    #[arg(long)]
+    http_host: Option<String>,
+
+    /// Serve the web UI over HTTPS. Generates a self-signed cert unless
+    /// --tls-cert/--tls-key are supplied.
+    #[arg(long)]
+    secure: bool,
+
+    /// TLS certificate (PEM) for --secure
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+
+    /// TLS private key (PEM) for --secure
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
+
+    /// htpasswd file (username:hash lines) for web UI basic auth
+    #[arg(long)]
+    htpasswd: Option<PathBuf>,
+
+    /// Access token for the web UI (auto-generated when binding a non-loopback address)
+    #[arg(long)]
+    token: Option<String>,
 
     /// Arguments to pass to the root command (after --)
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -165,6 +195,36 @@ fn main() {
     }
 }
 
+/// Start the web UI server if configured. Prints the access URL to stderr.
+fn start_web_from_config(app: &app::App, config: &config::Config) {
+    let Some(port) = config.http_port else {
+        return;
+    };
+    let host = config
+        .http_host
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    let web_cfg = web::WebConfig {
+        host,
+        port,
+        secure: config.secure,
+        tls_cert: config.tls_cert.clone(),
+        tls_key: config.tls_key.clone(),
+        htpasswd: config.htpasswd.clone(),
+        token: config.token.clone(),
+    };
+
+    match web::start_web_server(web_cfg, app.shared_sessions()) {
+        Ok(url) => {
+            eprintln!("[tttt] Web UI: {}", url);
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to start web server: {}", e);
+        }
+    }
+}
+
 fn run_tui(cli: Cli) {
     let mut config = match cli.config {
         Some(path) => config::Config::load(&path).unwrap_or_else(|e| {
@@ -202,8 +262,30 @@ fn run_tui(cli: Cli) {
     if cli.tui_tools {
         config.tui_tools = true;
     }
+    // Web UI settings (merged into config so they survive live reload)
+    if let Some(p) = cli.http_port {
+        config.http_port = Some(p);
+    }
+    if let Some(h) = cli.http_host {
+        config.http_host = Some(h);
+    }
+    if cli.secure {
+        config.secure = true;
+    }
+    if cli.tls_cert.is_some() {
+        config.tls_cert = cli.tls_cert.clone();
+    }
+    if cli.tls_key.is_some() {
+        config.tls_key = cli.tls_key.clone();
+    }
+    if cli.htpasswd.is_some() {
+        config.htpasswd = cli.htpasswd.clone();
+    }
+    if cli.token.is_some() {
+        config.token = cli.token.clone();
+    }
 
-    let mut app = app::App::new(config);
+    let mut app = app::App::new(config.clone());
 
     if let Err(e) = app.init_loggers() {
         eprintln!("Warning: failed to initialize loggers: {}", e);
@@ -218,6 +300,9 @@ fn run_tui(cli: Cli) {
     if let Err(e) = app.start_viewer_listener() {
         eprintln!("Warning: failed to start viewer listener: {}", e);
     }
+
+    // Start web UI server (if configured)
+    start_web_from_config(&app, &config);
 
     if let Err(e) = app.launch_root() {
         eprintln!("Failed to launch root session: {}", e);
@@ -291,7 +376,7 @@ fn run_restored(restore_file: &str) {
     let restart_root = state.restart_root
         && config.root_args.iter().any(|a| a == "--resume");
 
-    let mut app = app::App::new(config);
+    let mut app = app::App::new(config.clone());
 
     if let Err(e) = app.init_loggers() {
         eprintln!("Warning: failed to initialize loggers: {}", e);
@@ -314,6 +399,9 @@ fn run_restored(restore_file: &str) {
     if let Err(e) = app.start_viewer_listener() {
         eprintln!("Warning: failed to start viewer listener: {}", e);
     }
+
+    // Restart the web UI server (config preserved in saved state)
+    start_web_from_config(&app, &config);
 
     // For SIGUSR2: kill the old root child and respawn a fresh one in the same
     // session slot. This preserves the session ID, position, and sidebar order.

@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>tttt — web viewer</title>
+  <link rel="stylesheet" href="/xterm.css">
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; background: #1e1e2e; color: #cdd6f4;
+                 font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    #layout { display: flex; height: 100vh; }
+    #sidebar { width: 220px; min-width: 220px; background: #181825; border-right: 1px solid #313244;
+               display: flex; flex-direction: column; overflow-y: auto; }
+    #sidebar h3 { margin: 0; padding: 12px 14px; font-size: 13px; letter-spacing: 1px;
+                  text-transform: uppercase; color: #89b4fa; border-bottom: 1px solid #313244; }
+    #session-list { flex: 1; overflow-y: auto; padding: 6px 0; }
+    .session { padding: 8px 14px; cursor: pointer; border-left: 3px solid transparent; }
+    .session:hover { background: #1e1e2e; }
+    .session.active { border-left-color: #89b4fa; background: #1e1e2e; }
+    .session .name { font-size: 13px; color: #cdd6f4; white-space: nowrap; overflow: hidden;
+                     text-overflow: ellipsis; }
+    .session .cmd { font-size: 11px; color: #6c7086; white-space: nowrap; overflow: hidden;
+                    text-overflow: ellipsis; }
+    .session .status { font-size: 10px; color: #a6e3a1; }
+    .session .status.exited { color: #f38ba8; }
+    #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+    #toolbar { display: flex; align-items: center; gap: 10px; padding: 6px 12px;
+               background: #181825; border-bottom: 1px solid #313244; font-size: 12px; }
+    #toolbar .spacer { flex: 1; }
+    #conn { color: #a6e3a1; }
+    #conn.disconnected { color: #f38ba8; }
+    #term-wrap { flex: 1; padding: 8px; overflow: hidden; }
+    #term { width: 100%; height: 100%; }
+    #login-overlay { position: fixed; inset: 0; background: rgba(30,30,46,0.96);
+                     display: flex; align-items: center; justify-content: center; z-index: 10; }
+    #login-box { background: #181825; border: 1px solid #313244; border-radius: 8px;
+                 padding: 24px; width: 340px; }
+    #login-box h2 { margin: 0 0 16px; font-size: 16px; color: #89b4fa; }
+    #login-box label { display: block; font-size: 12px; margin: 10px 0 4px; color: #a6adc8; }
+    #login-box input { width: 100%; padding: 8px; background: #1e1e2e; color: #cdd6f4;
+                       border: 1px solid #45475a; border-radius: 4px; font-size: 14px; }
+    #login-box button { margin-top: 16px; width: 100%; padding: 9px; background: #89b4fa;
+                        color: #11111b; border: none; border-radius: 4px; font-weight: 600;
+                        font-size: 14px; cursor: pointer; }
+    #login-box button:hover { background: #a6c8ff; }
+    #login-error { color: #f38ba8; font-size: 12px; margin-top: 10px; min-height: 16px; }
+    #login-token { display: none; }
+    #login-basic { display: none; }
+  </style>
+</head>
+<body>
+  <div id="layout">
+    <div id="sidebar">
+      <h3>Sessions</h3>
+      <div id="session-list"></div>
+    </div>
+    <div id="main">
+      <div id="toolbar">
+        <span>tttt</span>
+        <span class="spacer"></span>
+        <span id="conn">connecting…</span>
+      </div>
+      <div id="term-wrap"><div id="term"></div></div>
+    </div>
+  </div>
+
+  <div id="login-overlay" style="display:none">
+    <div id="login-box">
+      <h2>tttt web viewer</h2>
+      <div id="login-token">
+        <label for="token-input">Access token</label>
+        <input id="token-input" type="password" autocomplete="off" placeholder="paste token">
+      </div>
+      <div id="login-basic">
+        <label for="user-input">Username</label>
+        <input id="user-input" type="text" autocomplete="username">
+        <label for="pass-input">Password</label>
+        <input id="pass-input" type="password" autocomplete="current-password">
+      </div>
+      <button id="login-btn">Connect</button>
+      <div id="login-error"></div>
+    </div>
+  </div>
+
+  <script src="/xterm.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
