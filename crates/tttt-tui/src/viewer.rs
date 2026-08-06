@@ -7,6 +7,17 @@ use crate::protocol::{encode_message, ServerMsg, SessionInfo};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 
+/// FNV-1a 64-bit hash used for screen change detection by all viewer
+/// implementations (unix-socket attach and the web console).
+pub fn hash_bytes(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+    for byte in data {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+    }
+    hash
+}
+
 /// A connected viewer client.
 pub struct ViewerClient {
     stream: UnixStream,
@@ -43,12 +54,7 @@ impl ViewerClient {
 
     /// FNV-1a 64-bit hash for change detection.
     fn hash_bytes(data: &[u8]) -> u64 {
-        let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
-        for byte in data {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3); // FNV prime
-        }
-        hash
+        hash_bytes(data)
     }
 
     /// Send a screen update to the client.

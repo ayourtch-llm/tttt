@@ -99,6 +99,23 @@
     return d.innerHTML;
   }
 
+  var screenDecoder = new TextDecoder("utf-8", { fatal: false });
+
+  // Screen updates arrive as binary frames:
+  // [cursor_row: u16 BE][cursor_col: u16 BE][raw screen bytes]
+  // (raw bytes instead of a JSON number array — ~4x smaller on the wire).
+  function handleScreenFrame(buf) {
+    var dv = new DataView(buf);
+    var row = dv.getUint16(0);
+    var col = dv.getUint16(2);
+    var bytes = new Uint8Array(buf, 4);
+    if (bytes.length) {
+      term.write(screenDecoder.decode(bytes));
+    }
+    // Place the cursor explicitly (1-indexed CSI H).
+    term.write("\x1b[" + (row + 1) + ";" + (col + 1) + "H");
+  }
+
   function handleServerMsg(raw) {
     var msg = JSON.parse(raw);
     // Unit variants (like Goodbye) serialize as a bare JSON string.
@@ -107,15 +124,7 @@
       scheduleReconnect();
       return;
     }
-    if (msg.ScreenUpdate) {
-      var data = msg.ScreenUpdate.screen_data;
-      if (data && data.length) {
-        // data is an array of bytes (JSON numbers)
-        var bytes = Uint8Array.from(data);
-        var dec = new TextDecoder("utf-8", { fatal: false });
-        term.write(dec.decode(bytes));
-      }
-    } else if (msg.SessionList) {
+    if (msg.SessionList) {
       renderSessions(msg.SessionList);
     } else if (msg.WindowSize) {
       // Keep the browser terminal in sync with PTY dims.
@@ -156,6 +165,8 @@
     ws.onmessage = function (ev) {
       if (typeof ev.data === "string") {
         try { handleServerMsg(ev.data); } catch (e) { /* ignore malformed */ }
+      } else if (ev.data instanceof ArrayBuffer) {
+        try { handleScreenFrame(ev.data); } catch (e) { /* ignore malformed */ }
       }
     };
 

@@ -98,12 +98,63 @@ fn random_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Immutable per-tick view of one session, shared across all connections.
+struct SessionSnapshot {
+    /// PTY dimensions (cols, rows).
+    dims: (u16, u16),
+    /// Cursor position (row, col).
+    cursor: (u16, u16),
+    /// Hash of `content` for change detection.
+    content_hash: u64,
+    /// Rendered contents_formatted() + input modes.
+    content: Arc<Vec<u8>>,
+}
+
+/// Immutable per-tick view of the session manager. Built once per tick by
+/// the publisher task and fanned out to every connection via a watch
+/// channel, so N viewers cost one render + one manager lock per tick
+/// instead of N.
+#[derive(Default)]
+struct Snapshot {
+    list: Vec<SessionInfo>,
+    list_hash: u64,
+    /// Session a viewer should fall back to (root, else first).
+    pick_default: Option<String>,
+    /// Rendered state for sessions at least one viewer watches.
+    sessions: HashMap<String, SessionSnapshot>,
+}
+
+/// Refcounts of sessions currently watched by connected viewers; the
+/// publisher only renders these.
+type WatchedSessions = Arc<Mutex<HashMap<String, usize>>>;
+
+/// Move a viewer's watch refcount from `old` to `new`.
+fn retarget_watch(watched: &WatchedSessions, old: Option<&str>, new: Option<&str>) {
+    if old == new {
+        return;
+    }
+    let mut w = watched.lock().unwrap();
+    if let Some(old) = old {
+        if let Some(n) = w.get_mut(old) {
+            *n -= 1;
+            if *n == 0 {
+                w.remove(old);
+            }
+        }
+    }
+    if let Some(new) = new {
+        *w.entry(new.to_string()).or_insert(0) += 1;
+    }
+}
+
 /// Shared state for axum handlers.
 #[derive(Clone)]
 struct WebState {
     sessions: Arc<Mutex<SessionManager<AnyPty>>>,
     auth: Arc<auth::Auth>,
     work_dir: PathBuf,
+    snapshot_rx: tokio::sync::watch::Receiver<Arc<Snapshot>>,
+    watched: WatchedSessions,
 }
 
 /// Shared WebSocket sender (split sink) used by both the push loop and the
@@ -135,10 +186,13 @@ pub fn start_web_server(
         url = format!("{}?token={}", base, tok);
     }
 
+    let (snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(Arc::new(Snapshot::default()));
     let state = WebState {
         sessions,
         auth: Arc::new(auth),
         work_dir: cfg.work_dir.clone(),
+        snapshot_rx,
+        watched: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let cfg = Arc::new(cfg);
@@ -150,13 +204,22 @@ pub fn start_web_server(
                 .worker_threads(2)
                 .build()
                 .expect("failed to build web runtime");
-            rt.block_on(serve(cfg, state));
+            rt.block_on(serve(cfg, state, snapshot_tx));
         })?;
 
     Ok(url)
 }
 
-async fn serve(cfg: Arc<WebConfig>, state: WebState) {
+async fn serve(
+    cfg: Arc<WebConfig>,
+    state: WebState,
+    snapshot_tx: tokio::sync::watch::Sender<Arc<Snapshot>>,
+) {
+    tokio::spawn(publisher(
+        Arc::clone(&state.sessions),
+        Arc::clone(&state.watched),
+        snapshot_tx,
+    ));
     let app = Router::new()
         .route("/", get(index))
         .route("/app.js", get(serve_app_js))
@@ -325,15 +388,6 @@ impl WebViewer {
     }
 }
 
-fn fnv1a(data: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for &b in data {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
 async fn handle_ws(socket: WebSocket, state: WebState) {
     use futures_util::{SinkExt, StreamExt};
 
@@ -353,31 +407,32 @@ async fn handle_ws(socket: WebSocket, state: WebState) {
             .or_else(|| list.first())
             .map(|m| m.id.clone())
     };
+    retarget_watch(&state.watched, None, active.as_deref());
     viewer.lock().await.active_session = active;
 
-    // Push loop: periodically send screen + session-list updates.
+    // Push loop: forward snapshot changes published by the shared publisher
+    // task. Wakes only when something actually changed.
     let push_sender = Arc::clone(&sender);
     let push_viewer = Arc::clone(&viewer);
     let push_state = state.clone();
     let push_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
+        let mut rx = push_state.snapshot_rx.clone();
         loop {
-            interval.tick().await;
             let msgs = {
+                let snap = Arc::clone(&rx.borrow_and_update());
                 let mut v = push_viewer.lock().await;
-                let mut out = Vec::new();
-                build_updates(&push_state.sessions, &mut v, &mut out);
-                out
+                viewer_updates(&snap, &mut v, &push_state.watched)
             };
-            if msgs.is_empty() {
-                continue;
-            }
-            let mut s = push_sender.lock().await;
-            for msg in msgs {
-                let text = serde_json::to_string(&msg).unwrap_or_default();
-                if s.send(Message::Text(text)).await.is_err() {
-                    return;
+            if !msgs.is_empty() {
+                let mut s = push_sender.lock().await;
+                for msg in &msgs {
+                    if s.send(encode_out_msg(msg)).await.is_err() {
+                        return;
+                    }
                 }
+            }
+            if rx.changed().await.is_err() {
+                return;
             }
         }
     });
@@ -408,6 +463,35 @@ async fn handle_ws(socket: WebSocket, state: WebState) {
         }
     }
     push_task.abort();
+    // Drop this viewer's watch refcount so the publisher stops rendering
+    // sessions nobody is looking at.
+    let active = viewer.lock().await.active_session.clone();
+    retarget_watch(&state.watched, active.as_deref(), None);
+}
+
+/// Push any updates the viewer needs right now (used by the read loop after
+/// a session switch, so the new screen appears without waiting for the next
+/// snapshot change).
+async fn flush_viewer(
+    state: &WebState,
+    viewer: &Arc<tokio::sync::Mutex<WebViewer>>,
+    sender: &Arc<WsSender>,
+) {
+    use futures_util::SinkExt;
+    let msgs = {
+        let snap = Arc::clone(&state.snapshot_rx.borrow());
+        let mut v = viewer.lock().await;
+        viewer_updates(&snap, &mut v, &state.watched)
+    };
+    if msgs.is_empty() {
+        return;
+    }
+    let mut s = sender.lock().await;
+    for msg in &msgs {
+        if s.send(encode_out_msg(msg)).await.is_err() {
+            return;
+        }
+    }
 }
 
 /// Parse and handle one incoming client message. Returns true if the
@@ -425,40 +509,38 @@ async fn handle_incoming(
     }
 }
 
-/// Build any pending screen/session-list updates for a viewer.
-fn build_updates(
-    sessions: &Arc<Mutex<SessionManager<AnyPty>>>,
-    viewer: &mut WebViewer,
-    out: &mut Vec<ServerMsg>,
+/// Publisher task: once per tick, render each watched session and publish a
+/// shared snapshot. Connections wake only when something actually changed.
+async fn publisher(
+    sessions: Arc<Mutex<SessionManager<AnyPty>>>,
+    watched: WatchedSessions,
+    tx: tokio::sync::watch::Sender<Arc<Snapshot>>,
 ) {
-    let mgr = sessions.lock().unwrap();
-
-    // (Re)pick an active session if the current one is gone (killed by
-    // another viewer or the TUI) or was never set (connected before any
-    // session existed). Without this the viewer freezes on a dead session.
-    let current_ok = viewer
-        .active_session
-        .as_ref()
-        .map(|sid| mgr.exists(sid))
-        .unwrap_or(false);
-    if !current_ok {
-        let list = mgr.list();
-        let new_active = list
-            .iter()
-            .find(|m| m.root)
-            .or_else(|| list.first())
-            .map(|m| m.id.clone());
-        if new_active != viewer.active_session {
-            viewer.active_session = new_active;
-            viewer.invalidate();
-            // Force a SessionList push so the sidebar highlight follows.
-            viewer.last_list_hash = 0;
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
+    let mut prev = Arc::new(Snapshot::default());
+    loop {
+        interval.tick().await;
+        let snap = build_snapshot(&sessions, &watched);
+        if snapshot_changed(&prev, &snap) {
+            prev = Arc::new(snap);
+            if tx.send(Arc::clone(&prev)).is_err() {
+                return; // server dropped
+            }
         }
     }
+}
 
-    // Session list (only when changed)
-    let list: Vec<SessionInfo> = mgr
-        .list()
+/// Build one immutable snapshot of the session manager: list metadata for
+/// all sessions, rendered screen state for watched ones.
+fn build_snapshot(
+    sessions: &Arc<Mutex<SessionManager<AnyPty>>>,
+    watched: &WatchedSessions,
+) -> Snapshot {
+    let watched_ids: Vec<String> = watched.lock().unwrap().keys().cloned().collect();
+    let mgr = sessions.lock().unwrap();
+
+    let meta = mgr.list();
+    let list: Vec<SessionInfo> = meta
         .iter()
         .map(|m| SessionInfo {
             id: m.id.clone(),
@@ -467,50 +549,144 @@ fn build_updates(
         })
         .collect();
     let list_json = serde_json::to_vec(&list).unwrap_or_default();
-    let list_hash = fnv1a(&list_json);
-    if list_hash != viewer.last_list_hash {
-        viewer.last_list_hash = list_hash;
-        out.push(ServerMsg::SessionList {
-            sessions: list,
+    let list_hash = tttt_tui::viewer::hash_bytes(&list_json);
+    let pick_default = meta
+        .iter()
+        .find(|m| m.root)
+        .or_else(|| meta.first())
+        .map(|m| m.id.clone());
+
+    let mut snapshot_sessions = HashMap::new();
+    for sid in watched_ids {
+        let Ok(session) = mgr.get(&sid) else {
+            continue; // killed; viewers re-pick via pick_default
+        };
+        // contents_formatted() PLUS the terminal input modes (bracketed
+        // paste, application keypad/cursor, mouse). xterm.js uses the
+        // bracketed paste flag to wrap pastes in \x1b[200~...\x1b[201~ so
+        // multi-line pastes aren't executed line-by-line by the shell.
+        let mut content = session.get_screen_formatted();
+        content.extend_from_slice(&session.screen().screen().input_mode_formatted());
+        let content_hash = tttt_tui::viewer::hash_bytes(&content);
+        snapshot_sessions.insert(
+            sid,
+            SessionSnapshot {
+                dims: session.screen().size(),
+                cursor: session.cursor_position(),
+                content_hash,
+                content: Arc::new(content),
+            },
+        );
+    }
+
+    Snapshot {
+        list,
+        list_hash,
+        pick_default,
+        sessions: snapshot_sessions,
+    }
+}
+
+/// True if anything a viewer could care about differs between snapshots.
+fn snapshot_changed(a: &Snapshot, b: &Snapshot) -> bool {
+    if a.list_hash != b.list_hash || a.pick_default != b.pick_default {
+        return true;
+    }
+    if a.sessions.len() != b.sessions.len() {
+        return true;
+    }
+    b.sessions.iter().any(|(sid, s)| {
+        a.sessions.get(sid).map_or(true, |p| {
+            p.content_hash != s.content_hash || p.cursor != s.cursor || p.dims != s.dims
+        })
+    })
+}
+
+/// An outgoing message: protocol JSON, or a raw binary screen frame
+/// (`[cursor_row: u16 BE][cursor_col: u16 BE][screen bytes]`) which avoids
+/// serializing screen data as a JSON number array (~4x smaller).
+enum OutMsg {
+    Json(ServerMsg),
+    Screen {
+        cursor: (u16, u16),
+        content: Arc<Vec<u8>>,
+    },
+}
+
+/// Build the messages a viewer needs to catch up to `snap`.
+fn viewer_updates(snap: &Snapshot, viewer: &mut WebViewer, watched: &WatchedSessions) -> Vec<OutMsg> {
+    let mut out = Vec::new();
+
+    // (Re)pick an active session if the current one is gone (killed by
+    // another viewer or the TUI) or was never set (connected before any
+    // session existed). Without this the viewer freezes on a dead session.
+    let current_ok = viewer
+        .active_session
+        .as_ref()
+        .map(|sid| snap.list.iter().any(|s| &s.id == sid))
+        .unwrap_or(false);
+    if !current_ok && viewer.active_session != snap.pick_default {
+        retarget_watch(
+            watched,
+            viewer.active_session.as_deref(),
+            snap.pick_default.as_deref(),
+        );
+        viewer.active_session = snap.pick_default.clone();
+        viewer.invalidate();
+        // Force a SessionList push so the sidebar highlight follows.
+        viewer.last_list_hash = 0;
+    }
+
+    // Session list (only when changed)
+    if snap.list_hash != viewer.last_list_hash {
+        viewer.last_list_hash = snap.list_hash;
+        out.push(OutMsg::Json(ServerMsg::SessionList {
+            sessions: snap.list.clone(),
             active_id: viewer.active_session.clone(),
-        });
+        }));
     }
 
     // Screen update for the active session
-    let Some(sid) = viewer.active_session.clone() else {
-        return;
-    };
-    let Ok(session) = mgr.get(&sid) else {
-        return;
+    let Some(session) = viewer
+        .active_session
+        .as_ref()
+        .and_then(|sid| snap.sessions.get(sid))
+    else {
+        return out;
     };
     // Keep the browser terminal at the PTY's dimensions. The TUI owns the
     // PTY size (min-across-viewers arbitration); the web client follows.
-    let dims = session.screen().size();
-    if dims != viewer.last_window_size {
-        viewer.last_window_size = dims;
-        out.push(ServerMsg::WindowSize {
-            cols: dims.0,
-            rows: dims.1,
-        });
+    if session.dims != viewer.last_window_size {
+        viewer.last_window_size = session.dims;
+        out.push(OutMsg::Json(ServerMsg::WindowSize {
+            cols: session.dims.0,
+            rows: session.dims.1,
+        }));
     }
-    // Send the formatted contents PLUS the terminal input modes (bracketed
-    // paste, application keypad/cursor, mouse). xterm.js uses the bracketed
-    // paste mode flag to wrap pastes in \x1b[200~...\x1b[201~ so multi-line
-    // pastes aren't executed line-by-line by the shell.
-    let mut content = session.get_screen_formatted();
-    content.extend_from_slice(&session.screen().screen().input_mode_formatted());
-    let hash = fnv1a(&content);
-    let cursor = session.cursor_position();
-    if hash == viewer.last_content_hash && cursor == viewer.last_cursor {
-        return;
+    if session.content_hash == viewer.last_content_hash && session.cursor == viewer.last_cursor {
+        return out;
     }
-    viewer.last_content_hash = hash;
-    viewer.last_cursor = cursor;
-    out.push(ServerMsg::ScreenUpdate {
-        screen_data: content,
-        cursor_row: cursor.0,
-        cursor_col: cursor.1,
+    viewer.last_content_hash = session.content_hash;
+    viewer.last_cursor = session.cursor;
+    out.push(OutMsg::Screen {
+        cursor: session.cursor,
+        content: Arc::clone(&session.content),
     });
+    out
+}
+
+/// Encode an OutMsg as a WebSocket message.
+fn encode_out_msg(msg: &OutMsg) -> Message {
+    match msg {
+        OutMsg::Json(m) => Message::Text(serde_json::to_string(m).unwrap_or_default()),
+        OutMsg::Screen { cursor, content } => {
+            let mut frame = Vec::with_capacity(4 + content.len());
+            frame.extend_from_slice(&cursor.0.to_be_bytes());
+            frame.extend_from_slice(&cursor.1.to_be_bytes());
+            frame.extend_from_slice(content);
+            Message::Binary(frame)
+        }
+    }
 }
 
 /// Handle one client message. Returns true if the connection should close.
@@ -531,11 +707,14 @@ async fn handle_client_msg(
             }
         }
         ClientMsg::SwitchSession { session_id } => {
-            let mut v = viewer.lock().await;
             let exists = state.sessions.lock().unwrap().exists(&session_id);
             if exists {
+                let mut v = viewer.lock().await;
+                retarget_watch(&state.watched, v.active_session.as_deref(), Some(&session_id));
                 v.active_session = Some(session_id);
                 v.invalidate();
+                drop(v);
+                flush_viewer(state, viewer, sender).await;
             }
         }
         ClientMsg::Resize { .. } => {
@@ -556,6 +735,7 @@ async fn handle_client_msg(
                     // Auto-switch this viewer to the freshly created session.
                     {
                         let mut v = viewer.lock().await;
+                        retarget_watch(&state.watched, v.active_session.as_deref(), Some(&new_id));
                         v.active_session = Some(new_id.clone());
                         v.invalidate();
                     }
@@ -587,15 +767,19 @@ async fn handle_client_msg(
                 }
             };
             // If this viewer was watching the killed session, switch it away.
+            // (Other viewers re-pick via `pick_default` in viewer_updates.)
             {
                 let mut v = viewer.lock().await;
                 if v.active_session.as_deref() == Some(session_id.as_str()) {
-                    let mgr = state.sessions.lock().unwrap();
-                    let list = mgr.list();
-                    v.active_session = list
-                        .iter()
-                        .find(|m| m.id != session_id)
-                        .map(|m| m.id.clone());
+                    let new_active = {
+                        let mgr = state.sessions.lock().unwrap();
+                        let list = mgr.list();
+                        list.iter()
+                            .find(|m| m.id != session_id)
+                            .map(|m| m.id.clone())
+                    };
+                    retarget_watch(&state.watched, v.active_session.as_deref(), new_active.as_deref());
+                    v.active_session = new_active;
                     v.invalidate();
                 }
             }
@@ -685,10 +869,102 @@ mod tests {
         assert!(!is_loopback("example.com"));
     }
 
+    fn snap_session(hash: u64) -> SessionSnapshot {
+        SessionSnapshot {
+            dims: (80, 24),
+            cursor: (0, 0),
+            content_hash: hash,
+            content: Arc::new(vec![]),
+        }
+    }
+
+    fn info(id: &str) -> SessionInfo {
+        SessionInfo {
+            id: id.to_string(),
+            command: "sh".to_string(),
+            status: "running".to_string(),
+        }
+    }
+
     #[test]
-    fn test_fnv1a_stability() {
-        assert_eq!(fnv1a(b"abc"), fnv1a(b"abc"));
-        assert_ne!(fnv1a(b"abc"), fnv1a(b"abd"));
+    fn test_snapshot_changed() {
+        let mut a = Snapshot::default();
+        let mut b = Snapshot::default();
+        assert!(!snapshot_changed(&a, &b));
+        b.list_hash = 1;
+        assert!(snapshot_changed(&a, &b));
+        a.list_hash = 1;
+        a.sessions.insert("pty-1".into(), snap_session(10));
+        b.sessions.insert("pty-1".into(), snap_session(10));
+        assert!(!snapshot_changed(&a, &b));
+        b.sessions.insert("pty-1".into(), snap_session(11));
+        assert!(snapshot_changed(&a, &b));
+        b.sessions.insert("pty-1".into(), snap_session(10));
+        b.sessions.get_mut("pty-1").unwrap().cursor = (1, 2);
+        assert!(snapshot_changed(&a, &b));
+    }
+
+    #[test]
+    fn test_viewer_updates_repicks_dead_session() {
+        let watched: WatchedSessions = Arc::new(Mutex::new(HashMap::new()));
+        let mut snap = Snapshot::default();
+        snap.list = vec![info("pty-1")];
+        snap.list_hash = 42;
+        snap.pick_default = Some("pty-1".to_string());
+        snap.sessions.insert("pty-1".into(), snap_session(7));
+
+        let mut viewer = WebViewer::new();
+        viewer.active_session = Some("pty-9".to_string()); // killed elsewhere
+        retarget_watch(&watched, None, Some("pty-9"));
+
+        let msgs = viewer_updates(&snap, &mut viewer, &watched);
+        assert_eq!(viewer.active_session.as_deref(), Some("pty-1"));
+        // Watch refcount moved from the dead session to the new one.
+        let w = watched.lock().unwrap();
+        assert!(!w.contains_key("pty-9"));
+        assert_eq!(w.get("pty-1"), Some(&1));
+        drop(w);
+        // Gets the list, the window size, and the screen frame.
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(&msgs[0], OutMsg::Json(ServerMsg::SessionList { .. })));
+        assert!(matches!(&msgs[1], OutMsg::Json(ServerMsg::WindowSize { .. })));
+        assert!(matches!(&msgs[2], OutMsg::Screen { .. }));
+
+        // Second pass with the same snapshot: nothing new to send.
+        let msgs = viewer_updates(&snap, &mut viewer, &watched);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn test_encode_screen_frame() {
+        let msg = OutMsg::Screen {
+            cursor: (3, 260),
+            content: Arc::new(vec![0x41, 0x42]),
+        };
+        match encode_out_msg(&msg) {
+            Message::Binary(b) => {
+                assert_eq!(&b[..4], &[0, 3, 1, 4]); // 3, 260 as u16 BE
+                assert_eq!(&b[4..], b"AB");
+            }
+            _ => panic!("expected binary frame"),
+        }
+    }
+
+    #[test]
+    fn test_retarget_watch_refcounts() {
+        let watched: WatchedSessions = Arc::new(Mutex::new(HashMap::new()));
+        retarget_watch(&watched, None, Some("a"));
+        retarget_watch(&watched, None, Some("a"));
+        assert_eq!(watched.lock().unwrap().get("a"), Some(&2));
+        retarget_watch(&watched, Some("a"), Some("b"));
+        {
+            let w = watched.lock().unwrap();
+            assert_eq!(w.get("a"), Some(&1));
+            assert_eq!(w.get("b"), Some(&1));
+        }
+        retarget_watch(&watched, Some("a"), None);
+        retarget_watch(&watched, Some("b"), None);
+        assert!(watched.lock().unwrap().is_empty());
     }
 
     #[test]
