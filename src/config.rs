@@ -171,7 +171,13 @@ impl Config {
             self.http_host = Some(val);
         }
         if let Ok(val) = std::env::var("TTTT_SECURE") {
-            self.secure = val == "1" || val.eq_ignore_ascii_case("true");
+            // Only apply recognized values; an unrecognized value must not
+            // silently downgrade a config file's `secure = true`.
+            if val == "1" || val.eq_ignore_ascii_case("true") {
+                self.secure = true;
+            } else if val == "0" || val.eq_ignore_ascii_case("false") {
+                self.secure = false;
+            }
         }
     }
 
@@ -290,6 +296,23 @@ sidebar_width = 25
         assert_eq!(dc.sidebar_width, 35);
         assert_eq!(dc.prefix_key, 0x01);
         assert!(dc.status_line);
+    }
+
+    #[test]
+    fn test_secure_env_override_ignores_unrecognized() {
+        // Unrecognized values must not downgrade secure=true from the config.
+        let mut config = Config::default();
+        config.secure = true;
+        std::env::set_var("TTTT_SECURE", "yes");
+        config.apply_env_overrides();
+        assert!(config.secure);
+        std::env::set_var("TTTT_SECURE", "0");
+        config.apply_env_overrides();
+        assert!(!config.secure);
+        std::env::set_var("TTTT_SECURE", "true");
+        config.apply_env_overrides();
+        assert!(config.secure);
+        std::env::remove_var("TTTT_SECURE");
     }
 
     #[test]

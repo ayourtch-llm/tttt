@@ -8,6 +8,8 @@
   var ws = null;
   var reconnectTimer = null;
   var credential = null; // { token } or { user, pass }
+  var authRequired = false;
+  var authScheme = null; // "token" | "basic" | "none"
   var connEl = document.getElementById("conn");
   var sessionListEl = document.getElementById("session-list");
   var loginOverlay = document.getElementById("login-overlay");
@@ -51,9 +53,8 @@
       send({ KeyInput: { bytes: Array.from(new TextEncoder().encode(data)) } });
     });
 
-    term.onResize(function (dims) {
-      send({ Resize: { cols: dims.cols, rows: dims.rows } });
-    });
+    // The PTY size is owned by the tttt TUI; the browser terminal follows
+    // it via WindowSize messages, so no Resize is sent to the server.
   }
 
   function send(obj) {
@@ -100,6 +101,12 @@
 
   function handleServerMsg(raw) {
     var msg = JSON.parse(raw);
+    // Unit variants (like Goodbye) serialize as a bare JSON string.
+    if (msg === "Goodbye") {
+      setConn("server closed", false);
+      scheduleReconnect();
+      return;
+    }
     if (msg.ScreenUpdate) {
       var data = msg.ScreenUpdate.screen_data;
       if (data && data.length) {
@@ -129,9 +136,6 @@
       if (!sk.success) {
         setConn("close failed: " + (sk.error || "unknown"), false);
       }
-    } else if (msg.Goodbye) {
-      setConn("server closed", false);
-      scheduleReconnect();
     }
   }
 
@@ -142,11 +146,11 @@
     setConn("connecting…", false);
     ws = new WebSocket(wsUrl());
     ws.binaryType = "arraybuffer";
+    var opened = false;
 
     ws.onopen = function () {
+      opened = true;
       setConn("connected", true);
-      // Announce our terminal size so the PTY is sized correctly.
-      send({ Resize: { cols: term.cols, rows: term.rows } });
     };
 
     ws.onmessage = function (ev) {
@@ -157,6 +161,25 @@
 
     ws.onclose = function () {
       setConn("disconnected", false);
+      if (!opened && credential) {
+        // Never connected with this credential. Probe the server: if it is
+        // reachable, the credential was rejected — re-show the login form
+        // instead of reconnecting with the same bad credential forever.
+        fetch("/api/auth")
+          .then(function (r) {
+            if (r.ok) {
+              credential = null;
+              var err = document.getElementById("login-error");
+              if (err) err.textContent = "authentication failed";
+              setConn("auth failed", false);
+              showLogin();
+            } else {
+              scheduleReconnect();
+            }
+          })
+          .catch(function () { scheduleReconnect(); });
+        return;
+      }
       scheduleReconnect();
     };
 
@@ -169,7 +192,7 @@
     if (reconnectTimer) return;
     reconnectTimer = setTimeout(function () {
       reconnectTimer = null;
-      if (credential) {
+      if (credential || !authRequired) {
         connect();
       } else {
         showLogin();
@@ -178,6 +201,15 @@
   }
 
   function showLogin() {
+    // Make sure the form matching the server's auth scheme is visible
+    // (e.g. when a URL token was rejected, no form was shown yet).
+    if (authScheme === "basic") {
+      document.getElementById("login-basic").style.display = "block";
+      document.getElementById("login-token").style.display = "none";
+    } else if (authScheme === "token") {
+      document.getElementById("login-token").style.display = "block";
+      document.getElementById("login-basic").style.display = "none";
+    }
     loginOverlay.style.display = "flex";
   }
 
@@ -200,19 +232,17 @@
     fetch("/api/auth")
       .then(function (r) { return r.json(); })
       .then(function (info) {
+        authRequired = !!info.required;
+        authScheme = info.scheme || null;
         if (!info.required) {
           startWithCredential(null);
           return;
         }
-        if (info.scheme === "token") {
-          if (urlToken) {
-            startWithCredential({ token: urlToken });
-          } else {
-            document.getElementById("login-token").style.display = "block";
-            showLogin();
-          }
+        // A URL token is worth trying under any scheme (token auth may be
+        // active alongside htpasswd); if rejected, the login form appears.
+        if (urlToken) {
+          startWithCredential({ token: urlToken });
         } else {
-          document.getElementById("login-basic").style.display = "block";
           showLogin();
         }
       })

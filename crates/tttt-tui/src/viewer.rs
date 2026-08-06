@@ -149,7 +149,8 @@ impl ViewerClient {
         self.last_cursor = (0, 0);
     }
 
-    fn send_msg(&mut self, msg: &ServerMsg) -> bool {
+    /// Send an arbitrary protocol message to the client.
+    pub fn send_msg(&mut self, msg: &ServerMsg) -> bool {
         let data = encode_message(msg);
         // Temporarily set blocking for writes to ensure delivery
         let _ = self.stream.set_nonblocking(false);

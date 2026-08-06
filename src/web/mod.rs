@@ -46,17 +46,33 @@ pub struct WebConfig {
 impl WebConfig {
     /// The auth instance to use, and whether a token was auto-generated.
     fn resolved_auth(&self) -> Result<(auth::Auth, Option<String>), Box<dyn std::error::Error>> {
-        if let Some(ht) = &self.htpasswd {
-            return Ok((auth::Auth::with_htpasswd(ht)?, None));
-        }
+        let mut auth = match &self.htpasswd {
+            Some(ht) => auth::Auth::with_htpasswd(ht)?,
+            None => auth::Auth::none(),
+        };
         if let Some(tok) = &self.token {
-            return Ok((auth::Auth::with_token(tok.clone()), None));
+            auth.set_token(tok.clone());
+            return Ok((auth, None));
         }
-        if !is_loopback(&self.host) {
+        if self.htpasswd.is_none() && !is_loopback(&self.host) {
             let tok = random_token();
-            return Ok((auth::Auth::with_token(tok.clone()), Some(tok)));
+            auth.set_token(tok.clone());
+            return Ok((auth, Some(tok)));
         }
-        Ok((auth::Auth::none(), None))
+        Ok((auth, None))
+    }
+}
+
+/// Ensure a bind that would auto-generate an access token has that token
+/// stored in the config, so the same token survives SIGUSR1 live reload
+/// (the reload path restores the saved config and restarts the web server).
+pub fn ensure_token(config: &mut crate::config::Config) {
+    if config.http_port.is_none() || config.htpasswd.is_some() || config.token.is_some() {
+        return;
+    }
+    let host = config.http_host.as_deref().unwrap_or("127.0.0.1");
+    if !is_loopback(host) {
+        config.token = Some(random_token());
     }
 }
 
@@ -99,6 +115,9 @@ pub fn start_web_server(
     cfg: WebConfig,
     sessions: Arc<Mutex<SessionManager<AnyPty>>>,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    if cfg.tls_cert.is_some() != cfg.tls_key.is_some() {
+        return Err("--tls-cert and --tls-key must be supplied together".into());
+    }
     let (auth, generated_token) = cfg.resolved_auth()?;
 
     let scheme = if cfg.secure { "https" } else { "http" };
@@ -109,8 +128,10 @@ pub fn start_web_server(
     };
     let base = format!("{}://{}:{}", scheme, display_host, cfg.port);
 
+    // Include the access token in the printed URL whether it was generated
+    // here or pre-generated into the config (see `ensure_token`).
     let mut url = base.clone();
-    if let Some(tok) = generated_token.as_ref() {
+    if let Some(tok) = generated_token.as_ref().or(cfg.token.as_ref()) {
         url = format!("{}?token={}", base, tok);
     }
 
@@ -145,9 +166,25 @@ async fn serve(cfg: Arc<WebConfig>, state: WebState) {
         .route("/ws", get(ws_handler))
         .with_state(state);
 
-    let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
-        .parse()
-        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], cfg.port)));
+    // Resolve via ToSocketAddrs so hostnames and bare IPv6 work; refuse to
+    // start rather than silently binding a different address than requested.
+    use std::net::ToSocketAddrs;
+    let addr: SocketAddr = match (cfg.host.as_str(), cfg.port).to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(a) => a,
+            None => {
+                eprintln!("[tttt web] no address found for {}:{}", cfg.host, cfg.port);
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "[tttt web] cannot resolve bind address {}:{}: {}",
+                cfg.host, cfg.port, e
+            );
+            return;
+        }
+    };
 
     let result = if cfg.secure {
         let server_config = build_tls_config(&cfg);
@@ -225,12 +262,14 @@ async fn serve_xterm_css() -> Response {
 /// Report whether auth is required and its scheme, without leaking secrets.
 /// The client uses this to decide what login UI to show.
 async fn auth_info(State(state): State<WebState>) -> Response {
+    // When both htpasswd and a token are configured, the login form uses
+    // basic auth; the token still works via `?token=`/`Bearer`.
     let scheme = if !state.auth.required() {
         "none"
-    } else if state.auth.has_token() {
-        "token"
-    } else {
+    } else if state.auth.has_htpasswd() {
         "basic"
+    } else {
+        "token"
     };
     let body = serde_json::json!({ "required": state.auth.required(), "scheme": scheme });
     ([(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
@@ -244,8 +283,16 @@ async fn ws_handler(
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    if state.auth.required() && !state.auth.check_request(&query, &headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if state.auth.required() {
+        // bcrypt verification is CPU-heavy (~tens of ms); keep it off the
+        // small async worker pool so screen pushes aren't stalled.
+        let auth = Arc::clone(&state.auth);
+        let ok = tokio::task::spawn_blocking(move || auth.check_request(&query, &headers))
+            .await
+            .unwrap_or(false);
+        if !ok {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
     }
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
@@ -253,28 +300,28 @@ async fn ws_handler(
 /// Per-connection viewer state (mirrors `ViewerClient` for the web).
 struct WebViewer {
     active_session: Option<String>,
-    cols: u16,
-    rows: u16,
     last_content_hash: u64,
     last_cursor: (u16, u16),
     last_list_hash: u64,
+    /// PTY dimensions last announced to this client via `WindowSize`.
+    last_window_size: (u16, u16),
 }
 
 impl WebViewer {
     fn new() -> Self {
         Self {
             active_session: None,
-            cols: 80,
-            rows: 24,
             last_content_hash: 0,
             last_cursor: (0, 0),
             last_list_hash: 0,
+            last_window_size: (0, 0),
         }
     }
 
     fn invalidate(&mut self) {
         self.last_content_hash = 0;
         self.last_cursor = (0, 0);
+        self.last_window_size = (0, 0);
     }
 }
 
@@ -386,6 +433,29 @@ fn build_updates(
 ) {
     let mgr = sessions.lock().unwrap();
 
+    // (Re)pick an active session if the current one is gone (killed by
+    // another viewer or the TUI) or was never set (connected before any
+    // session existed). Without this the viewer freezes on a dead session.
+    let current_ok = viewer
+        .active_session
+        .as_ref()
+        .map(|sid| mgr.exists(sid))
+        .unwrap_or(false);
+    if !current_ok {
+        let list = mgr.list();
+        let new_active = list
+            .iter()
+            .find(|m| m.root)
+            .or_else(|| list.first())
+            .map(|m| m.id.clone());
+        if new_active != viewer.active_session {
+            viewer.active_session = new_active;
+            viewer.invalidate();
+            // Force a SessionList push so the sidebar highlight follows.
+            viewer.last_list_hash = 0;
+        }
+    }
+
     // Session list (only when changed)
     let list: Vec<SessionInfo> = mgr
         .list()
@@ -413,6 +483,16 @@ fn build_updates(
     let Ok(session) = mgr.get(&sid) else {
         return;
     };
+    // Keep the browser terminal at the PTY's dimensions. The TUI owns the
+    // PTY size (min-across-viewers arbitration); the web client follows.
+    let dims = session.screen().size();
+    if dims != viewer.last_window_size {
+        viewer.last_window_size = dims;
+        out.push(ServerMsg::WindowSize {
+            cols: dims.0,
+            rows: dims.1,
+        });
+    }
     // Send the formatted contents PLUS the terminal input modes (bracketed
     // paste, application keypad/cursor, mouse). xterm.js uses the bracketed
     // paste mode flag to wrap pastes in \x1b[200~...\x1b[201~ so multi-line
@@ -458,20 +538,11 @@ async fn handle_client_msg(
                 v.invalidate();
             }
         }
-        ClientMsg::Resize { cols, rows } => {
-            let sid = viewer.lock().await.active_session.clone();
-            {
-                let mut v = viewer.lock().await;
-                v.cols = cols;
-                v.rows = rows;
-                v.invalidate();
-            }
-            if let Some(sid) = sid {
-                let mut mgr = state.sessions.lock().unwrap();
-                if let Ok(session) = mgr.get_mut(&sid) {
-                    let _ = session.resize(cols.max(2), rows.max(2));
-                }
-            }
+        ClientMsg::Resize { .. } => {
+            // The PTY size is owned by the TUI (min-across-viewers
+            // arbitration in App); resizing it here would garble the local
+            // display. The browser terminal follows the PTY instead, via
+            // the WindowSize messages pushed from build_updates.
         }
         ClientMsg::CreateSession {
             command,
@@ -504,9 +575,16 @@ async fn handle_client_msg(
             }
         }
         ClientMsg::KillSession { session_id } => {
-            let kill_result = {
+            let kill_result: Result<(), String> = {
                 let mut mgr = state.sessions.lock().unwrap();
-                mgr.kill_session(&session_id)
+                // Never kill the root session: the TUI depends on it
+                // (respawn/restart logic), and with no other sessions
+                // running its removal would exit the whole tttt process.
+                if mgr.get(&session_id).map(|s| s.is_root()).unwrap_or(false) {
+                    Err("cannot close the root session from the web UI".to_string())
+                } else {
+                    mgr.kill_session(&session_id).map_err(|e| e.to_string())
+                }
             };
             // If this viewer was watching the killed session, switch it away.
             {
@@ -530,7 +608,7 @@ async fn handle_client_msg(
                 Err(e) => ServerMsg::SessionKilled {
                     session_id,
                     success: false,
-                    error: Some(e.to_string()),
+                    error: Some(e),
                 },
             };
             send_server_msg(sender, &resp).await;
@@ -558,11 +636,21 @@ fn create_session(
     };
     let cmd_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    let backend = RealPty::spawn_with_cwd(&cmd, &cmd_args, Some(&state.work_dir), cols, rows)
-        .map_err(|e| e.to_string())?;
+    // Same env as App::create_session: TTTT_PID lets tools inside the
+    // session signal this process (e.g. SIGUSR1 live reload).
+    let backend = RealPty::spawn_with_cwd_and_env(
+        &cmd,
+        &cmd_args,
+        Some(&state.work_dir),
+        cols,
+        rows,
+        [("TTTT_PID".to_string(), std::process::id().to_string())],
+    )
+    .map_err(|e| e.to_string())?;
     let mut mgr = state.sessions.lock().unwrap();
     let id = mgr.generate_id();
-    let session = PtySession::new(id.clone(), AnyPty::Real(backend), cmd, cols, rows);
+    let mut session = PtySession::new(id.clone(), AnyPty::Real(backend), cmd, cols, rows);
+    session.set_working_dir(state.work_dir.to_string_lossy().into_owned());
     mgr.add_session(session).map_err(|e| e.to_string())?;
     Ok(id)
 }
@@ -634,6 +722,50 @@ mod tests {
         let (auth, gen) = cfg.resolved_auth().unwrap();
         assert!(!auth.required());
         assert!(gen.is_none());
+    }
+
+    #[test]
+    fn test_ensure_token_non_loopback() {
+        let mut config = crate::config::Config::default();
+        config.http_port = Some(8080);
+        config.http_host = Some("0.0.0.0".to_string());
+        ensure_token(&mut config);
+        assert!(config.token.is_some());
+        // Idempotent: an existing token is kept.
+        let tok = config.token.clone();
+        ensure_token(&mut config);
+        assert_eq!(config.token, tok);
+    }
+
+    #[test]
+    fn test_ensure_token_loopback_or_disabled() {
+        // Loopback: no token needed.
+        let mut config = crate::config::Config::default();
+        config.http_port = Some(8080);
+        ensure_token(&mut config);
+        assert!(config.token.is_none());
+        // Web disabled: no token even for non-loopback host.
+        let mut config = crate::config::Config::default();
+        config.http_host = Some("0.0.0.0".to_string());
+        ensure_token(&mut config);
+        assert!(config.token.is_none());
+    }
+
+    #[test]
+    fn test_tls_cert_without_key_rejected() {
+        let cfg = WebConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            secure: true,
+            tls_cert: Some(std::path::PathBuf::from("/nonexistent/cert.pem")),
+            tls_key: None,
+            htpasswd: None,
+            token: None,
+            work_dir: std::path::PathBuf::from("."),
+        };
+        let sessions: Arc<Mutex<SessionManager<AnyPty>>> =
+            Arc::new(Mutex::new(SessionManager::new()));
+        assert!(start_web_server(cfg, sessions).is_err());
     }
 
     #[test]

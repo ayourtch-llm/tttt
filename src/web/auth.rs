@@ -33,14 +33,6 @@ impl Auth {
         }
     }
 
-    /// Token-only auth.
-    pub fn with_token(token: String) -> Self {
-        Self {
-            token: Some(token),
-            htpasswd: None,
-        }
-    }
-
     /// Load an htpasswd file.
     pub fn with_htpasswd(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
@@ -54,13 +46,25 @@ impl Auth {
         self.token.is_some() || self.htpasswd.is_some()
     }
 
-    /// True if the configured scheme is token-based (vs htpasswd basic auth).
-    pub fn has_token(&self) -> bool {
-        self.token.is_some()
+    /// Set (or replace) the access token. Composes with htpasswd: either
+    /// credential grants access.
+    pub fn set_token(&mut self, token: String) {
+        self.token = Some(token);
+    }
+
+    /// True if an htpasswd file is configured.
+    pub fn has_htpasswd(&self) -> bool {
+        self.htpasswd.is_some()
     }
 
     /// Validate a request using query params and/or HTTP headers.
+    /// When both a token and an htpasswd file are configured, either
+    /// credential grants access.
     pub fn check_request(&self, query: &HashMap<String, String>, headers: &HeaderMap) -> bool {
+        if !self.required() {
+            return true;
+        }
+
         if let Some(tok) = &self.token {
             // ?token=xxx
             if let Some(q) = query.get("token") {
@@ -78,7 +82,6 @@ impl Auth {
                     }
                 }
             }
-            return false;
         }
 
         if let Some(hp) = &self.htpasswd {
@@ -102,10 +105,9 @@ impl Auth {
                     }
                 }
             }
-            return false;
         }
 
-        true
+        false
     }
 }
 
@@ -360,7 +362,8 @@ mod tests {
 
     #[test]
     fn test_token_auth() {
-        let auth = Auth::with_token("sekrit".to_string());
+        let mut auth = Auth::none();
+        auth.set_token("sekrit".to_string());
         let mut q = HashMap::new();
         q.insert("token".to_string(), "sekrit".to_string());
         assert!(auth.check_request(&q, &HeaderMap::new()));
@@ -383,6 +386,38 @@ mod tests {
         let (u, p) = decode_basic(&b64).unwrap();
         assert_eq!(u, "user");
         assert_eq!(p, "pass");
+    }
+
+    #[test]
+    fn test_token_and_htpasswd_both_accepted() {
+        use base64::Engine;
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("htpasswd");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "user:plainsecret").unwrap();
+        drop(f);
+
+        let mut auth = Auth::with_htpasswd(&path).unwrap();
+        auth.set_token("sekrit".to_string());
+        assert!(auth.required());
+        assert!(auth.has_htpasswd());
+
+        // Token credential works.
+        let mut q = HashMap::new();
+        q.insert("token".to_string(), "sekrit".to_string());
+        assert!(auth.check_request(&q, &HeaderMap::new()));
+
+        // Basic credential works too (token check must fall through).
+        let mut q2 = HashMap::new();
+        q2.insert(
+            "auth".to_string(),
+            base64::engine::general_purpose::STANDARD.encode("user:plainsecret"),
+        );
+        assert!(auth.check_request(&q2, &HeaderMap::new()));
+
+        // Neither credential -> rejected.
+        assert!(!auth.check_request(&HashMap::new(), &HeaderMap::new()));
     }
 
     #[test]

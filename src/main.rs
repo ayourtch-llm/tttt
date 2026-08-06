@@ -285,6 +285,10 @@ fn run_tui(cli: Cli) {
     if cli.token.is_some() {
         config.token = cli.token.clone();
     }
+    // Generate the web access token (if one will be needed) into the config
+    // BEFORE App::new clones it, so the token survives SIGUSR1 live reload
+    // and open browser sessions keep working across reloads.
+    web::ensure_token(&mut config);
 
     let mut app = app::App::new(config.clone());
 

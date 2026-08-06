@@ -2846,10 +2846,29 @@ impl App {
                         protocol::ClientMsg::Detach => {
                             self.viewer_clients[i].send_goodbye();
                         }
-                        // Session create/kill is a web-UI feature; not used by
-                        // `tttt attach` clients, so ignore it here.
-                        protocol::ClientMsg::CreateSession { .. }
-                        | protocol::ClientMsg::KillSession { .. } => {}
+                        // Session create/kill is a web-UI feature; not
+                        // implemented for `tttt attach` clients. Still ack
+                        // with an error so a protocol client waiting on the
+                        // documented acknowledgement doesn't hang forever.
+                        protocol::ClientMsg::CreateSession { .. } => {
+                            self.viewer_clients[i].send_msg(&protocol::ServerMsg::SessionCreated {
+                                session_id: None,
+                                error: Some(
+                                    "session creation is not supported over the attach socket"
+                                        .to_string(),
+                                ),
+                            });
+                        }
+                        protocol::ClientMsg::KillSession { session_id } => {
+                            self.viewer_clients[i].send_msg(&protocol::ServerMsg::SessionKilled {
+                                session_id,
+                                success: false,
+                                error: Some(
+                                    "session kill is not supported over the attach socket"
+                                        .to_string(),
+                                ),
+                            });
+                        }
                     }
                 } else {
                     break;
