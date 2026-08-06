@@ -1,5 +1,9 @@
 //! Web-based viewer for tttt (`--http-host` / `--http-port` / `--secure`).
 //!
+//! **EXPERIMENTAL**: this feature is under active development. Use it only
+//! on trusted local networks or over a VPN — do not expose it to the open
+//! internet.
+//!
 //! Serves a browser UI (xterm.js) that talks to tttt over WebSocket using the
 //! same `tttt_tui::protocol` JSON messages as `tttt attach`, so a browser can
 //! watch and drive any session remotely.
@@ -77,7 +81,7 @@ pub fn ensure_token(config: &mut crate::config::Config) {
 }
 
 /// True if the host string refers to the loopback interface.
-fn is_loopback(host: &str) -> bool {
+pub fn is_loopback(host: &str) -> bool {
     match host {
         "localhost" | "127.0.0.1" | "::1" | "0:0:0:0:0:0:0:1" => return true,
         _ => {}

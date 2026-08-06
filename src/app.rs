@@ -2304,7 +2304,7 @@ impl App {
                     Line::from(format!("prefix: {}", p)),
                 ];
                 if let Some(url) = web_url.as_deref() {
-                    help_text.push(Line::from(format!("web: {}", url)));
+                    help_text.push(Line::from(format!("web (experimental): {}", url)));
                 }
                 help_text.extend(vec![
                     Line::from(""),

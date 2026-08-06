@@ -54,6 +54,10 @@
     #login-error { color: #f38ba8; font-size: 12px; margin-top: 10px; min-height: 16px; }
     #login-token { display: none; }
     #login-basic { display: none; }
+    .experimental { color: #fab387; font-size: 10px; text-transform: uppercase;
+                    letter-spacing: 1px; border: 1px solid #fab387; border-radius: 3px;
+                    padding: 1px 4px; margin-left: 4px; vertical-align: middle; }
+    #login-note { color: #6c7086; font-size: 11px; margin-top: 12px; }
   </style>
 </head>
 <body>
@@ -64,7 +68,7 @@
     </div>
     <div id="main">
       <div id="toolbar">
-        <span>tttt</span>
+        <span>tttt<span class="experimental" title="The web console is experimental — use it only on trusted local networks or over a VPN">experimental</span></span>
         <button id="new-session" title="Create a new terminal session">+ New session</button>
         <span class="spacer"></span>
         <span id="conn">connecting…</span>
@@ -75,7 +79,7 @@
 
   <div id="login-overlay" style="display:none">
     <div id="login-box">
-      <h2>tttt web viewer</h2>
+      <h2>tttt web viewer<span class="experimental">experimental</span></h2>
       <div id="login-token">
         <label for="token-input">Access token</label>
         <input id="token-input" type="password" autocomplete="off" placeholder="paste token">
@@ -88,6 +92,8 @@
       </div>
       <button id="login-btn">Connect</button>
       <div id="login-error"></div>
+      <div id="login-note">The web console is experimental. Use it only on trusted
+        local networks or over a VPN — do not expose it to the open internet.</div>
     </div>
   </div>
 

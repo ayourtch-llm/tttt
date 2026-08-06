@@ -46,6 +46,7 @@ pub struct Config {
     pub tui_tools: bool,
 
     /// Port for the web UI HTTP server. `None` disables the web server.
+    /// EXPERIMENTAL: use only on trusted local networks or over a VPN.
     #[serde(default)]
     pub http_port: Option<u16>,
 

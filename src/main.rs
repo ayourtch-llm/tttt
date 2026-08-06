@@ -38,16 +38,19 @@ struct Cli {
     #[arg(long)]
     tui_tools: bool,
 
-    /// Enable the web UI and bind it to this HTTP port (e.g. 8080)
+    /// EXPERIMENTAL: enable the web UI and bind it to this HTTP port
+    /// (e.g. 8080). The web console is experimental — use it only on
+    /// trusted local networks or over a VPN, never on the open internet.
     #[arg(long)]
     http_port: Option<u16>,
 
-    /// Host/address to bind the web UI HTTP server to (default: 127.0.0.1)
+    /// Host/address to bind the web UI HTTP server to (default: 127.0.0.1).
+    /// Keep non-loopback binds within trusted local networks or VPNs.
     #[arg(long)]
     http_host: Option<String>,
 
     /// Serve the web UI over HTTPS. Generates a self-signed cert unless
-    /// --tls-cert/--tls-key are supplied.
+    /// --tls-cert/--tls-key are supplied. (Web UI is experimental.)
     #[arg(long)]
     secure: bool,
 
@@ -220,7 +223,12 @@ fn start_web_from_config(app: &mut app::App, config: &config::Config) {
     let status: web::WebStatus = std::sync::Arc::new(std::sync::Mutex::new(None));
     match web::start_web_server(web_cfg, app.shared_sessions(), std::sync::Arc::clone(&status)) {
         Ok(url) => {
-            app.queue_startup_message(format!("Web UI: {}", url));
+            app.queue_startup_message(format!("Web UI (experimental): {}", url));
+            if !web::is_loopback(config.http_host.as_deref().unwrap_or("127.0.0.1")) {
+                app.queue_startup_message(
+                    "the web UI is experimental — keep it within trusted local networks or VPNs",
+                );
+            }
             app.set_web_info(Some(url), status);
         }
         Err(e) => {

@@ -88,6 +88,40 @@ All keybindings use a prefix key: **`Ctrl+\`** (like tmux's `Ctrl+b`).
 - **Virtual screen rendering** — Attach uses a virtual vt100 screen to absorb rapid updates, only rendering the final state
 - **Bracketed paste detection** — Prevents accidental detach during paste operations
 
+### Web Console (EXPERIMENTAL)
+
+> ⚠️ **The web console is experimental.** Use it only on trusted local
+> networks or over a VPN. Do **not** expose it to the open internet: the
+> feature is young, the auth is a single shared token or htpasswd file, and
+> whoever connects can type into your terminal sessions.
+
+An optional browser UI (xterm.js over WebSocket) for watching and driving
+sessions when SSH isn't handy:
+
+```bash
+# Loopback only (default; no auth required)
+tttt --http-port 8080 -e "claude"
+
+# LAN/VPN bind: an access token is auto-generated and printed in the URL,
+# and it survives SIGUSR1 live reloads
+tttt --http-port 8080 --http-host 0.0.0.0 -e "claude"
+
+# HTTPS with a self-signed certificate (or supply --tls-cert/--tls-key)
+tttt --http-port 8080 --http-host 0.0.0.0 --secure -e "claude"
+
+# Username/password auth (bcrypt, apr1, {SHA} and plaintext entries);
+# can be combined with --token
+tttt --http-port 8080 --http-host 0.0.0.0 --htpasswd users.htpasswd -e "claude"
+```
+
+- Watch and type into any session; create and close sessions from the sidebar
+- Follows the PTY size owned by the TUI (the browser never resizes your terminal)
+- The access URL is shown at the top of the root terminal on startup and in
+  the help overlay (`Ctrl+\` `?`)
+- Config keys (`http_port`, `http_host`, `secure`, `tls_cert`, `tls_key`,
+  `htpasswd`, `token`) and `TTTT_HTTP_PORT`/`TTTT_HTTP_HOST`/`TTTT_SECURE`
+  env vars mirror the CLI flags
+
 ## Architecture
 
 ```
@@ -134,6 +168,9 @@ cargo build
 
 # Attach from another terminal to watch
 ./target/debug/tttt attach
+
+# Or watch from a browser (EXPERIMENTAL — local networks/VPNs only)
+./target/debug/tttt -e "claude" --http-port 8080
 
 # Replay recorded sessions
 ./target/debug/tttt replay
@@ -214,7 +251,7 @@ cargo test -p tttt-pty    # PTY session management
 
 ## Status
 
-This project is under active development. The core infrastructure is solid and battle-tested through real autonomous coding sessions. Key areas for future work:
+This project is under active development. The core infrastructure is solid and battle-tested through real autonomous coding sessions. The web console is **experimental** — keep it on trusted local networks or VPNs. Key areas for future work:
 
 - **TextFSMPlus integration** — Automated permission approval via state machine templates
 - **Git worktree isolation** — Per-worker sandboxed repositories
