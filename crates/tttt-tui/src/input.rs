@@ -110,6 +110,8 @@ pub enum InputEvent {
     PrevTerminal,
     /// Show help overlay.
     ShowHelp,
+    /// Toggle the web (HTTP) server on/off.
+    ToggleWeb,
     /// Send the literal prefix key byte.
     PrefixEscape,
     /// Detach / quit.
@@ -386,6 +388,12 @@ impl InputParser {
                         }
                         events.push(InputEvent::ToggleStickyActive);
                     }
+                    b'w' | b'W' => {
+                        if !passthrough.is_empty() {
+                            events.push(InputEvent::PassThrough(std::mem::take(&mut passthrough)));
+                        }
+                        events.push(InputEvent::ToggleWeb);
+                    }
                     b if b == self.config.prefix_key => {
                         // Double prefix = send literal prefix key
                         passthrough.push(self.config.prefix_key);
@@ -505,6 +513,14 @@ mod tests {
         let mut p = parser();
         let events = p.process(&input(&[0x1c, b'd']));
         assert_eq!(events, vec![InputEvent::Detach]);
+    }
+
+    #[test]
+    fn test_prefix_then_w_toggle_web() {
+        let mut p = parser();
+        assert_eq!(p.process(&input(&[0x1c, b'w'])), vec![InputEvent::ToggleWeb]);
+        let mut p = parser();
+        assert_eq!(p.process(&input(&[0x1c, b'W'])), vec![InputEvent::ToggleWeb]);
     }
 
     #[test]

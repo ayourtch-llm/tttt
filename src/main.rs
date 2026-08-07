@@ -198,44 +198,6 @@ fn main() {
     }
 }
 
-/// Start the web UI server if configured. The access URL (or the failure)
-/// is queued as a startup message shown at the top of the root terminal.
-fn start_web_from_config(app: &mut app::App, config: &config::Config) {
-    let Some(port) = config.http_port else {
-        return;
-    };
-    let host = config
-        .http_host
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-
-    let web_cfg = web::WebConfig {
-        host,
-        port,
-        secure: config.secure,
-        tls_cert: config.tls_cert.clone(),
-        tls_key: config.tls_key.clone(),
-        htpasswd: config.htpasswd.clone(),
-        token: config.token.clone(),
-        work_dir: config.work_dir.clone(),
-    };
-
-    let status: web::WebStatus = std::sync::Arc::new(std::sync::Mutex::new(None));
-    match web::start_web_server(web_cfg, app.shared_sessions(), std::sync::Arc::clone(&status)) {
-        Ok(url) => {
-            app.queue_startup_message(format!("Web UI (experimental): {}", url));
-            if !web::is_loopback(config.http_host.as_deref().unwrap_or("127.0.0.1")) {
-                app.queue_startup_message(
-                    "the web UI is experimental — keep it within trusted local networks or VPNs",
-                );
-            }
-            app.set_web_info(Some(url), status);
-        }
-        Err(e) => {
-            app.queue_startup_message(format!("failed to start web server: {}", e));
-        }
-    }
-}
 
 fn run_tui(cli: Cli) {
     let mut config = match cli.config {
@@ -318,7 +280,7 @@ fn run_tui(cli: Cli) {
     }
 
     // Start web UI server (if configured)
-    start_web_from_config(&mut app, &config);
+    app.start_web_from_config();
 
     if let Err(e) = app.launch_root() {
         eprintln!("Failed to launch root session: {}", e);
@@ -420,7 +382,7 @@ fn run_restored(restore_file: &str) {
     }
 
     // Restart the web UI server (config preserved in saved state)
-    start_web_from_config(&mut app, &config);
+    app.start_web_from_config();
 
     // For SIGUSR2: kill the old root child and respawn a fresh one in the same
     // session slot. This preserves the session ID, position, and sidebar order.

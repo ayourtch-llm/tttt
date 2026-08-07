@@ -105,6 +105,7 @@ enum InputAction {
     NextSession,
     PrevSession,
     ShowHelp,
+    ToggleWeb,
     CreateSession,
     Reload,
     Detach,
@@ -134,6 +135,7 @@ fn decide_input_action(event: tttt_tui::InputEvent) -> InputAction {
         tttt_tui::InputEvent::NextTerminal        => InputAction::NextSession,
         tttt_tui::InputEvent::PrevTerminal        => InputAction::PrevSession,
         tttt_tui::InputEvent::ShowHelp            => InputAction::ShowHelp,
+        tttt_tui::InputEvent::ToggleWeb           => InputAction::ToggleWeb,
         tttt_tui::InputEvent::CreateTerminal      => InputAction::CreateSession,
         tttt_tui::InputEvent::Reload              => InputAction::Reload,
         tttt_tui::InputEvent::Detach              => InputAction::Detach,
@@ -707,6 +709,86 @@ pub struct App {
     web_status: Option<crate::web::WebStatus>,
     /// URL of the web UI, when enabled (shown in the help overlay).
     web_url: Option<String>,
+    /// Running web server handle (Some when the server is up), used by the
+    /// hotkey toggle to stop it.
+    web_handle: Option<crate::web::WebHandle>,
+    /// Active web-enable dialog state (Some while the modal is open).
+    web_dialog: Option<WebDialog>,
+}
+
+/// State for the modal shown when enabling the web server via the hotkey.
+#[derive(Clone)]
+struct WebDialog {
+    host: String,
+    port: String,
+    htpasswd: String,
+    /// Focused field: 0 = host, 1 = port, 2 = htpasswd.
+    focus: usize,
+    error: Option<String>,
+}
+
+impl WebDialog {
+    const FIELDS: usize = 3;
+
+    fn field_mut(&mut self) -> &mut String {
+        match self.focus {
+            0 => &mut self.host,
+            1 => &mut self.port,
+            _ => &mut self.htpasswd,
+        }
+    }
+
+    fn next_field(&mut self) {
+        self.focus = (self.focus + 1) % Self::FIELDS;
+    }
+
+    fn prev_field(&mut self) {
+        self.focus = (self.focus + Self::FIELDS - 1) % Self::FIELDS;
+    }
+}
+
+/// A parsed key from the web dialog's raw input.
+enum DialogKey {
+    Char(char),
+    Backspace,
+    Enter,
+    Tab,
+    BackTab,
+    Cancel,
+}
+
+/// Parse raw terminal bytes into dialog keys (handles arrows, tab, esc).
+fn parse_dialog_keys(buf: &[u8]) -> Vec<DialogKey> {
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i < buf.len() {
+        let b = buf[i];
+        match b {
+            0x1b => {
+                // Escape sequence: arrows (\x1b[A/B), shift-tab (\x1b[Z),
+                // or a lone Esc = cancel.
+                if i + 2 < buf.len() && buf[i + 1] == b'[' {
+                    match buf[i + 2] {
+                        b'A' => keys.push(DialogKey::BackTab), // Up
+                        b'B' => keys.push(DialogKey::Tab),     // Down
+                        b'Z' => keys.push(DialogKey::BackTab), // Shift-Tab
+                        _ => {}
+                    }
+                    i += 3;
+                    continue;
+                }
+                keys.push(DialogKey::Cancel);
+            }
+            0x09 => keys.push(DialogKey::Tab),
+            b'\r' | b'\n' => keys.push(DialogKey::Enter),
+            0x7f | 0x08 => keys.push(DialogKey::Backspace),
+            0x03 => keys.push(DialogKey::Cancel), // Ctrl-C
+            0x20..=0x7e => keys.push(DialogKey::Char(b as char)),
+            _ => {}
+        }
+        i += 1;
+    }
+    keys
 }
 
 impl App {
@@ -772,6 +854,8 @@ impl App {
             startup_messages: Vec::new(),
             web_status: None,
             web_url: None,
+            web_handle: None,
+            web_dialog: None,
             config,
         }
     }
@@ -784,10 +868,96 @@ impl App {
         self.startup_messages.push(msg.into());
     }
 
-    /// Record the web UI url and the status cell its thread reports into.
-    pub fn set_web_info(&mut self, url: Option<String>, status: crate::web::WebStatus) {
-        self.web_url = url;
-        self.web_status = Some(status);
+    /// True if the web server is currently running.
+    pub fn web_running(&self) -> bool {
+        self.web_handle.is_some()
+    }
+
+    /// Build a `WebConfig` from the current config, overriding host/port/
+    /// htpasswd with the given values (used by the hotkey dialog).
+    fn build_web_config(
+        &self,
+        host: Option<String>,
+        port: u16,
+        htpasswd: Option<std::path::PathBuf>,
+    ) -> crate::web::WebConfig {
+        crate::web::WebConfig {
+            host: host.unwrap_or_else(|| "127.0.0.1".to_string()),
+            port,
+            secure: self.config.secure,
+            tls_cert: self.config.tls_cert.clone(),
+            tls_key: self.config.tls_key.clone(),
+            htpasswd,
+            token: self.config.token.clone(),
+            work_dir: self.config.work_dir.clone(),
+        }
+    }
+
+    /// Start the web server with the given config. Records the handle, url,
+    /// and status cell, and updates `self.config` so the setting survives a
+    /// live reload. Returns an error string on failure (already queued as a
+    /// startup message by the caller if desired).
+    fn start_web(&mut self, web_cfg: crate::web::WebConfig) -> Result<String, String> {
+        if self.web_handle.is_some() {
+            return Err("web server already running".to_string());
+        }
+        // Persist into config so a SIGUSR1 reload restarts with these values.
+        self.config.http_port = Some(web_cfg.port);
+        self.config.http_host = Some(web_cfg.host.clone());
+        self.config.htpasswd = web_cfg.htpasswd.clone();
+        crate::web::ensure_token(&mut self.config);
+        let web_cfg = crate::web::WebConfig {
+            token: self.config.token.clone(),
+            ..web_cfg
+        };
+
+        let status: crate::web::WebStatus = Arc::new(Mutex::new(None));
+        match crate::web::start_web_server(web_cfg, self.sessions.clone(), Arc::clone(&status)) {
+            Ok(handle) => {
+                let url = handle.url.clone();
+                self.web_url = Some(url.clone());
+                self.web_status = Some(status);
+                self.web_handle = Some(handle);
+                Ok(url)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Start the web server at startup from the loaded config, queueing the
+    /// URL (or failure) as a startup message. Called once during launch.
+    pub fn start_web_from_config(&mut self) {
+        let Some(port) = self.config.http_port else {
+            return;
+        };
+        let host = self.config.http_host.clone();
+        let htpasswd = self.config.htpasswd.clone();
+        let is_loopback = crate::web::is_loopback(host.as_deref().unwrap_or("127.0.0.1"));
+        let web_cfg = self.build_web_config(host, port, htpasswd);
+        match self.start_web(web_cfg) {
+            Ok(url) => {
+                self.queue_startup_message(format!("Web UI (experimental): {}", url));
+                if !is_loopback {
+                    self.queue_startup_message(
+                        "the web UI is experimental — keep it within trusted local networks or VPNs",
+                    );
+                }
+            }
+            Err(e) => {
+                self.queue_startup_message(format!("failed to start web server: {}", e));
+            }
+        }
+    }
+
+    /// Stop the running web server, if any. Clears `http_port` from the
+    /// config so the disabled state persists across a SIGUSR1 live reload.
+    fn stop_web(&mut self) {
+        if let Some(handle) = self.web_handle.take() {
+            handle.shutdown();
+        }
+        self.config.http_port = None;
+        self.web_url = None;
+        self.web_status = None;
     }
 
     /// Inject queued startup messages into the root terminal's screen so
@@ -1802,6 +1972,7 @@ impl App {
             InputAction::NextSession => self.switch_relative(1)?,
             InputAction::PrevSession => self.switch_relative(-1)?,
             InputAction::ShowHelp => self.show_help()?,
+            InputAction::ToggleWeb => self.toggle_web()?,
             InputAction::PrefixEscape => {
                 if let Some(id) = self.active_session.clone() {
                     let prefix = vec![self.config.prefix_key];
@@ -2068,6 +2239,115 @@ impl App {
         Ok(())
     }
 
+    /// Hotkey handler: toggle the web server. If running, stop it. Otherwise
+    /// open a modal to enter host/port/htpasswd, then start it.
+    fn toggle_web(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.web_running() {
+            self.stop_web();
+            self.inject_root_text(&["Web UI stopped".to_string()]);
+            self.render_frame()?;
+            return Ok(());
+        }
+
+        let mut dialog = WebDialog {
+            host: self
+                .config
+                .http_host
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
+            port: self
+                .config
+                .http_port
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "8080".to_string()),
+            htpasswd: self
+                .config
+                .htpasswd
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            focus: 0,
+            error: None,
+        };
+
+        let stdin_fd = std::io::stdin().as_raw_fd();
+        loop {
+            self.web_dialog = Some(dialog.clone());
+            self.render_frame()?;
+
+            let mut buf = [0u8; 64];
+            let n = match nix::unistd::read(stdin_fd, &mut buf) {
+                Ok(n) if n > 0 => n,
+                _ => continue,
+            };
+
+            let mut submit = false;
+            let mut cancel = false;
+            for key in parse_dialog_keys(&buf[..n]) {
+                match key {
+                    DialogKey::Cancel => cancel = true,
+                    DialogKey::Enter => submit = true,
+                    DialogKey::Tab => dialog.next_field(),
+                    DialogKey::BackTab => dialog.prev_field(),
+                    DialogKey::Backspace => {
+                        dialog.field_mut().pop();
+                    }
+                    DialogKey::Char(c) => dialog.field_mut().push(c),
+                }
+            }
+
+            if cancel {
+                self.web_dialog = None;
+                self.render_frame()?;
+                return Ok(());
+            }
+            if !submit {
+                continue;
+            }
+
+            // Validate and start.
+            let port = match dialog.port.trim().parse::<u16>() {
+                Ok(p) if p > 0 => p,
+                _ => {
+                    dialog.error = Some("port must be 1-65535".to_string());
+                    continue;
+                }
+            };
+            let host = dialog.host.trim();
+            if host.is_empty() {
+                dialog.error = Some("host must not be empty".to_string());
+                continue;
+            }
+            let htpasswd = {
+                let h = dialog.htpasswd.trim();
+                if h.is_empty() {
+                    None
+                } else {
+                    let path = std::path::PathBuf::from(h);
+                    if !path.is_file() {
+                        dialog.error = Some(format!("htpasswd file not found: {}", h));
+                        continue;
+                    }
+                    Some(path)
+                }
+            };
+
+            let web_cfg = self.build_web_config(Some(host.to_string()), port, htpasswd);
+            self.web_dialog = None;
+            match self.start_web(web_cfg) {
+                Ok(url) => {
+                    self.inject_root_text(&[format!("Web UI (experimental): {}", url)]);
+                    self.render_frame()?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Re-open the dialog with the error shown.
+                    dialog.error = Some(e);
+                }
+            }
+        }
+    }
+
     /// Render the full frame using ratatui widgets.
     /// Returns true if a frame was actually rendered, false if rendering was
     /// suppressed (e.g., due to synchronized output mode being active).
@@ -2172,6 +2452,7 @@ impl App {
         };
         let showing_help = self.showing_help;
         let web_url = self.web_url.clone();
+        let web_dialog = self.web_dialog.clone();
         let prefix_name_str = prefix_key_name(self.config.prefix_key);
         let prefix_name = if showing_help {
             Some(prefix_name_str.clone())
@@ -2317,6 +2598,7 @@ impl App {
                     Line::from("  l    Force redraw (recover)"),
                     Line::from("  i    Dump diagnostics to /tmp"),
                     Line::from("  .    Toggle sticky on current pane"),
+                    Line::from("  w    Enable/disable web server (experimental)"),
                     Line::from("  ?    This help"),
                     Line::from(format!("  {p}{p}  Send literal prefix")),
                     Line::from(""),
@@ -2327,6 +2609,65 @@ impl App {
                     .block(Block::bordered().title(" Help "))
                     .style(Style::default().fg(Color::White).bg(Color::Black));
                 frame.render_widget(help_widget, popup_area);
+            }
+
+            // Web-enable dialog popup
+            if let Some(dialog) = web_dialog.as_ref() {
+                let popup_area = help_popup_area(frame.area());
+                frame.render_widget(Clear, popup_area);
+
+                let field_line = |label: &str, value: &str, idx: usize| -> Line {
+                    let focused = dialog.focus == idx;
+                    let marker = if focused { "> " } else { "  " };
+                    let val_style = if focused {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let shown = if value.is_empty() && !focused {
+                        "(none)".to_string()
+                    } else if focused {
+                        format!("{}_", value)
+                    } else {
+                        value.to_string()
+                    };
+                    Line::from(vec![
+                        Span::styled(format!("{}{:<10}", marker, label), Style::default().fg(Color::Gray)),
+                        Span::styled(shown, val_style),
+                    ])
+                };
+
+                let mut lines = vec![
+                    Line::from(vec![Span::styled(
+                        "Enable web server (experimental)",
+                        Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow),
+                    )]),
+                    Line::from(""),
+                    field_line("Host:", &dialog.host, 0),
+                    field_line("Port:", &dialog.port, 1),
+                    field_line("htpasswd:", &dialog.htpasswd, 2),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "htpasswd empty = no basic auth (token used for non-loopback)",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ];
+                if let Some(err) = dialog.error.as_ref() {
+                    lines.push(Line::from(Span::styled(
+                        format!("! {}", err),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Tab/↑↓ move · Enter start · Esc cancel",
+                    Style::default().fg(Color::DarkGray),
+                )));
+
+                let widget = Paragraph::new(lines)
+                    .block(Block::bordered().title(" Web server "))
+                    .style(Style::default().fg(Color::White).bg(Color::Black));
+                frame.render_widget(widget, popup_area);
             }
         })?;
 
@@ -3239,6 +3580,50 @@ fn copy_to_clipboard_osc52(text: &str) -> ClipboardResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_dialog_keys() {
+        // Plain text becomes chars.
+        let keys = parse_dialog_keys(b"ab");
+        assert!(matches!(keys[0], DialogKey::Char('a')));
+        assert!(matches!(keys[1], DialogKey::Char('b')));
+        // Control bytes.
+        assert!(matches!(parse_dialog_keys(b"\t")[0], DialogKey::Tab));
+        assert!(matches!(parse_dialog_keys(b"\r")[0], DialogKey::Enter));
+        assert!(matches!(parse_dialog_keys(b"\n")[0], DialogKey::Enter));
+        assert!(matches!(parse_dialog_keys(&[0x7f])[0], DialogKey::Backspace));
+        assert!(matches!(parse_dialog_keys(&[0x03])[0], DialogKey::Cancel));
+        // Lone escape = cancel.
+        assert!(matches!(parse_dialog_keys(&[0x1b])[0], DialogKey::Cancel));
+        // Arrow keys: up = BackTab, down = Tab, shift-tab = BackTab.
+        assert!(matches!(parse_dialog_keys(b"\x1b[A")[0], DialogKey::BackTab));
+        assert!(matches!(parse_dialog_keys(b"\x1b[B")[0], DialogKey::Tab));
+        assert!(matches!(parse_dialog_keys(b"\x1b[Z")[0], DialogKey::BackTab));
+        // Escape sequence does not leak its trailing bytes as chars.
+        assert_eq!(parse_dialog_keys(b"\x1b[A").len(), 1);
+    }
+
+    #[test]
+    fn test_web_dialog_field_navigation() {
+        let mut d = WebDialog {
+            host: "127.0.0.1".to_string(),
+            port: "8080".to_string(),
+            htpasswd: String::new(),
+            focus: 0,
+            error: None,
+        };
+        d.field_mut().push('x'); // edits host
+        assert_eq!(d.host, "127.0.0.1x");
+        d.next_field();
+        assert_eq!(d.focus, 1);
+        d.field_mut().pop(); // edits port
+        assert_eq!(d.port, "808");
+        d.next_field();
+        d.next_field(); // wraps 2 -> 0
+        assert_eq!(d.focus, 0);
+        d.prev_field(); // wraps 0 -> 2
+        assert_eq!(d.focus, 2);
+    }
 
     #[test]
     fn test_format_startup_lines() {

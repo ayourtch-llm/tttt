@@ -79,6 +79,7 @@ All keybindings use a prefix key: **`Ctrl+\`** (like tmux's `Ctrl+b`).
 | `Ctrl+\` then `p` | Previous terminal |
 | `Ctrl+\` then `c` | Create new terminal session |
 | `Ctrl+\` then `r` | Live reload (SIGUSR1 equivalent) |
+| `Ctrl+\` then `w` | Enable/disable the web server (opens a host/port/htpasswd dialog) |
 | `Ctrl+\` then `d` | Detach / quit |
 | `Ctrl+\` then `?` | Show help |
 | `Ctrl+\` then `Ctrl+\` | Send literal `Ctrl+\` to the terminal |
@@ -114,6 +115,8 @@ tttt --http-port 8080 --http-host 0.0.0.0 --secure -e "claude"
 tttt --http-port 8080 --http-host 0.0.0.0 --htpasswd users.htpasswd -e "claude"
 ```
 
+- Toggle it at runtime with `Ctrl+\` `w` — a dialog prompts for host, port,
+  and an optional htpasswd file (prepopulated from any CLI/config values)
 - Watch and type into any session; create and close sessions from the sidebar
 - Follows the PTY size owned by the TUI (the browser never resizes your terminal)
 - The access URL is shown at the top of the root terminal on startup and in

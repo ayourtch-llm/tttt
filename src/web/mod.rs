@@ -169,14 +169,31 @@ type WsSender = tokio::sync::Mutex<futures_util::stream::SplitSink<WebSocket, Me
 /// the App drains it into the root terminal.
 pub type WebStatus = Arc<Mutex<Option<String>>>;
 
-/// Start the web server in a background thread. Returns the URL to open.
-/// Configuration problems (bad host, TLS misconfiguration) are validated
-/// here, synchronously; later runtime errors are posted to `status`.
+/// Handle to a running web server, used to stop it at runtime (hotkey
+/// toggle). Dropping it does not stop the server — call `shutdown()`.
+pub struct WebHandle {
+    handle: axum_server::Handle,
+    /// The URL the server was started on.
+    pub url: String,
+}
+
+impl WebHandle {
+    /// Gracefully stop the server; its background thread then winds down.
+    pub fn shutdown(&self) {
+        self.handle
+            .graceful_shutdown(Some(std::time::Duration::from_millis(200)));
+    }
+}
+
+/// Start the web server in a background thread. Returns a handle carrying
+/// the URL to open and a way to stop it. Configuration problems (bad host,
+/// TLS misconfiguration) are validated here, synchronously; later runtime
+/// errors are posted to `status`.
 pub fn start_web_server(
     cfg: WebConfig,
     sessions: Arc<Mutex<SessionManager<AnyPty>>>,
     status: WebStatus,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<WebHandle, Box<dyn std::error::Error>> {
     if cfg.tls_cert.is_some() != cfg.tls_key.is_some() {
         return Err("--tls-cert and --tls-key must be supplied together".into());
     }
@@ -222,6 +239,8 @@ pub fn start_web_server(
         watched: Arc::new(Mutex::new(HashMap::new())),
     };
 
+    let server_handle = axum_server::Handle::new();
+    let thread_handle = server_handle.clone();
     std::thread::Builder::new()
         .name("tttt-web".to_string())
         .spawn(move || {
@@ -230,10 +249,13 @@ pub fn start_web_server(
                 .worker_threads(2)
                 .build()
                 .expect("failed to build web runtime");
-            rt.block_on(serve(addr, tls_config, state, snapshot_tx, status));
+            rt.block_on(serve(addr, tls_config, state, snapshot_tx, status, thread_handle));
         })?;
 
-    Ok(url)
+    Ok(WebHandle {
+        handle: server_handle,
+        url,
+    })
 }
 
 async fn serve(
@@ -242,6 +264,7 @@ async fn serve(
     state: WebState,
     snapshot_tx: tokio::sync::watch::Sender<Arc<Snapshot>>,
     status: WebStatus,
+    handle: axum_server::Handle,
 ) {
     tokio::spawn(publisher(
         Arc::clone(&state.sessions),
@@ -261,10 +284,16 @@ async fn serve(
         Some(sc) => {
             let tls = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(sc));
             axum_server::bind_rustls(addr, tls)
+                .handle(handle)
                 .serve(app.into_make_service())
                 .await
         }
-        None => axum_server::bind(addr).serve(app.into_make_service()).await,
+        None => {
+            axum_server::bind(addr)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await
+        }
     };
 
     // Runtime failures (e.g. port already in use) are drained by the App
@@ -1044,7 +1073,7 @@ mod tests {
         let sessions: Arc<Mutex<SessionManager<AnyPty>>> =
             Arc::new(Mutex::new(SessionManager::new()));
         let status: WebStatus = Arc::new(Mutex::new(None));
-        assert!(start_web_server(cfg, sessions, status).is_err());
+        assert!(start_web_server(cfg, sessions, status).map(|_| ()).is_err());
     }
 
     #[test]
