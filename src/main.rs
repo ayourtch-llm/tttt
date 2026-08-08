@@ -70,6 +70,13 @@ struct Cli {
     #[arg(long)]
     token: Option<String>,
 
+    /// On startup, once the root agent is ready, inject an instruction to
+    /// read this file and follow it (e.g. handoff.md — the same file the
+    /// context-refresh tool uses). Write the file idempotently: it may be
+    /// injected again after every restart.
+    #[arg(long)]
+    inject_file: Option<PathBuf>,
+
     /// Arguments to pass to the root command (after --)
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     root_args: Vec<String>,
@@ -258,6 +265,9 @@ fn run_tui(cli: Cli) {
     if cli.token.is_some() {
         config.token = cli.token.clone();
     }
+    if cli.inject_file.is_some() {
+        config.inject_file = cli.inject_file.clone();
+    }
     // Generate the web access token (if one will be needed) into the config
     // BEFORE App::new clones it, so the token survives SIGUSR1 live reload
     // and open browser sessions keep working across reloads.
@@ -282,10 +292,16 @@ fn run_tui(cli: Cli) {
     // Start web UI server (if configured)
     app.start_web_from_config();
 
-    if let Err(e) = app.launch_root() {
-        eprintln!("Failed to launch root session: {}", e);
-        std::process::exit(1);
-    }
+    let root_id = match app.launch_root() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Failed to launch root session: {}", e);
+            std::process::exit(1);
+        }
+    };
+    // Fresh start only (reloads keep the session alive): once the root agent
+    // is ready, inject the startup instruction file if one is configured.
+    app.setup_startup_inject(&root_id);
     // Show queued startup info (web URL, warnings) at the top of the root
     // terminal — stderr is invisible under the alternate screen.
     app.flush_startup_messages();

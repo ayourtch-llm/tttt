@@ -1295,6 +1295,35 @@ impl App {
         }
     }
 
+    /// Set up a one-shot watcher that injects "read <inject_file> and follow it"
+    /// once the root agent is ready (same readiness match as auto-continue).
+    /// Deliberately stateless: the same file is injected on every fresh start,
+    /// so the file's own text must be written to be safe to re-run.
+    pub fn setup_startup_inject(&mut self, root_session_id: &str) {
+        let Some(path) = self.config.inject_file.clone() else { return };
+        if !path.exists() {
+            self.queue_startup_message(format!(
+                "Warning: --inject-file {} not found, skipping startup injection",
+                path.display()
+            ));
+            return;
+        }
+        let instruction = format!(
+            "STARTUP: Please read {} and follow the instructions in it.\n",
+            path.display()
+        );
+        let mut notif = self.notifications.lock().unwrap();
+        if let Err(e) = notif.add_watcher(
+            root_session_id.to_string(),
+            r"\? for shortcuts",
+            instruction,
+            root_session_id.to_string(),
+            true, // one-shot
+        ) {
+            eprintln!("Warning: failed to set up startup inject watcher: {}", e);
+        }
+    }
+
     /// Queue a text injection into a session. Will be drained by the event loop.
     pub fn queue_injection(&mut self, session_id: &str, text: &str) {
         if self.pending_injection_queue.len() >= Self::MAX_PENDING_INJECTIONS {

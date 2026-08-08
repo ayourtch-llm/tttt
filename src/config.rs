@@ -73,6 +73,12 @@ pub struct Config {
     /// Access token for the web UI (auto-generated when binding non-loopback).
     #[serde(default)]
     pub token: Option<String>,
+
+    /// File whose instructions are injected into the root agent once it is
+    /// ready after a fresh start (e.g. a handoff.md). The agent is asked to
+    /// read the file; staleness handling belongs in the file's own text.
+    #[serde(default)]
+    pub inject_file: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -100,6 +106,7 @@ impl Default for Config {
             tls_key: None,
             htpasswd: None,
             token: None,
+            inject_file: None,
         }
     }
 }
