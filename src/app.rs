@@ -1312,10 +1312,12 @@ impl App {
             "STARTUP: Please read {} and follow the instructions in it.\n",
             path.display()
         );
+        // "? for shortcuts" is replaced by the bypass-permissions warning when
+        // claude runs with --dangerously-skip-permissions, so accept either.
         let mut notif = self.notifications.lock().unwrap();
         if let Err(e) = notif.add_watcher(
             root_session_id.to_string(),
-            r"\? for shortcuts",
+            r"\? for shortcuts|bypass permissions on",
             instruction,
             root_session_id.to_string(),
             true, // one-shot
