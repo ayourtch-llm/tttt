@@ -369,9 +369,11 @@ fn run_restored(restore_file: &str) {
 
     // Check if root session should be restarted:
     // - Explicitly requested via SIGUSR2 (restart_root flag in saved state)
-    // - Only if root command has --resume so it can recover its conversation
+    // - Only if the fresh agent can recover its context: either the root
+    //   command has --resume, or an inject-file will point it at a handoff.
     let restart_root = state.restart_root
-        && config.root_args.iter().any(|a| a == "--resume");
+        && (config.root_args.iter().any(|a| a == "--resume")
+            || config.inject_file.is_some());
 
     let mut app = app::App::new(config.clone());
 
@@ -408,7 +410,13 @@ fn run_restored(restore_file: &str) {
                 eprintln!("Failed to respawn root session: {}", e);
                 std::process::exit(1);
             }
-            app.setup_auto_continue(root_id);
+            // Prefer the inject-file handoff when configured; the generic
+            // "continue" nudge only makes sense for a --resume'd conversation.
+            if config.inject_file.is_some() {
+                app.setup_startup_inject(root_id);
+            } else {
+                app.setup_auto_continue(root_id);
+            }
         }
     }
 
