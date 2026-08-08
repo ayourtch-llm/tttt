@@ -399,24 +399,27 @@ fn cmd_send(conn: &mut McpConnection, session: &str, text: Option<String>, enter
         process::exit(1);
     });
 
-    let key_str: String;
-    let keys_to_send: &str;
+    let mut keys_to_send: String;
 
-    if enter {
-        keys_to_send = "[ENTER]";
-    } else if let Some(k) = &keys {
-        keys_to_send = k.as_str();
+    if let Some(k) = &keys {
+        keys_to_send = k.clone();
     } else if let Some(f) = file {
-        key_str = std::fs::read_to_string(&f).unwrap_or_else(|e| {
+        keys_to_send = std::fs::read_to_string(&f).unwrap_or_else(|e| {
             eprintln!("ERROR: Cannot read {}: {e}", f.display());
             process::exit(1);
         });
-        keys_to_send = &key_str;
     } else if let Some(t) = &text {
-        keys_to_send = t.as_str();
+        keys_to_send = t.clone();
+    } else if enter {
+        keys_to_send = String::new();
     } else {
         eprintln!("ERROR: send requires text, --enter, --keys, or --file");
         process::exit(1);
+    }
+    // --enter APPENDS Enter after whatever else is sent (a bare --enter with
+    // no text sends just the keypress).
+    if enter {
+        keys_to_send.push_str("[ENTER]");
     }
 
     let args = json!({"session_id": sid, "keys": keys_to_send});
