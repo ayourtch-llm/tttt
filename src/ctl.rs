@@ -417,9 +417,11 @@ fn cmd_send(conn: &mut McpConnection, session: &str, text: Option<String>, enter
         eprintln!("ERROR: send requires text, --enter, --keys, or --file");
         process::exit(1);
     }
-    // --enter APPENDS Enter after whatever else is sent (a bare --enter with
-    // no text sends just the keypress).
-    if enter {
+    // --enter submits AFTER whatever else is sent, as a separate delayed
+    // keypress: TUIs with paste detection (e.g. claude) treat an Enter in
+    // the same input burst as a pasted newline, not a submit.
+    let send_enter_separately = enter && !keys_to_send.is_empty();
+    if enter && keys_to_send.is_empty() {
         keys_to_send.push_str("[ENTER]");
     }
 
@@ -435,6 +437,22 @@ fn cmd_send(conn: &mut McpConnection, session: &str, text: Option<String>, enter
     {
         eprintln!("ERROR: {}", extract_text(&resp));
         process::exit(1);
+    }
+
+    if send_enter_separately {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let resp = conn
+            .call_tool("tttt_pty_send_keys", json!({"session_id": sid, "keys": "[ENTER]"}))
+            .unwrap_or_else(|e| {
+                eprintln!("ERROR: {e}");
+                process::exit(1);
+            });
+        if resp.get("error").is_some()
+            || resp["result"]["isError"].as_bool().unwrap_or(false)
+        {
+            eprintln!("ERROR: {}", extract_text(&resp));
+            process::exit(1);
+        }
     }
 }
 
