@@ -266,11 +266,12 @@ pub fn find_mcp_socket() -> Result<PathBuf> {
 
 // ── Parse session ID ──────────────────────────────────────────────────────────
 
-/// Parse "pty-N" or "N" into a u32. Returns error on invalid input.
-pub fn parse_session_id(s: &str) -> Result<u32> {
+/// Normalize "pty-N" or "N" into the canonical "pty-N" session id string.
+/// The MCP handlers take session_id as a string, never a number.
+pub fn parse_session_id(s: &str) -> Result<String> {
     let id = s.strip_prefix("pty-").unwrap_or(s);
     if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
-        id.parse::<u32>().map_err(|e| CtlError::Other(e.to_string()))
+        Ok(format!("pty-{id}"))
     } else {
         Err(CtlError::InvalidSessionId(s.to_string()))
     }
@@ -423,10 +424,18 @@ fn cmd_send(conn: &mut McpConnection, session: &str, text: Option<String>, enter
     }
 
     let args = json!({"session_id": sid, "keys": keys_to_send});
-    conn.call_tool("tttt_pty_send_keys", args).unwrap_or_else(|e| {
+    let resp = conn.call_tool("tttt_pty_send_keys", args).unwrap_or_else(|e| {
         eprintln!("ERROR: {e}");
         process::exit(1);
     });
+    // Surface tool-level failures (e.g. bad session id): a swallowed error
+    // here means callers think keys were delivered when they were not.
+    if resp.get("error").is_some()
+        || resp["result"]["isError"].as_bool().unwrap_or(false)
+    {
+        eprintln!("ERROR: {}", extract_text(&resp));
+        process::exit(1);
+    }
 }
 
 fn cmd_screen(conn: &mut McpConnection, session: &str) {
@@ -811,16 +820,16 @@ mod tests {
 
     #[test]
     fn test_parse_session_id_pty_prefix() {
-        assert_eq!(parse_session_id("pty-1").unwrap(), 1);
-        assert_eq!(parse_session_id("pty-0").unwrap(), 0);
-        assert_eq!(parse_session_id("pty-42").unwrap(), 42);
+        assert_eq!(parse_session_id("pty-1").unwrap(), "pty-1");
+        assert_eq!(parse_session_id("pty-0").unwrap(), "pty-0");
+        assert_eq!(parse_session_id("pty-42").unwrap(), "pty-42");
     }
 
     #[test]
     fn test_parse_session_id_bare_number() {
-        assert_eq!(parse_session_id("5").unwrap(), 5);
-        assert_eq!(parse_session_id("0").unwrap(), 0);
-        assert_eq!(parse_session_id("999").unwrap(), 999);
+        assert_eq!(parse_session_id("5").unwrap(), "pty-5");
+        assert_eq!(parse_session_id("0").unwrap(), "pty-0");
+        assert_eq!(parse_session_id("999").unwrap(), "pty-999");
     }
 
     #[test]
