@@ -1157,8 +1157,40 @@ impl App {
     /// Start the MCP proxy socket listener.
     /// Returns the socket path that `tttt mcp-server --connect` should use.
     pub fn start_mcp_listener(&mut self) -> Result<String, Box<dyn std::error::Error>> {
-        let path = format!("/tmp/tttt-mcp-{}.sock", std::process::id());
-        let _ = std::fs::remove_file(&path);
+        // Honor TTTT_MCP_SOCKET so a second concurrent tttt instance can pin a
+        // DISTINCT socket path (its ctl/mcp-absorb read the same env var to target
+        // this instance — ctl.rs already prefers TTTT_MCP_SOCKET). Falls back to the
+        // PID-based default when unset. Use a path that does NOT start with
+        // "tttt-mcp-" for the pinned instance so it stays out of the other
+        // instance's /tmp/tttt-mcp-*.sock auto-detect glob (e.g. /tmp/tttt-helper.sock).
+        let pinned = std::env::var("TTTT_MCP_SOCKET").ok();
+        let path = pinned
+            .clone()
+            .unwrap_or_else(|| format!("/tmp/tttt-mcp-{}.sock", std::process::id()));
+        // A leftover socket file may be (a) LIVE — owned by another running tttt —
+        // or (b) STALE from a crash. Probe by connecting: a successful connect means
+        // a live owner, so refuse rather than clobber it (early exit). A failed
+        // connect means it's dead, so remove and rebind (auto-recover). The
+        // PID-based default path is unique per process, so a leftover there is
+        // always stale — but the same probe handles it correctly and cheaply.
+        if std::path::Path::new(&path).exists() {
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                // A live tttt already owns this socket. Only reachable when
+                // TTTT_MCP_SOCKET is pinned to a path another running instance
+                // uses — a misconfiguration. Fail fast and exit rather than
+                // clobber the live instance or run silently without an MCP
+                // socket. Reached before raw mode is enabled (mirrors the
+                // launch_root startup-failure path), so exiting is clean.
+                eprintln!(
+                    "FATAL: MCP socket {path} is already in use by a live tttt \
+                     instance (TTTT_MCP_SOCKET collision). Refusing to take it \
+                     over — give this instance a distinct TTTT_MCP_SOCKET. Exiting."
+                );
+                std::process::exit(1);
+            }
+            // Stale socket from a dead instance: reclaim it.
+            let _ = std::fs::remove_file(&path);
+        }
         let listener = UnixListener::bind(&path)?;
         listener.set_nonblocking(true)?;
         self.mcp_socket_path = Some(path.clone());
