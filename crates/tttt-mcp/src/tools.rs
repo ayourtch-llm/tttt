@@ -224,7 +224,8 @@ pub fn scheduler_tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "message": { "type": "string", "description": "Reminder message" },
-                    "delay_seconds": { "type": "integer", "description": "Seconds from now" }
+                    "delay_seconds": { "type": "integer", "description": "Seconds from now" },
+                    "session_id": { "type": "string", "description": "Target session ID or name. If omitted, defaults to the first (oldest) session — never the session that happens to be focused when the reminder fires." }
                 },
                 "required": ["message", "delay_seconds"]
             }

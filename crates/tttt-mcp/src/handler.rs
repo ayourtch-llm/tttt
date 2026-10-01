@@ -867,12 +867,14 @@ impl SchedulerToolHandler {
             .as_u64()
             .ok_or_else(|| McpError::InvalidParams("delay_seconds required".to_string()))?;
 
+        let session_id = args["session_id"].as_str().map(|s| s.to_string());
+
         let fire_at = Instant::now() + Duration::from_secs(delay_seconds);
         let mut sched = self
             .scheduler
             .lock()
             .map_err(|e| McpError::Protocol(e.to_string()))?;
-        let id = sched.add_reminder(message, fire_at);
+        let id = sched.add_reminder(message, session_id, fire_at);
         Ok(json!({"reminder_id": id}))
     }
 
