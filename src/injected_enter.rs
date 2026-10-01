@@ -908,4 +908,31 @@ mod tests {
         h.tick(12000);
         assert_eq!(h.backend().enters, 3);
     }
+
+    #[test]
+    fn cursor_above_last_prompt_does_not_match() {
+        let text = "[CRON job-7]: check the pending work, then report on the queue state";
+        let mut h = Harness::new(text);
+        let session = h.sessions.get_mut("target").unwrap();
+        session.inject_screen_data(
+            format!("\x1b[2J\x1b[HSome output\r\nmore output\r\n❯ {text}\x1b[1;1H").as_bytes(),
+        );
+        assert!(!input_matches(session, text));
+    }
+
+    #[test]
+    fn input_before_initial_enter_does_not_arm_verification() {
+        let mut h = Harness::new("[CRON job-7]: check the pending work");
+        h.sessions
+            .get_mut("target")
+            .unwrap()
+            .send_raw(b"x")
+            .unwrap();
+        h.tick(100);
+        assert_eq!(h.backend().enters, 1);
+        assert!(h.pending.is_empty());
+        assert!(h.logger.0[0]
+            .data
+            .starts_with(b"[ENTER-GAVE-UP] input changed before initial Enter"));
+    }
 }
