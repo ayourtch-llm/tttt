@@ -300,8 +300,8 @@ mod tests {
                 }
             } else {
                 self.io.queue_output("\x1b[2J\x1b[H❯ ".as_bytes());
-                // Scheduler injection starts with a separate leading Enter.
-                // The delayed standalone Enter is the one this script ignores.
+                // Model an app that consumes the injection's leading CR.
+                // The captured-screen tests replay the pasted-newline layout.
                 self.io
                     .queue_output(data.strip_prefix(b"\r").unwrap_or(data));
             }
@@ -438,7 +438,8 @@ mod tests {
 
     #[test]
     fn observed_screen_blank_prompt_with_different_text_does_not_retry() {
-        let screen = OBSERVED_SCREEN.replace("[CRON cron-2]", "[CRON cron-9]");
+        // Keep the same cron ID and line widths, but change the command text.
+        let screen = OBSERVED_SCREEN.replace("(1) Run", "(1) Say");
         let mut h = observed_screen_harness(&screen);
         assert!(!input_matches(
             h.sessions.get("target").unwrap(),
@@ -451,6 +452,67 @@ mod tests {
         assert!(!h.backend().submitted);
         assert!(h.pending.is_empty());
         assert!(h.logger.0.is_empty());
+    }
+
+    #[test]
+    fn observed_screen_with_leading_whitespace_lines_matches_and_retries() {
+        let screen = OBSERVED_SCREEN.replace("❯ \n", "❯   \n    \n  \n");
+        let mut h = observed_screen_harness(&screen);
+        assert!(input_matches(
+            h.sessions.get("target").unwrap(),
+            &h.pending[0].text,
+        ));
+        h.tick(100);
+        h.tick(1100);
+        assert_eq!(h.backend().enters, 2);
+        assert!(h.backend().submitted);
+    }
+
+    #[test]
+    fn framed_blank_lines_preserve_whole_input_checks_for_short_messages() {
+        for text in [
+            "[REMINDER: ok]",
+            "[REMINDER: \tcheck 界]",
+            "[REMINDER: check\r\n  progress]",
+        ] {
+            for suffix in ["", " human draft"] {
+                let mut h = Harness::new(text);
+                let session = h.sessions.get_mut("target").unwrap();
+                session.inject_screen_data(format!(
+                    "\x1b[2J\x1b[H────────────────────\r\n❯ \t\r\n  \t\r\n  {text}{suffix}\r\n────────────────────\r\n  footer\x1b[?25l"
+                ).as_bytes());
+                assert_eq!(
+                    input_matches(session, text),
+                    suffix.is_empty(),
+                    "text {text:?}, suffix {suffix:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blank_prompt_does_not_skip_nonblank_input_or_frame_boundaries() {
+        let text = "[CRON job-7]: check the pending work and report any progress";
+        let rule = "────────────────────";
+        for screen in [
+            format!("❯ \r\n  {text}"),
+            format!("{rule}\r\n❯ \r\n  {text}"),
+            format!("❯ \r\n  {text}\r\n{rule}"),
+            format!("{rule}\r\n❯ \r\n  \r\n{rule}\r\n  {text}"),
+            format!("{rule}\r\n❯ \r\n  human draft\r\n  {text}\r\n{rule}"),
+            format!("{rule}\r\n❯ \r\nX {text}\r\n{rule}"),
+            format!("{rule}\r\n❯ \r\nX \r\n  {text}\r\n{rule}"),
+            format!("{rule}\r\n❯ \r\n  {text}\r\n{rule}\r\n{rule}\r\n❯ \r\n  \r\n{rule}"),
+        ] {
+            let mut h = Harness::new(text);
+            let session = h.sessions.get_mut("target").unwrap();
+            session.inject_screen_data(format!("\x1b[2J\x1b[H{screen}").as_bytes());
+            assert!(!input_matches(session, text), "screen {screen:?}");
+            h.tick(100);
+            h.tick(1100);
+            assert_eq!(h.backend().enters, 1, "screen {screen:?}");
+            assert!(h.pending.is_empty());
+        }
     }
 
     #[test]
