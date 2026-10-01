@@ -3100,30 +3100,12 @@ impl App {
 
     /// Send any pending Enter keystrokes whose delay has elapsed.
     fn drain_pending_delayed_enters(&mut self) {
-        if self.pending_delayed_enters.is_empty() {
-            return;
-        }
-        let now = Instant::now();
-        let mut remaining = Vec::new();
-        for (session_id, fire_at) in std::mem::take(&mut self.pending_delayed_enters) {
-            if now >= fire_at {
-                let mut mgr = self.sessions.lock().unwrap();
-                let sent = match mgr.get_mut(&session_id) {
-                    Ok(session) => session.send_keys("[ENTER]").is_ok(),
-                    Err(_) => false,
-                };
-                drop(mgr);
-                if !sent {
-                    let _ = self.logger.log_event(&LogEvent::new(
-                        session_id.clone(), LogDirection::Meta,
-                        b"[NOTIFICATION-DROPPED] delayed Enter: target session gone".to_vec(),
-                    ));
-                }
-            } else {
-                remaining.push((session_id, fire_at));
-            }
-        }
-        self.pending_delayed_enters = remaining;
+        crate::injected_enter::drain_delayed_enters(
+            &mut self.pending_delayed_enters,
+            &mut self.sessions.lock().unwrap(),
+            &mut self.logger,
+            Instant::now(),
+        );
     }
 
     fn inject_context_refresh_text(&mut self, text: &str, stage: &str) -> bool {
