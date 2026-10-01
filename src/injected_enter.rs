@@ -451,7 +451,11 @@ mod tests {
         assert_eq!(h.backend().enters, 1);
         assert!(!h.backend().submitted);
         assert!(h.pending.is_empty());
-        assert!(h.logger.0.is_empty());
+        assert_eq!(h.logger.0.len(), 1);
+        assert_eq!(
+            h.logger.0[0].data,
+            b"[ENTER-VERIFY] no matching input, stopping (0 retries)"
+        );
     }
 
     #[test]
@@ -630,7 +634,55 @@ mod tests {
         assert!(h.backend().submitted);
         assert_eq!(h.backend().enters, 1);
         assert!(h.pending.is_empty());
-        assert!(h.logger.0.is_empty());
+        assert_eq!(h.logger.0.len(), 1);
+        assert_eq!(
+            h.logger.0[0].data,
+            b"[ENTER-VERIFY] no matching input, stopping (0 retries)"
+        );
+    }
+
+    #[test]
+    fn no_matching_input_logs_stop_once_with_retry_count() {
+        for retries in 0..=3 {
+            for submitted in [false, true] {
+                let mut h = Harness::new("[CRON job-7]: check the pending work");
+                h.sessions
+                    .get_mut("target")
+                    .unwrap()
+                    .backend_mut()
+                    .ignore_enters = if submitted { retries } else { usize::MAX };
+                h.tick(100);
+                for ms in [1100, 3100, 7100].into_iter().take(retries) {
+                    h.tick(ms);
+                }
+
+                let session = h.sessions.get_mut("target").unwrap();
+                if submitted {
+                    session.pump().unwrap();
+                } else {
+                    session.inject_screen_data(b"\x1b[2J\x1b[HUnknown input layout");
+                }
+                h.tick([1100, 3100, 7100, 8100][retries]);
+                h.tick(60000);
+                assert_eq!(h.backend().submitted, submitted);
+                assert_eq!(h.backend().enters, retries + 1);
+                assert!(h.pending.is_empty());
+                let events: Vec<_> = h
+                    .logger
+                    .0
+                    .iter()
+                    .filter(|event| event.data.starts_with(b"[ENTER-VERIFY]"))
+                    .collect();
+                assert_eq!(events.len(), 1, "{retries} retries, submitted={submitted}");
+                assert_eq!(events[0].session_id, "target");
+                assert_eq!(events[0].direction, Direction::Meta);
+                assert_eq!(
+                    events[0].data,
+                    format!("[ENTER-VERIFY] no matching input, stopping ({retries} retries)")
+                        .as_bytes()
+                );
+            }
+        }
     }
 
     #[test]
