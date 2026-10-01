@@ -31,6 +31,11 @@ impl BusyPolicy {
 pub struct Reminder {
     pub id: String,
     pub message: String,
+    /// Session the reminder should be delivered to. `None` means "fall back to the
+    /// first session", the same rule `CronJob` uses. A reminder must never be aimed
+    /// at whatever session happens to be focused when it fires: that delivers it to
+    /// an unrelated window and loses it for the session that set it.
+    pub session_id: Option<String>,
     #[serde(skip)]
     pub fire_at: Option<Instant>,
 }
@@ -92,8 +97,13 @@ impl Scheduler {
         }
     }
 
-    /// Add a one-shot reminder.
-    pub fn add_reminder(&mut self, message: String, fire_at: Instant) -> String {
+    /// Add a one-shot reminder, delivered to `session_id` (or the first session).
+    pub fn add_reminder(
+        &mut self,
+        message: String,
+        session_id: Option<String>,
+        fire_at: Instant,
+    ) -> String {
         let id = format!("reminder-{}", self.next_reminder_id);
         self.next_reminder_id += 1;
 
@@ -101,6 +111,7 @@ impl Scheduler {
         let reminder = Reminder {
             id: id.clone(),
             message,
+            session_id,
             fire_at: Some(fire_at),
         };
 
@@ -320,7 +331,7 @@ mod tests {
     fn test_add_reminder() {
         let e = epoch();
         let mut sched = Scheduler::with_epoch(e);
-        let id = sched.add_reminder("test".to_string(), e + Duration::from_secs(10));
+        let id = sched.add_reminder("test".to_string(), None, e + Duration::from_secs(10));
         assert_eq!(id, "reminder-1");
         assert_eq!(sched.reminder_count(), 1);
     }
@@ -329,7 +340,7 @@ mod tests {
     fn test_reminder_fires_at_correct_time() {
         let e = epoch();
         let mut sched = Scheduler::with_epoch(e);
-        sched.add_reminder("hello".to_string(), e + Duration::from_secs(5));
+        sched.add_reminder("hello".to_string(), None, e + Duration::from_secs(5));
 
         // Not yet
         let events = sched.tick(e + Duration::from_secs(3));
@@ -348,17 +359,43 @@ mod tests {
     fn test_reminder_not_premature() {
         let e = epoch();
         let mut sched = Scheduler::with_epoch(e);
-        sched.add_reminder("future".to_string(), e + Duration::from_secs(100));
+        sched.add_reminder("future".to_string(), None, e + Duration::from_secs(100));
         let events = sched.tick(e + Duration::from_secs(50));
         assert!(events.is_empty());
         assert_eq!(sched.reminder_count(), 1);
     }
 
     #[test]
+    fn test_reminder_carries_target_session() {
+        // Regression: reminders used to be delivered to whatever session was focused
+        // when they fired, which put them in an unrelated window and lost them for the
+        // session that set them. The target must travel with the reminder.
+        let e = Instant::now();
+        let mut sched = Scheduler::with_epoch(e);
+        sched.add_reminder(
+            "aimed".to_string(),
+            Some("pty-1".to_string()),
+            e + Duration::from_secs(1),
+        );
+        sched.add_reminder("unaimed".to_string(), None, e + Duration::from_secs(1));
+
+        let events = sched.tick(e + Duration::from_secs(2));
+        let mut targets: Vec<Option<String>> = events
+            .iter()
+            .map(|ev| match ev {
+                SchedulerEvent::ReminderFired(r) => r.session_id.clone(),
+                _ => panic!("expected a reminder"),
+            })
+            .collect();
+        targets.sort();
+        assert_eq!(targets, vec![None, Some("pty-1".to_string())]);
+    }
+
+    #[test]
     fn test_reminder_consumed_after_fire() {
         let e = epoch();
         let mut sched = Scheduler::with_epoch(e);
-        sched.add_reminder("once".to_string(), e + Duration::from_secs(1));
+        sched.add_reminder("once".to_string(), None, e + Duration::from_secs(1));
         sched.tick(e + Duration::from_secs(2));
         assert_eq!(sched.reminder_count(), 0);
         // Second tick should not fire again
@@ -370,9 +407,9 @@ mod tests {
     fn test_multiple_reminders_ordered() {
         let e = epoch();
         let mut sched = Scheduler::with_epoch(e);
-        sched.add_reminder("second".to_string(), e + Duration::from_secs(20));
-        sched.add_reminder("first".to_string(), e + Duration::from_secs(10));
-        sched.add_reminder("third".to_string(), e + Duration::from_secs(30));
+        sched.add_reminder("second".to_string(), None, e + Duration::from_secs(20));
+        sched.add_reminder("first".to_string(), None, e + Duration::from_secs(10));
+        sched.add_reminder("third".to_string(), None, e + Duration::from_secs(30));
 
         let events = sched.tick(e + Duration::from_secs(25));
         assert_eq!(events.len(), 2);
@@ -483,8 +520,8 @@ mod tests {
     fn test_next_wake_reminder() {
         let e = epoch();
         let mut sched = Scheduler::with_epoch(e);
-        sched.add_reminder("a".to_string(), e + Duration::from_secs(10));
-        sched.add_reminder("b".to_string(), e + Duration::from_secs(5));
+        sched.add_reminder("a".to_string(), None, e + Duration::from_secs(10));
+        sched.add_reminder("b".to_string(), None, e + Duration::from_secs(5));
         let wake = sched.next_wake().unwrap();
         // Should be the earlier one
         assert!(wake <= e + Duration::from_secs(5) + Duration::from_millis(1));

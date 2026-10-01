@@ -2957,8 +2957,12 @@ impl App {
                     "scheduler".to_string(), LogDirection::Meta,
                     format!("REMINDER: {}", reminder.message).into_bytes(),
                 ));
-                // Inject the reminder message into the active session (or first session).
-                let target = self.active_session.clone().or_else(|| {
+                // Deliver to the session that SET the reminder, falling back to the
+                // first session -- the same rule CronFired uses below. Never
+                // self.active_session: that aims the reminder at whatever window is
+                // focused when it fires, which both delivers it to an unrelated session
+                // and loses it for the one that asked for it.
+                let target = reminder.session_id.clone().or_else(|| {
                     self.session_order.first().cloned()
                 });
                 if let Some(sid) = target {
@@ -3027,8 +3031,8 @@ impl App {
         let events = std::mem::take(&mut self.deferred_scheduler_events);
         for event in events {
             let (target_id, is_idle) = match &event {
-                SchedulerEvent::ReminderFired(_) => {
-                    let sid = self.active_session.clone().or_else(|| {
+                SchedulerEvent::ReminderFired(reminder) => {
+                    let sid = reminder.session_id.clone().or_else(|| {
                         self.session_order.first().cloned()
                     });
                     match sid {
