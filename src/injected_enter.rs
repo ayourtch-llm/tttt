@@ -54,12 +54,13 @@ impl PendingEnter {
 }
 
 /// Column after a known prompt, including an empty prompt whose trailing space
-/// was trimmed by VT100. Empty prompts must still separate input from history.
+/// was trimmed by VT100. Some composers use a nonbreaking space instead.
+/// Empty prompts must still separate input from history.
 fn prompt_input_column(line: &str) -> Option<u16> {
     let trimmed = line.trim_start_matches(' ');
     let mut chars = trimmed.chars();
     if !matches!(chars.next()?, '❯' | '›' | '>' | '$' | '#')
-        || !matches!(chars.next(), None | Some(' '))
+        || !matches!(chars.next(), None | Some(' ' | '\u{a0}'))
     {
         return None;
     }
@@ -76,7 +77,7 @@ fn normalized_input(text: &str) -> String {
 }
 
 /// Require the latest identifiable prompt connected to the cursor, or the last
-/// framed composer (which can hide the cursor or leave it on a footer). Unknown
+/// framed composer, independently of cursor position or visibility. Unknown
 /// layouts and input whose identifying prefix has scrolled away fail closed.
 fn input_matches<B: PtyBackend>(session: &PtySession<B>, text: &str) -> bool {
     let mut screen = session.screen().screen().clone();
@@ -94,7 +95,7 @@ fn input_matches<B: PtyBackend>(session: &PtySession<B>, text: &str) -> bool {
         return false;
     };
     let input_col = prompt_input_column(&lines[start]).unwrap();
-    if input_col >= cols || start > usize::from(row) {
+    if input_col >= cols {
         return false;
     }
 
@@ -113,7 +114,10 @@ fn input_matches<B: PtyBackend>(session: &PtySession<B>, text: &str) -> bool {
     let end = if let Some(end) = framed_end {
         end as u16
     } else {
-        if screen.hide_cursor() || (start == usize::from(row) && col < input_col) {
+        if start > usize::from(row)
+            || screen.hide_cursor()
+            || (start == usize::from(row) && col < input_col)
+        {
             return false;
         }
         for (continuation, line) in lines
