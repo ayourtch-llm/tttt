@@ -1,34 +1,193 @@
 //! Delayed submission of injected terminal input.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tttt_log::{Direction, LogEvent, LogSink};
-use tttt_pty::{PtyBackend, SessionManager};
+use tttt_pty::{
+    process_special_keys, PtyBackend, PtySession, ScreenBuffer, SessionManager, SessionStatus,
+};
+
+const RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
+pub(crate) struct PendingEnter {
+    session_id: String,
+    text: String,
+    fire_at: Instant,
+    input_at: Instant,
+    quiet_since: Option<Instant>,
+    checks: usize,
+    retries: usize,
+}
+
+impl PendingEnter {
+    /// Call immediately after successfully sending the injection, under the
+    /// session lock, so later keyboard input or another injection invalidates it.
+    pub(crate) fn new<B: PtyBackend>(session: &PtySession<B>, text: &str, now: Instant) -> Self {
+        Self {
+            session_id: session.id.clone(),
+            text: text.strip_prefix("[ENTER]").unwrap_or(text).to_owned(),
+            fire_at: now + Duration::from_millis(100),
+            input_at: session.last_input_time(),
+            quiet_since: None,
+            checks: 0,
+            retries: 0,
+        }
+    }
+
+    fn log(&self, logger: &mut impl LogSink, message: String) {
+        let _ = logger.log_event(&LogEvent::new(
+            self.session_id.clone(),
+            Direction::Meta,
+            message.into_bytes(),
+        ));
+    }
+
+    fn give_up(&self, logger: &mut impl LogSink, reason: &str) {
+        self.log(
+            logger,
+            format!("[ENTER-GAVE-UP] {reason} ({} retries)", self.retries),
+        );
+    }
+}
+
+/// Require an identifiable prompt connected to the cursor, not a match in
+/// history. Unknown layouts and input whose prefix has scrolled away fail closed.
+fn input_matches<B: PtyBackend>(session: &PtySession<B>, text: &str) -> bool {
+    let mut screen = session.screen().screen().clone();
+    screen.set_scrollback(0);
+    if screen.hide_cursor() || session.synchronized_output() {
+        return false;
+    }
+    let (row, col) = screen.cursor_position();
+    let (_, cols) = screen.size();
+    let lines: Vec<_> = screen.rows(0, cols).collect();
+    for start in (0..=row).rev() {
+        let line = &lines[usize::from(start)];
+        let trimmed = line.trim_start_matches(' ');
+        let prompt = ["❯ ", "› ", "> ", "$ ", "# "]
+            .iter()
+            .find(|prompt| trimmed.starts_with(**prompt));
+        if let Some(prompt) = prompt {
+            let input_col = (line.len() - trimmed.len()) as u16 + 2;
+            if input_col >= cols || (start == row && col < input_col) {
+                return false;
+            }
+            // Render through the same key conversion and VT100 parser as the
+            // live screen. Scrollback preserves the first row of long messages.
+            let mut expected = ScreenBuffer::with_scrollback(cols - input_col, 2, text.len());
+            expected.process(&process_special_keys(text));
+            let history = expected.get_scrollback(usize::MAX);
+            let first_line = history.first().cloned().unwrap_or_else(|| {
+                expected
+                    .screen()
+                    .rows(0, cols - input_col)
+                    .next()
+                    .unwrap_or_default()
+            });
+            let prefix: String = first_line.trim().chars().take(40).collect();
+            return !prefix.is_empty() && trimmed[prompt.len()..].trim_start().starts_with(&prefix);
+        }
+        // Follow terminal soft wraps and indented TUI continuation rows only.
+        // Never cross a blank separator, output line, or another prompt.
+        if start == 0
+            || (!screen.row_wrapped(start - 1)
+                && (line.trim().is_empty() || !line.starts_with("  ")))
+        {
+            return false;
+        }
+    }
+    false
+}
 
 pub(crate) fn drain_delayed_enters<B: PtyBackend>(
-    pending: &mut Vec<(String, Instant)>,
+    pending: &mut Vec<PendingEnter>,
     sessions: &mut SessionManager<B>,
     logger: &mut impl LogSink,
     now: Instant,
 ) {
-    let mut remaining = Vec::new();
-    for (session_id, fire_at) in std::mem::take(pending) {
-        if now >= fire_at {
-            let sent = match sessions.get_mut(&session_id) {
-                Ok(session) => session.send_keys("[ENTER]").is_ok(),
-                Err(_) => false,
-            };
-            if !sent {
-                let _ = logger.log_event(&LogEvent::new(
-                    session_id,
-                    Direction::Meta,
-                    b"[NOTIFICATION-DROPPED] delayed Enter: target session gone".to_vec(),
-                ));
-            }
-        } else {
-            remaining.push((session_id, fire_at));
+    pending.retain_mut(|enter| {
+        if now < enter.fire_at {
+            return true;
         }
-    }
-    *pending = remaining;
+        let Ok(session) = sessions.get_mut(&enter.session_id) else {
+            if enter.quiet_since.is_none() {
+                enter.log(
+                    logger,
+                    "[NOTIFICATION-DROPPED] delayed Enter: target session gone".into(),
+                );
+            } else {
+                enter.give_up(logger, "target session gone");
+            }
+            return false;
+        };
+        let Some(quiet_since) = enter.quiet_since else {
+            // Preserve the existing first Enter, including its 100 ms delay.
+            // If ownership was already lost, never arm verification for it.
+            let owned = session.last_input_time() == enter.input_at;
+            if session.send_keys("[ENTER]").is_err() {
+                enter.log(
+                    logger,
+                    "[NOTIFICATION-DROPPED] delayed Enter: send failed".into(),
+                );
+                return false;
+            }
+            if !owned {
+                enter.give_up(logger, "input changed before initial Enter");
+                return false;
+            }
+            enter.input_at = session.last_input_time();
+            enter.quiet_since = Some(enter.input_at);
+            enter.fire_at = now + RETRY_DELAYS[0];
+            return true;
+        };
+        if session.status() != &SessionStatus::Running {
+            enter.give_up(logger, "target session exited");
+            return false;
+        }
+        if session.last_input_time() != enter.input_at {
+            enter.give_up(logger, "intervening input");
+            return false;
+        }
+        if !input_matches(session, &enter.text) {
+            // This includes successful submission: history is never sufficient
+            // evidence to send another Enter. Do not claim submission succeeded.
+            return false;
+        }
+        if enter.checks == RETRY_DELAYS.len() {
+            enter.give_up(logger, "matching input remains after final check");
+            return false;
+        }
+        // Reuse the existing output-idle clock. Activity consumes a check but
+        // does not send Enter. A late echo can settle before the next check;
+        // continual output cannot keep this queue entry alive indefinitely.
+        let quiet_for = now.saturating_duration_since(quiet_since).as_secs_f64();
+        if session.idle_seconds_at(now) >= quiet_for {
+            if session.send_keys("[ENTER]").is_err() {
+                enter.give_up(logger, "retry send failed");
+                return false;
+            }
+            enter.retries += 1;
+            enter.input_at = session.last_input_time();
+            enter.log(
+                logger,
+                format!(
+                    "[ENTER-RETRY {}] matching injected input is still pending",
+                    enter.retries
+                ),
+            );
+        }
+        enter.checks += 1;
+        enter.quiet_since = Some(Instant::now());
+        enter.fire_at = now
+            + RETRY_DELAYS
+                .get(enter.checks)
+                .copied()
+                .unwrap_or(Duration::from_secs(1));
+        true
+    });
 }
 
 #[cfg(test)]
@@ -43,14 +202,19 @@ mod tests {
         io: MockPty,
         enters: usize,
         submitted: bool,
+        ignore_enters: usize,
+        fail_writes: bool,
     }
 
     impl PtyBackend for ScriptedPty {
         fn write(&mut self, data: &[u8]) -> tttt_pty::Result<()> {
+            if self.fail_writes {
+                return Err(tttt_pty::PtyError::SessionExited);
+            }
             self.io.write(data)?;
             if data == b"\r" {
                 self.enters += 1;
-                if self.enters > 1 {
+                if self.enters > self.ignore_enters {
                     self.submitted = true;
                     self.io.queue_output("\r\nAccepted\r\n❯ ".as_bytes());
                 }
@@ -94,7 +258,7 @@ mod tests {
 
     struct Harness {
         sessions: SessionManager<ScriptedPty>,
-        pending: Vec<(String, Instant)>,
+        pending: Vec<PendingEnter>,
         logger: RecordingLog,
         start: Instant,
     }
@@ -105,16 +269,19 @@ mod tests {
                 io: MockPty::new(80, 24),
                 enters: 0,
                 submitted: false,
+                ignore_enters: 1,
+                fail_writes: false,
             };
             let mut session = PtySession::new("target".into(), backend, "claude".into(), 80, 24);
             session.send_keys(text).unwrap();
             session.pump().unwrap();
             let start = Instant::now();
+            let pending = vec![PendingEnter::new(&session, text, start)];
             let mut sessions = SessionManager::new();
             sessions.add_session(session).unwrap();
             Self {
                 sessions,
-                pending: vec![("target".into(), start + Duration::from_millis(100))],
+                pending,
                 logger: RecordingLog::default(),
                 start,
             }
@@ -145,13 +312,21 @@ mod tests {
         h.tick(1099);
         assert_eq!(h.backend().enters, 1);
         h.tick(1100);
-        assert_eq!(h.backend().enters, 2, "ignored Enter must be retried after one second");
+        assert_eq!(
+            h.backend().enters,
+            2,
+            "ignored Enter must be retried after one second"
+        );
         assert!(h.backend().submitted);
 
         h.sessions.get_mut("target").unwrap().pump().unwrap();
         h.tick(3100);
         h.tick(7100);
-        assert_eq!(h.backend().enters, 2, "submitted text in history must not trigger another Enter");
+        assert_eq!(
+            h.backend().enters,
+            2,
+            "submitted text in history must not trigger another Enter"
+        );
         assert!(h.pending.is_empty());
         assert!(h.logger.0.iter().any(|event| {
             event.session_id == "target"
@@ -168,9 +343,10 @@ mod tests {
         // A redraw replaces the input without a tttt key write. This exercises
         // the screen guard independently of any input-activity cancellation.
         let session = h.sessions.get_mut("target").unwrap();
-        session.backend_mut().io.queue_output(
-            format!("\x1b[2J\x1b[H❯ {text}\r\nAccepted\r\n❯ human draft").as_bytes(),
-        );
+        session
+            .backend_mut()
+            .io
+            .queue_output(format!("\x1b[2J\x1b[H❯ {text}\r\nAccepted\r\n❯ human draft").as_bytes());
         session.pump().unwrap();
         for ms in [1100, 3100, 7100, 11100] {
             h.tick(ms);
@@ -178,6 +354,192 @@ mod tests {
         assert_eq!(h.backend().enters, 1, "never submit replacement input");
         assert!(!h.backend().submitted);
         assert!(h.pending.is_empty());
-        assert!(!h.logger.0.iter().any(|event| event.data.starts_with(b"[ENTER-RETRY")));
+        assert!(!h
+            .logger
+            .0
+            .iter()
+            .any(|event| event.data.starts_with(b"[ENTER-RETRY")));
+    }
+
+    #[test]
+    fn three_retries_use_backoff_then_log_give_up_once() {
+        let mut h = Harness::new("[REMINDER: check the pending work]");
+        h.sessions
+            .get_mut("target")
+            .unwrap()
+            .backend_mut()
+            .ignore_enters = usize::MAX;
+        for (ms, enters) in [
+            (100, 1),
+            (1099, 1),
+            (1100, 2),
+            (3099, 2),
+            (3100, 3),
+            (7099, 3),
+            (7100, 4),
+            (8099, 4),
+            (8100, 4),
+            (60000, 4),
+        ] {
+            h.tick(ms);
+            assert_eq!(h.backend().enters, enters, "at {ms} ms");
+        }
+        assert!(h.pending.is_empty());
+        let events: Vec<_> = h
+            .logger
+            .0
+            .iter()
+            .map(|event| {
+                assert_eq!(event.direction, Direction::Meta);
+                assert_eq!(event.session_id, "target");
+                String::from_utf8_lossy(&event.data)
+            })
+            .collect();
+        assert_eq!(events.len(), 4);
+        for (index, event) in events[..3].iter().enumerate() {
+            assert!(event.starts_with(&format!("[ENTER-RETRY {}]", index + 1)));
+        }
+        assert!(events[3].starts_with("[ENTER-GAVE-UP]"));
+    }
+
+    #[test]
+    fn successful_initial_enter_does_not_retry_history() {
+        let mut h = Harness::new("[CRON job-7]: check the pending work");
+        h.sessions
+            .get_mut("target")
+            .unwrap()
+            .backend_mut()
+            .ignore_enters = 0;
+        h.tick(100);
+        h.sessions.get_mut("target").unwrap().pump().unwrap();
+        h.tick(1100);
+        assert!(h.backend().submitted);
+        assert_eq!(h.backend().enters, 1);
+        assert!(h.pending.is_empty());
+        assert!(h.logger.0.is_empty());
+    }
+
+    #[test]
+    fn late_echo_waits_for_output_silence_then_retries() {
+        let mut h = Harness::new("[CRON job-7]: check the pending work");
+        h.tick(100);
+        // A cursor redraw counts as output even though the text is unchanged.
+        let session = h.sessions.get_mut("target").unwrap();
+        session.backend_mut().io.queue_output(b"\x1b[0m");
+        session.pump().unwrap();
+        h.tick(1100);
+        assert_eq!(
+            h.backend().enters,
+            1,
+            "output since Enter forbids this retry"
+        );
+        assert!(!h.pending.is_empty());
+        h.tick(3100);
+        assert_eq!(h.backend().enters, 2, "late echo has now settled");
+    }
+
+    #[test]
+    fn continuous_output_is_bounded_without_any_retry() {
+        let mut h = Harness::new("[CRON job-7]: check the pending work");
+        h.tick(100);
+        for ms in [1100, 3100, 7100, 8100] {
+            let session = h.sessions.get_mut("target").unwrap();
+            session.backend_mut().io.queue_output(b"\x1b[0m");
+            session.pump().unwrap();
+            h.tick(ms);
+        }
+        assert_eq!(h.backend().enters, 1);
+        assert!(h.pending.is_empty());
+        assert_eq!(h.logger.0.len(), 1);
+        assert!(h.logger.0[0].data.starts_with(b"[ENTER-GAVE-UP]"));
+    }
+
+    #[test]
+    fn intervening_input_cancels_even_before_its_echo() {
+        for input_kind in 0..3 {
+            let mut h = Harness::new("[CRON job-7]: check the pending work");
+            h.tick(100);
+            let session = h.sessions.get_mut("target").unwrap();
+            match input_kind {
+                0 => session.send_raw(b"human draft").unwrap(),
+                1 => {
+                    session.try_send_raw(b"human draft").unwrap();
+                }
+                _ => session.send_keys("another injection").unwrap(),
+            }
+            // Do not pump: the screen still contains the original injection.
+            h.tick(1100);
+            assert_eq!(h.backend().enters, 1);
+            assert!(h.pending.is_empty());
+            assert!(h.logger.0[0]
+                .data
+                .starts_with(b"[ENTER-GAVE-UP] intervening input"));
+        }
+    }
+
+    #[test]
+    fn wrapped_unicode_and_rendered_escape_text_matches() {
+        for text in [
+            "[REMINDER: café 界界 é ".to_owned() + &"long text ".repeat(20) + "]",
+            r"[REMINDER: \x1b[31mcolored\x1b[0m café]".to_owned(),
+        ] {
+            let mut h = Harness::new(&text);
+            assert!(input_matches(h.sessions.get("target").unwrap(), &text));
+            h.tick(100);
+            h.tick(1100);
+            assert_eq!(h.backend().enters, 2);
+        }
+    }
+
+    #[test]
+    fn indented_multiline_input_matches_without_using_footer() {
+        let text = "[REMINDER: check the pending work and report progress]";
+        let mut h = Harness::new(text);
+        let session = h.sessions.get_mut("target").unwrap();
+        session.inject_screen_data(
+            "\x1b[2J\x1b[H❯ [REMINDER: check the pending work and report progress]\r\n  continued input\r\n────────────────────\r\n  status footer\x1b[2;18H".as_bytes(),
+        );
+        assert!(input_matches(session, text));
+        session.inject_screen_data(b"\x1b[4;16H");
+        assert!(!input_matches(session, text), "footer cursor is not input");
+    }
+
+    #[test]
+    fn hidden_cursor_unknown_layout_and_blank_input_do_not_match() {
+        let text = "[CRON job-7]: check the pending work";
+        for screen in [
+            format!("❯ {text}\x1b[?25l"),
+            format!("output: {text}"),
+            format!("❯ {text}\r\n\r\n❯ "),
+            format!("❯ {text}\x1b[?2026h"),
+        ] {
+            let mut h = Harness::new(text);
+            let session = h.sessions.get_mut("target").unwrap();
+            session.inject_screen_data(format!("\x1b[2J\x1b[H{screen}").as_bytes());
+            assert!(!input_matches(session, text), "screen {screen:?}");
+        }
+    }
+
+    #[test]
+    fn gone_exited_and_failed_write_stop_verification() {
+        for failure in 0..3 {
+            let mut h = Harness::new("[CRON job-7]: check the pending work");
+            h.tick(100);
+            match failure {
+                0 => h.sessions = SessionManager::new(),
+                1 => h.sessions.get_mut("target").unwrap().kill().unwrap(),
+                _ => {
+                    h.sessions
+                        .get_mut("target")
+                        .unwrap()
+                        .backend_mut()
+                        .fail_writes = true
+                }
+            }
+            h.tick(1100);
+            assert!(h.pending.is_empty());
+            assert_eq!(h.logger.0.len(), 1);
+            assert!(h.logger.0[0].data.starts_with(b"[ENTER-GAVE-UP]"));
+        }
     }
 }

@@ -2165,9 +2165,9 @@ mod tests {
         composite.add_handler(Box::new(make_handler()));
         composite.add_handler(Box::new(make_scheduler_handler()));
 
-        // Should have 15 PTY + 4 scheduler = 19 tool definitions
+        // Should have 15 PTY + 6 scheduler = 21 tool definitions
         let defs = composite.tool_definitions();
-        assert_eq!(defs.len(), 19);
+        assert_eq!(defs.len(), 21);
 
         // PTY tool should work
         let result = composite.handle_tool_call("tttt_pty_list", &json!({}));

@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn test_scheduler_tool_count() {
-        assert_eq!(scheduler_tool_definitions().len(), 4);
+        assert_eq!(scheduler_tool_definitions().len(), 6);
     }
 
     #[test]

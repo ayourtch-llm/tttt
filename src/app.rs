@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::injected_enter::PendingEnter;
 use crate::reload::{self, SavedState, SavedSession, SavedCronJob, SavedWatcher};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -694,7 +695,7 @@ pub struct App {
     deferred_scheduler_events: Vec<SchedulerEvent>,
     /// Pending Enter keystrokes for injections (cron, reminder, notification),
     /// sent after a delay so the target app processes the text before submission.
-    pending_delayed_enters: Vec<(String, Instant)>,
+    pending_delayed_enters: Vec<PendingEnter>,
     /// Direct keyboard input waiting for a non-blocking PTY write. Bytes are
     /// ordered per session so a busy child cannot stall the TUI event loop.
     pending_user_input:
@@ -1898,24 +1899,23 @@ impl App {
                 if can_inject {
                     if let Some((target_id, text)) = self.pending_injection_queue.pop_front() {
                         let mut mgr = self.sessions.lock().unwrap();
-                        let sent = if let Ok(session) = mgr.get_mut(&target_id) {
+                        let pending = if let Ok(session) = mgr.get_mut(&target_id) {
                             // Send text via send_keys (without auto-appending Enter).
                             // Strip trailing \r/\n — a delayed [ENTER] will be queued below.
                             let clean = text.trim_end_matches(|c| c == '\r' || c == '\n');
-                            session.send_keys(clean).is_ok()
+                            session.send_keys(clean).ok().map(|()| {
+                                PendingEnter::new(session, clean, Instant::now())
+                            })
                         } else {
-                            false
+                            None
                         };
                         drop(mgr);
-                        if sent {
+                        if let Some(pending) = pending {
                             let _ = self.logger.log_event(&LogEvent::new(
                                 target_id.clone(), LogDirection::Meta,
                                 format!("[NOTIFICATION] {}", text).into_bytes(),
                             ));
-                            self.pending_delayed_enters.push((
-                                target_id,
-                                Instant::now() + std::time::Duration::from_millis(100),
-                            ));
+                            self.pending_delayed_enters.push(pending);
                         } else {
                             let _ = self.logger.log_event(&LogEvent::new(
                                 target_id.clone(), LogDirection::Meta,
@@ -2975,12 +2975,11 @@ impl App {
                             return;
                         }
                         let text = format!("[ENTER][REMINDER: {}]", reminder.message);
-                        let _ = session.send_keys(&text);
-                        drop(mgr);
-                        self.pending_delayed_enters.push((
-                            sid.clone(),
-                            Instant::now() + std::time::Duration::from_millis(100),
-                        ));
+                        if session.send_keys(&text).is_ok() {
+                            self.pending_delayed_enters.push(PendingEnter::new(
+                                session, &text, Instant::now(),
+                            ));
+                        }
                     }
                 }
             }
@@ -3010,12 +3009,11 @@ impl App {
                         // app has time to process the text before submission.
                         let cmd = job.command.trim_end_matches(|c| c == '\r' || c == '\n');
                         let text = format!("[ENTER][CRON {}]: {}", job.id, cmd);
-                        let _ = session.send_keys(&text);
-                        drop(mgr);
-                        self.pending_delayed_enters.push((
-                            session_id.clone(),
-                            Instant::now() + std::time::Duration::from_millis(100),
-                        ));
+                        if session.send_keys(&text).is_ok() {
+                            self.pending_delayed_enters.push(PendingEnter::new(
+                                session, &text, Instant::now(),
+                            ));
+                        }
                     }
                 }
             }
@@ -3070,12 +3068,12 @@ impl App {
                         let mut mgr = self.sessions.lock().unwrap();
                         if let Ok(session) = mgr.get_mut(&sid) {
                             let text = format!("[ENTER][REMINDER: {}]", reminder.message);
-                            let _ = session.send_keys(&text);
+                            if session.send_keys(&text).is_ok() {
+                                self.pending_delayed_enters.push(PendingEnter::new(
+                                    session, &text, Instant::now(),
+                                ));
+                            }
                         }
-                        self.pending_delayed_enters.push((
-                            sid,
-                            Instant::now() + std::time::Duration::from_millis(100),
-                        ));
                     }
                     SchedulerEvent::CronFired(job) => {
                         let sid = target_id.unwrap();
@@ -3083,12 +3081,12 @@ impl App {
                         if let Ok(session) = mgr.get_mut(&sid) {
                             let cmd = job.command.trim_end_matches(|c| c == '\r' || c == '\n');
                             let text = format!("[ENTER][CRON {}]: {}", job.id, cmd);
-                            let _ = session.send_keys(&text);
+                            if session.send_keys(&text).is_ok() {
+                                self.pending_delayed_enters.push(PendingEnter::new(
+                                    session, &text, Instant::now(),
+                                ));
+                            }
                         }
-                        self.pending_delayed_enters.push((
-                            sid,
-                            Instant::now() + std::time::Duration::from_millis(100),
-                        ));
                     }
                 }
             } else {
@@ -3112,17 +3110,17 @@ impl App {
         let Some(session_id) = self.session_order.first().cloned() else {
             return false;
         };
-        let sent = {
+        let pending = {
             let mut mgr = self.sessions.lock().unwrap();
-            mgr.get_mut(&session_id)
-                .map(|session| session.send_keys(text).is_ok())
-                .unwrap_or(false)
+            mgr.get_mut(&session_id).ok().and_then(|session| {
+                session.send_keys(text).ok().map(|()| {
+                    PendingEnter::new(session, text, Instant::now())
+                })
+            })
         };
-        if sent {
-            self.pending_delayed_enters.push((
-                session_id.clone(),
-                Instant::now() + std::time::Duration::from_millis(100),
-            ));
+        let sent = pending.is_some();
+        if let Some(pending) = pending {
+            self.pending_delayed_enters.push(pending);
             let _ = self.logger.log_event(&LogEvent::new(
                 session_id,
                 LogDirection::Meta,
