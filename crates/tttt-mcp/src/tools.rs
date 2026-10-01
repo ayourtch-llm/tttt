@@ -231,6 +231,22 @@ pub fn scheduler_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "tttt_reminder_list",
+            "description": "List pending one-shot reminders with their target session and how long until each fires",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "tttt_reminder_cancel",
+            "description": "Cancel a pending one-shot reminder by id",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "reminder_id": { "type": "string", "description": "Reminder ID as returned by tttt_reminder_set or tttt_reminder_list" }
+                },
+                "required": ["reminder_id"]
+            }
+        }),
+        json!({
             "name": "tttt_cron_create",
             "description": "Create a recurring cron job that injects a message into a session",
             "inputSchema": {

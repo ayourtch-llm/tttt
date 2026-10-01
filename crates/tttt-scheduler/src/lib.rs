@@ -159,6 +159,41 @@ impl Scheduler {
         self.cron_jobs.values().collect()
     }
 
+    /// List pending reminders, soonest first, each with how long until it fires
+    /// measured from `now`. A reminder already due reports `Duration::ZERO`.
+    pub fn list_reminders(&self, now: Instant) -> Vec<(&Reminder, Duration)> {
+        let now_key = now.duration_since(self.epoch).as_millis() as u64;
+        self.reminders
+            .iter()
+            .flat_map(|(key, rs)| {
+                let remaining = Duration::from_millis(key.saturating_sub(now_key));
+                rs.iter().map(move |r| (r, remaining))
+            })
+            .collect()
+    }
+
+    /// Remove a pending reminder by id.
+    pub fn remove_reminder(&mut self, id: &str) -> Result<()> {
+        let mut found_in = None;
+        for (key, rs) in self.reminders.iter_mut() {
+            if let Some(pos) = rs.iter().position(|r| r.id == id) {
+                rs.remove(pos);
+                found_in = Some((*key, rs.is_empty()));
+                break;
+            }
+        }
+        match found_in {
+            // Drop the bucket once its last reminder is gone, so an empty entry
+            // cannot linger in the map and be walked on every tick.
+            Some((key, true)) => {
+                self.reminders.remove(&key);
+                Ok(())
+            }
+            Some((_, false)) => Ok(()),
+            None => Err(SchedulerError::NotFound(id.to_string())),
+        }
+    }
+
     /// Tick the scheduler, returning all events that should fire at or before `now`.
     pub fn tick(&mut self, now: Instant) -> Vec<SchedulerEvent> {
         let mut events = Vec::new();
@@ -363,6 +398,38 @@ mod tests {
         let events = sched.tick(e + Duration::from_secs(50));
         assert!(events.is_empty());
         assert_eq!(sched.reminder_count(), 1);
+    }
+
+    #[test]
+    fn test_reminder_list_and_cancel() {
+        let e = epoch();
+        let mut sched = Scheduler::with_epoch(e);
+        let soon = sched.add_reminder("soon".to_string(), None, e + Duration::from_secs(10));
+        let later = sched.add_reminder(
+            "later".to_string(),
+            Some("pty-3".to_string()),
+            e + Duration::from_secs(60),
+        );
+
+        let listed = sched.list_reminders(e);
+        assert_eq!(listed.len(), 2);
+        // soonest first, with the remaining time and the target both reported
+        assert_eq!(listed[0].0.id, soon);
+        assert_eq!(listed[0].1, Duration::from_secs(10));
+        assert_eq!(listed[1].0.session_id, Some("pty-3".to_string()));
+
+        assert!(sched.remove_reminder(&soon).is_ok());
+        assert_eq!(sched.reminder_count(), 1);
+        // cancelling the same id twice is an error, not a silent success
+        assert!(sched.remove_reminder(&soon).is_err());
+
+        // the cancelled one must not fire; the other still must
+        let events = sched.tick(e + Duration::from_secs(120));
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            SchedulerEvent::ReminderFired(r) => assert_eq!(r.id, later),
+            _ => panic!("expected a reminder"),
+        }
     }
 
     #[test]
