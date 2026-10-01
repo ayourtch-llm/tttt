@@ -3,6 +3,7 @@ mod attach;
 mod config;
 pub mod ctl;
 mod diag;
+mod injected_enter;
 mod reload;
 mod replay_tui;
 mod web;
