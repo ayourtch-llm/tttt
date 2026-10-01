@@ -310,7 +310,17 @@ impl<B: PtyBackend> PtySession<B> {
 
     /// Seconds since the session last produced any output.
     pub fn idle_seconds(&self) -> f64 {
-        self.last_output_time.elapsed().as_secs_f64()
+        self.idle_seconds_at(Instant::now())
+    }
+
+    /// Output silence at a caller-supplied event-loop time.
+    pub fn idle_seconds_at(&self, now: Instant) -> f64 {
+        now.saturating_duration_since(self.last_output_time).as_secs_f64()
+    }
+
+    /// Last input activity, shared by direct input and injected keys.
+    pub fn last_input_time(&self) -> Instant {
+        self.last_input_time
     }
 
     /// Seconds since the session last received any keyboard input.
