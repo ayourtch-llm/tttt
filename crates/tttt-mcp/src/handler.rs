@@ -878,6 +878,40 @@ impl SchedulerToolHandler {
         Ok(json!({"reminder_id": id}))
     }
 
+    fn handle_reminder_list(&self) -> Result<Value> {
+        let sched = self
+            .scheduler
+            .lock()
+            .map_err(|e| McpError::Protocol(e.to_string()))?;
+        let now = Instant::now();
+        let reminders: Vec<Value> = sched
+            .list_reminders(now)
+            .iter()
+            .map(|(r, remaining)| {
+                json!({
+                    "id": r.id,
+                    "message": r.message,
+                    "session_id": r.session_id,
+                    "fires_in_seconds": remaining.as_secs(),
+                })
+            })
+            .collect();
+        Ok(json!(reminders))
+    }
+
+    fn handle_reminder_cancel(&self, args: &Value) -> Result<Value> {
+        let reminder_id = args["reminder_id"]
+            .as_str()
+            .ok_or_else(|| McpError::InvalidParams("reminder_id required".to_string()))?;
+
+        let mut sched = self
+            .scheduler
+            .lock()
+            .map_err(|e| McpError::Protocol(e.to_string()))?;
+        sched.remove_reminder(reminder_id)?;
+        Ok(json!({"status": "ok"}))
+    }
+
     fn handle_cron_create(&self, args: &Value) -> Result<Value> {
         let expression = args["expression"]
             .as_str()
@@ -938,6 +972,8 @@ impl ToolHandler for SchedulerToolHandler {
     fn handle_tool_call(&mut self, name: &str, args: &Value) -> Result<Value> {
         match name {
             "tttt_reminder_set" => self.handle_reminder_set(args),
+            "tttt_reminder_list" => self.handle_reminder_list(),
+            "tttt_reminder_cancel" => self.handle_reminder_cancel(args),
             "tttt_cron_create" => self.handle_cron_create(args),
             "tttt_cron_list" => self.handle_cron_list(),
             "tttt_cron_delete" => self.handle_cron_delete(args),
