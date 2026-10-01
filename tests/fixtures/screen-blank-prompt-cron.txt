@@ -1,0 +1,20 @@
+❯ [chat] [chat #ops] user: Oh ok, got it!         
+
+⏺ user says "Oh ok!" which acknowledges the plan,
+  so there's nothing to answer. I'll post in
+  #ops once the agent finishes the new build.
+
+✻ Sautéed for 2s · done 2:10 PM · 1 shell still
+  running
+
+──────────────────────────────────────────────────
+❯ 
+  [CRON cron-2]: [CRON hourly] (1) Run `log-read
+  status --count`: if N>0 run `log-read status`
+  and act on the notes (set reminders for any
+  times he names); if exit is not 0, report it.
+  (2) bench: check a running bench arm (stall
+  >60 min → R1 recovery). Post to chat via #ops
+  only on a milestone.
+──────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 shell

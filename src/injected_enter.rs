@@ -369,6 +369,70 @@ mod tests {
         }
     }
 
+    const OBSERVED_SCREEN: &str = include_str!("../tests/fixtures/screen-blank-prompt-cron.txt");
+    const OBSERVED_INJECTION: &str = concat!(
+        "[ENTER][CRON cron-2]: [CRON hourly] (1) Run `log-read ",
+        "status --count`: if N>0 run `log-read status` ",
+        "and act on the notes (set reminders for any ",
+        "times he names); if exit is not 0, report it. ",
+        "(2) bench: check a running bench arm (stall ",
+        ">60 min → R1 recovery). Post to chat via #ops ",
+        "only on a milestone."
+    );
+
+    fn observed_screen_harness(screen: &str) -> Harness {
+        let mut h = Harness::new(OBSERVED_INJECTION);
+        let session = h.sessions.get_mut("target").unwrap();
+        session.resize(50, 24).unwrap();
+        // The capture is plain screen rows, so replay with CRLF. tttt reports
+        // zero-based cursor coordinates; CUP uses one-based coordinates.
+        session.backend_mut().io.queue_output(
+            format!("\x1b[2J\x1b[H{}\x1b[23;19H", screen.replace('\n', "\r\n")).as_bytes(),
+        );
+        session.pump().unwrap();
+        assert_eq!(session.cursor_position(), (22, 18));
+        assert_eq!(session.screen().size(), (50, 24));
+        let rendered: Vec<_> = session.screen().screen().rows(0, 50).collect();
+        for (row, line) in screen.lines().enumerate() {
+            assert_eq!(rendered[row], line, "captured row {row}");
+        }
+        h
+    }
+
+    #[test]
+    fn observed_screen_blank_prompt_matches_and_retries() {
+        let mut h = observed_screen_harness(OBSERVED_SCREEN);
+        assert!(input_matches(
+            h.sessions.get("target").unwrap(),
+            &h.pending[0].text,
+        ));
+        h.tick(100);
+        assert_eq!(h.backend().enters, 1);
+        assert!(!h.backend().submitted);
+        h.tick(1100);
+        assert_eq!(h.backend().enters, 2);
+        assert!(h.backend().submitted);
+        assert_eq!(h.logger.0.len(), 1);
+        assert!(h.logger.0[0].data.starts_with(b"[ENTER-RETRY 1]"));
+    }
+
+    #[test]
+    fn observed_screen_blank_prompt_with_different_text_does_not_retry() {
+        let screen = OBSERVED_SCREEN.replace("[CRON cron-2]", "[CRON cron-9]");
+        let mut h = observed_screen_harness(&screen);
+        assert!(!input_matches(
+            h.sessions.get("target").unwrap(),
+            &h.pending[0].text,
+        ));
+        for ms in [100, 1100, 3100, 7100, 8100] {
+            h.tick(ms);
+        }
+        assert_eq!(h.backend().enters, 1);
+        assert!(!h.backend().submitted);
+        assert!(h.pending.is_empty());
+        assert!(h.logger.0.is_empty());
+    }
+
     #[test]
     fn ignored_first_enter_is_retried_and_submits() {
         let mut h = Harness::new("[CRON job-7]: check the pending work");
