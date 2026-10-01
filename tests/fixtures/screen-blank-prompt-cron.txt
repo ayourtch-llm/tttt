@@ -8,7 +8,7 @@
   running
 
 ──────────────────────────────────────────────────
-❯ 
+❯ 
   [CRON cron-2]: [CRON hourly] (1) Run `log-read
   status --count`: if N>0 run `log-read status`
   and act on the notes (set reminders for any

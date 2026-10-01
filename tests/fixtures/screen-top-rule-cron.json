@@ -1,0 +1,8 @@
+{
+  "cursor": [
+    3,
+    26
+  ],
+  "screen": "\n\n\n──────────────────────────────────────────────────\n❯ \n  [CRON cron-1]: [livecheck] This is a test of\n  cron delivery. Reply with only the single word\n  OK and do nothing else: do not run any tools,\n  do not read any files, do not send any\n  messages. The rest of this line is padding so\n  the injected text is about as long as the real\n  hourly cron that got stuck twice daily in the\n  worker session.\n──────────────────────────────────────────────────",
+  "cron_command": "[livecheck] This is a test of cron delivery. Reply with only the single word OK and do nothing else: do not run any tools, do not read any files, do not send any messages. The rest of this line is padding so the injected text is about as long as the real hourly cron that got stuck twice daily in the worker session."
+}

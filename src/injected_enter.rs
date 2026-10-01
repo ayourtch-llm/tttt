@@ -408,22 +408,92 @@ mod tests {
     );
 
     fn observed_screen_harness(screen: &str) -> Harness {
-        let mut h = Harness::new(OBSERVED_INJECTION);
+        captured_screen_harness(screen, OBSERVED_INJECTION, (22, 18))
+    }
+
+    fn captured_screen_harness(screen: &str, injection: &str, cursor: (u16, u16)) -> Harness {
+        let mut h = Harness::new(injection);
         let session = h.sessions.get_mut("target").unwrap();
         session.resize(50, 24).unwrap();
         // The capture is plain screen rows, so replay with CRLF. tttt reports
         // zero-based cursor coordinates; CUP uses one-based coordinates.
         session.backend_mut().io.queue_output(
-            format!("\x1b[2J\x1b[H{}\x1b[23;19H", screen.replace('\n', "\r\n")).as_bytes(),
+            format!(
+                "\x1b[2J\x1b[H{}\x1b[{};{}H",
+                screen.replace('\n', "\r\n"),
+                cursor.0 + 1,
+                cursor.1 + 1,
+            )
+            .as_bytes(),
         );
         session.pump().unwrap();
-        assert_eq!(session.cursor_position(), (22, 18));
+        assert_eq!(session.cursor_position(), cursor);
         assert_eq!(session.screen().size(), (50, 24));
         let rendered: Vec<_> = session.screen().screen().rows(0, 50).collect();
         for (row, line) in screen.lines().enumerate() {
             assert_eq!(rendered[row], line, "captured row {row}");
         }
         h
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CapturedComposer {
+        cursor: (u16, u16),
+        screen: String,
+        cron_command: String,
+    }
+
+    fn live_composer_capture() -> CapturedComposer {
+        let capture: CapturedComposer =
+            serde_json::from_str(include_str!("../tests/fixtures/screen-top-rule-cron.json"))
+                .unwrap();
+        assert_eq!(capture.cursor, (3, 26));
+        assert_eq!(capture.screen.lines().nth(4), Some("❯\u{a0}"));
+        assert!(is_input_rule(capture.screen.lines().nth(3).unwrap()));
+        capture
+    }
+
+    #[test]
+    fn live_screen_nbsp_prompt_and_top_rule_cursor_match_and_retry() {
+        let capture = live_composer_capture();
+        let injection = format!("[ENTER][CRON cron-1]: {}", capture.cron_command);
+        let mut h = captured_screen_harness(&capture.screen, &injection, capture.cursor);
+        assert!(input_matches(
+            h.sessions.get("target").unwrap(),
+            &h.pending[0].text,
+        ));
+        h.tick(100);
+        assert_eq!(h.backend().enters, 1);
+        assert!(!h.backend().submitted);
+        h.tick(1100);
+        assert_eq!(h.backend().enters, 2);
+        assert!(h.backend().submitted);
+        assert_eq!(h.logger.0.len(), 1);
+        assert!(h.logger.0[0].data.starts_with(b"[ENTER-RETRY 1]"));
+    }
+
+    #[test]
+    fn live_screen_top_rule_cursor_with_different_text_does_not_retry() {
+        let capture = live_composer_capture();
+        let injection = format!("[ENTER][CRON cron-1]: {}", capture.cron_command);
+        // Preserve the cron ID, layout, and cursor; change only the command.
+        let screen = capture.screen.replace("This is a test", "That is a test");
+        let mut h = captured_screen_harness(&screen, &injection, capture.cursor);
+        assert!(!input_matches(
+            h.sessions.get("target").unwrap(),
+            &h.pending[0].text,
+        ));
+        for ms in [100, 1100, 3100, 7100, 8100] {
+            h.tick(ms);
+        }
+        assert_eq!(h.backend().enters, 1);
+        assert!(!h.backend().submitted);
+        assert!(h.pending.is_empty());
+        assert_eq!(h.logger.0.len(), 1);
+        assert_eq!(
+            h.logger.0[0].data,
+            b"[ENTER-VERIFY] no matching input, stopping (0 retries)"
+        );
     }
 
     #[test]
@@ -467,7 +537,7 @@ mod tests {
 
     #[test]
     fn observed_screen_with_leading_whitespace_lines_matches_and_retries() {
-        let screen = OBSERVED_SCREEN.replace("❯ \n", "❯   \n    \n  \n");
+        let screen = OBSERVED_SCREEN.replace("❯\u{a0}\n", "❯\u{a0}  \n    \n  \n");
         let mut h = observed_screen_harness(&screen);
         assert!(input_matches(
             h.sessions.get("target").unwrap(),
