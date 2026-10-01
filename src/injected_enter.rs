@@ -501,6 +501,58 @@ mod tests {
     }
 
     #[test]
+    fn framed_composer_matches_independently_of_cursor_position_and_visibility() {
+        let capture = live_composer_capture();
+        let injection = format!("[ENTER][CRON cron-1]: {}", capture.cron_command);
+        for separator in [' ', '\u{a0}'] {
+            let screen = capture.screen.replace("❯\u{a0}", &format!("❯{separator}"));
+            for cursor in [
+                (0, 0),   // History above the frame.
+                (3, 26),  // Top rule, as captured.
+                (4, 0),   // Prompt glyph.
+                (4, 1),   // Prompt separator, before the input column.
+                (4, 49),  // Blank prompt line after the input column.
+                (5, 0),   // Input continuation, before the input column.
+                (13, 49), // Bottom rule.
+                (23, 0),  // Below the frame.
+            ] {
+                for hidden in [false, true] {
+                    let mut h = captured_screen_harness(&screen, &injection, cursor);
+                    let session = h.sessions.get_mut("target").unwrap();
+                    if hidden {
+                        session.inject_screen_data(b"\x1b[?25l");
+                    }
+                    assert!(
+                        input_matches(session, &h.pending[0].text),
+                        "separator {separator:?}, cursor {cursor:?}, hidden={hidden}"
+                    );
+                    h.tick(100);
+                    h.tick(1100);
+                    assert_eq!(h.backend().enters, 2);
+                    assert!(h.backend().submitted);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_frame_with_cursor_above_prompt_does_not_retry() {
+        let text = "[CRON job-7]: check the pending work";
+        let rule = "────────────────────";
+        for separator in [' ', '\u{a0}'] {
+            for (top, bottom) in [("", ""), (rule, ""), ("", rule)] {
+                let screen = format!("History\n{top}\n❯{separator}{text}\n{bottom}");
+                let mut h = captured_screen_harness(&screen, text, (0, 0));
+                assert!(!input_matches(h.sessions.get("target").unwrap(), text));
+                h.tick(100);
+                h.tick(1100);
+                assert_eq!(h.backend().enters, 1);
+                assert!(h.pending.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn observed_screen_blank_prompt_matches_and_retries() {
         let mut h = observed_screen_harness(OBSERVED_SCREEN);
         assert!(input_matches(
