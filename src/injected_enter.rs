@@ -709,6 +709,18 @@ mod tests {
         assert!(!h.pending.is_empty());
         h.tick(3100);
         assert_eq!(h.backend().enters, 2, "late echo has now settled");
+
+        h.sessions.get_mut("target").unwrap().pump().unwrap();
+        h.tick(7100);
+        h.tick(60000);
+        assert_eq!(h.backend().enters, 2);
+        assert!(h.pending.is_empty());
+        assert_eq!(h.logger.0.len(), 2);
+        // The busy check consumed an opportunity but did not send a retry.
+        assert_eq!(
+            h.logger.0[1].data,
+            b"[ENTER-VERIFY] no matching input, stopping (1 retries)"
+        );
     }
 
     #[test]
