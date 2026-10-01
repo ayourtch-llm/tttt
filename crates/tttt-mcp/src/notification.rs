@@ -27,6 +27,12 @@ pub struct NotificationWatcher {
     /// Snapshot of screen content at last check; None means first check (snapshot only).
     #[serde(skip)]
     pub last_screen: Option<String>,
+    /// Also match the first screen seen, instead of only snapshotting it.
+    /// For readiness watchers set up at startup: the agent can paint its ready
+    /// screen before the first check, and a snapshot-only first check would
+    /// then treat the pattern as old and never fire.
+    #[serde(default)]
+    pub match_first_screen: bool,
 }
 
 /// Registry of notification watchers.
@@ -63,6 +69,31 @@ impl NotificationRegistry {
         inject_session_id: String,
         one_shot: bool,
     ) -> Result<String, String> {
+        self.add_watcher_inner(watch_session_id, pattern, inject_text, inject_session_id, one_shot, false)
+    }
+
+    /// Like `add_watcher`, but the first check matches the whole screen rather
+    /// than only snapshotting it, so a pattern already on screen fires.
+    pub fn add_watcher_matching_first_screen(
+        &mut self,
+        watch_session_id: String,
+        pattern: &str,
+        inject_text: String,
+        inject_session_id: String,
+        one_shot: bool,
+    ) -> Result<String, String> {
+        self.add_watcher_inner(watch_session_id, pattern, inject_text, inject_session_id, one_shot, true)
+    }
+
+    fn add_watcher_inner(
+        &mut self,
+        watch_session_id: String,
+        pattern: &str,
+        inject_text: String,
+        inject_session_id: String,
+        one_shot: bool,
+        match_first_screen: bool,
+    ) -> Result<String, String> {
         let compiled = regex::Regex::new(pattern)
             .map_err(|e| format!("invalid regex '{}': {}", pattern, e))?;
         let id = format!("notify-{}", self.next_id);
@@ -77,6 +108,7 @@ impl NotificationRegistry {
             one_shot,
             fired: false,
             last_screen: None,
+            match_first_screen,
         });
         Ok(id)
     }
@@ -106,8 +138,10 @@ impl NotificationRegistry {
                 continue;
             }
 
-            // On first check, take a snapshot and skip matching.
+            // On first check, take a snapshot and skip matching, unless the
+            // watcher asked to match the first screen (then everything is "new").
             let prev = match watcher.last_screen.take() {
+                None if watcher.match_first_screen => String::new(),
                 None => {
                     watcher.last_screen = Some(screen_content.to_string());
                     continue;
@@ -292,6 +326,29 @@ mod tests {
         let inj = reg.check_session("pty-1", "All right\nNext slide\nOkay");
         assert!(inj.is_empty());
         assert_eq!(reg.watcher_count(), 1); // still waiting
+    }
+
+    #[test]
+    fn test_match_first_screen_fires_on_pattern_already_present() {
+        let mut reg = NotificationRegistry::new();
+        reg.add_watcher_matching_first_screen("pty-1".into(), "bypass permissions on", "go".into(), "root".into(), true)
+            .unwrap();
+        // Ready screen already painted before the first check.
+        let inj = reg.check_session("pty-1", "banner\n❯ \n⏵⏵ bypass permissions on\n");
+        assert_eq!(inj.len(), 1);
+        assert_eq!(inj[0].text, "go");
+        // One-shot: a later redraw does not fire again.
+        assert!(reg.check_session("pty-1", "x\n⏵⏵ bypass permissions on\n").is_empty());
+    }
+
+    #[test]
+    fn test_match_first_screen_waits_when_pattern_absent() {
+        let mut reg = NotificationRegistry::new();
+        reg.add_watcher_matching_first_screen("pty-1".into(), "bypass permissions on", "go".into(), "root".into(), true)
+            .unwrap();
+        assert!(reg.check_session("pty-1", "loading...").is_empty());
+        let inj = reg.check_session("pty-1", "banner\n⏵⏵ bypass permissions on\n");
+        assert_eq!(inj.len(), 1);
     }
 
     #[test]

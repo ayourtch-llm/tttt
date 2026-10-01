@@ -1316,7 +1316,7 @@ impl App {
     /// waiting for input, avoiding false triggers during startup rendering.
     pub fn setup_auto_continue(&self, root_session_id: &str) {
         let mut notif = self.notifications.lock().unwrap();
-        if let Err(e) = notif.add_watcher(
+        if let Err(e) = notif.add_watcher_matching_first_screen(
             root_session_id.to_string(),
             r"\? for shortcuts",
             "Continue from where you left off.\n".to_string(),
@@ -1347,7 +1347,7 @@ impl App {
         // "? for shortcuts" is replaced by the bypass-permissions warning when
         // claude runs with --dangerously-skip-permissions, so accept either.
         let mut notif = self.notifications.lock().unwrap();
-        if let Err(e) = notif.add_watcher(
+        if let Err(e) = notif.add_watcher_matching_first_screen(
             root_session_id.to_string(),
             r"\? for shortcuts|bypass permissions on",
             instruction,
