@@ -3103,6 +3103,7 @@ impl App {
             &mut self.sessions.lock().unwrap(),
             &mut self.logger,
             Instant::now(),
+            |id| self.pending_user_input.get(id).is_some_and(|input| !input.is_empty()),
         );
     }
 

@@ -53,53 +53,115 @@ impl PendingEnter {
     }
 }
 
-/// Require an identifiable prompt connected to the cursor, not a match in
-/// history. Unknown layouts and input whose prefix has scrolled away fail closed.
+/// Column after a known prompt, including an empty prompt whose trailing space
+/// was trimmed by VT100. Empty prompts must still separate input from history.
+fn prompt_input_column(line: &str) -> Option<u16> {
+    let trimmed = line.trim_start_matches(' ');
+    let mut chars = trimmed.chars();
+    if !matches!(chars.next()?, '❯' | '›' | '>' | '$' | '#')
+        || !matches!(chars.next(), None | Some(' '))
+    {
+        return None;
+    }
+    Some(((line.len() - trimmed.len()) as u16).saturating_add(2))
+}
+
+fn is_input_rule(line: &str) -> bool {
+    let line = line.trim();
+    line.chars().count() >= 4 && line.chars().all(|c| c == '─' || c == '━')
+}
+
+fn normalized_input(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Require the latest identifiable prompt connected to the cursor, or the last
+/// framed composer (which can hide the cursor or leave it on a footer). Unknown
+/// layouts and input whose identifying prefix has scrolled away fail closed.
 fn input_matches<B: PtyBackend>(session: &PtySession<B>, text: &str) -> bool {
     let mut screen = session.screen().screen().clone();
     screen.set_scrollback(0);
-    if screen.hide_cursor() || session.synchronized_output() {
+    if session.synchronized_output() {
         return false;
     }
     let (row, col) = screen.cursor_position();
-    let (_, cols) = screen.size();
+    let (rows, cols) = screen.size();
     let lines: Vec<_> = screen.rows(0, cols).collect();
-    for start in (0..=row).rev() {
-        let line = &lines[usize::from(start)];
-        let trimmed = line.trim_start_matches(' ');
-        let prompt = ["❯ ", "› ", "> ", "$ ", "# "]
+    let Some(start) = lines
+        .iter()
+        .rposition(|line| prompt_input_column(line).is_some())
+    else {
+        return false;
+    };
+    let input_col = prompt_input_column(&lines[start]).unwrap();
+    if input_col >= cols || start > usize::from(row) {
+        return false;
+    }
+
+    let bottom = lines.iter().rposition(|line| is_input_rule(line));
+    let framed_end = bottom.and_then(|bottom| {
+        let top = lines[..bottom]
             .iter()
-            .find(|prompt| trimmed.starts_with(**prompt));
-        if let Some(prompt) = prompt {
-            let input_col = (line.len() - trimmed.len()) as u16 + 2;
-            if input_col >= cols || (start == row && col < input_col) {
-                return false;
-            }
-            // Render through the same key conversion and VT100 parser as the
-            // live screen. Scrollback preserves the first row of long messages.
-            let mut expected = ScreenBuffer::with_scrollback(cols - input_col, 2, text.len());
-            expected.process(&process_special_keys(text));
-            let history = expected.get_scrollback(usize::MAX);
-            let first_line = history.first().cloned().unwrap_or_else(|| {
-                expected
-                    .screen()
-                    .rows(0, cols - input_col)
-                    .next()
-                    .unwrap_or_default()
-            });
-            let prefix: String = first_line.trim().chars().take(40).collect();
-            return !prefix.is_empty() && trimmed[prompt.len()..].trim_start().starts_with(&prefix);
-        }
-        // Follow terminal soft wraps and indented TUI continuation rows only.
-        // Never cross a blank separator, output line, or another prompt.
-        if start == 0
-            || (!screen.row_wrapped(start - 1)
-                && (line.trim().is_empty() || !line.starts_with("  ")))
-        {
+            .rposition(|line| is_input_rule(line))?;
+        (top < start
+            && start < bottom
+            && lines[top + 1..start]
+                .iter()
+                .all(|line| line.trim().is_empty()))
+        .then_some(bottom - 1)
+    });
+    let end = if let Some(end) = framed_end {
+        end as u16
+    } else {
+        if screen.hide_cursor() || (start == usize::from(row) && col < input_col) {
             return false;
         }
+        for (continuation, line) in lines
+            .iter()
+            .enumerate()
+            .take(usize::from(row) + 1)
+            .skip(start + 1)
+        {
+            if !screen.row_wrapped((continuation - 1) as u16)
+                && (line.trim().is_empty() || !line.starts_with("  "))
+            {
+                return false;
+            }
+        }
+        row
+    };
+
+    // Include the prompt column: tabs and wide glyphs must render at the same
+    // columns as the real input. A normal screen height also avoids the VT100
+    // parser's single-row wrap edge case. Overflow loses the prefix and fails closed.
+    let mut expected = ScreenBuffer::with_scrollback(cols, rows.max(2), 0);
+    expected.process(&vec![b' '; usize::from(input_col)]);
+    expected.process(&process_special_keys(text));
+    let first_line = expected
+        .screen()
+        .rows(input_col, cols - input_col)
+        .next()
+        .unwrap_or_default();
+    let expected_text = normalized_input(&expected.contents());
+    let prefix: String = first_line.trim().chars().take(40).collect();
+    // A very narrow fragment such as "[CRON" is not a message identity.
+    if prefix.chars().count() < expected_text.chars().count().min(16) || prefix.is_empty() {
+        return false;
     }
-    false
+    let actual_first = screen
+        .rows(input_col, cols - input_col)
+        .nth(start)
+        .unwrap_or_default();
+    if !actual_first.trim_start().starts_with(&prefix) {
+        return false;
+    }
+    // Short messages must not match longer replacement drafts. For cursor-based
+    // multiline input, also distinguish continuations from indented output.
+    if expected_text.chars().count() <= 40 || (framed_end.is_none() && end as usize > start) {
+        let actual = screen.contents_between(start as u16, input_col, end, cols);
+        return normalized_input(&actual) == expected_text;
+    }
+    true
 }
 
 pub(crate) fn drain_delayed_enters<B: PtyBackend>(
@@ -107,6 +169,7 @@ pub(crate) fn drain_delayed_enters<B: PtyBackend>(
     sessions: &mut SessionManager<B>,
     logger: &mut impl LogSink,
     now: Instant,
+    input_waiting: impl Fn(&str) -> bool,
 ) {
     pending.retain_mut(|enter| {
         if now < enter.fire_at {
@@ -126,7 +189,8 @@ pub(crate) fn drain_delayed_enters<B: PtyBackend>(
         let Some(quiet_since) = enter.quiet_since else {
             // Preserve the existing first Enter, including its 100 ms delay.
             // If ownership was already lost, never arm verification for it.
-            let owned = session.last_input_time() == enter.input_at;
+            let owned =
+                session.last_input_time() == enter.input_at && !input_waiting(&enter.session_id);
             if session.send_keys("[ENTER]").is_err() {
                 enter.log(
                     logger,
@@ -147,7 +211,7 @@ pub(crate) fn drain_delayed_enters<B: PtyBackend>(
             enter.give_up(logger, "target session exited");
             return false;
         }
-        if session.last_input_time() != enter.input_at {
+        if session.last_input_time() != enter.input_at || input_waiting(&enter.session_id) {
             enter.give_up(logger, "intervening input");
             return false;
         }
@@ -220,7 +284,10 @@ mod tests {
                 }
             } else {
                 self.io.queue_output("\x1b[2J\x1b[H❯ ".as_bytes());
-                self.io.queue_output(data);
+                // Scheduler injection starts with a separate leading Enter.
+                // The delayed standalone Enter is the one this script ignores.
+                self.io
+                    .queue_output(data.strip_prefix(b"\r").unwrap_or(data));
             }
             Ok(())
         }
@@ -293,6 +360,7 @@ mod tests {
                 &mut self.sessions,
                 &mut self.logger,
                 self.start + Duration::from_millis(ms),
+                |_| false,
             );
         }
 
@@ -493,7 +561,7 @@ mod tests {
 
     #[test]
     fn indented_multiline_input_matches_without_using_footer() {
-        let text = "[REMINDER: check the pending work and report progress]";
+        let text = "[REMINDER: check the pending work and report progress]\r\n  continued input";
         let mut h = Harness::new(text);
         let session = h.sessions.get_mut("target").unwrap();
         session.inject_screen_data(
@@ -541,5 +609,152 @@ mod tests {
             assert_eq!(h.logger.0.len(), 1);
             assert!(h.logger.0[0].data.starts_with(b"[ENTER-GAVE-UP]"));
         }
+    }
+
+    #[test]
+    fn cursor_in_history_cannot_identify_the_current_input() {
+        let text = "[CRON job-7]: check the pending work";
+        let mut h = Harness::new(text);
+        let session = h.sessions.get_mut("target").unwrap();
+        session.inject_screen_data(
+            format!("\x1b[2J\x1b[H❯ {text}\r\nAccepted\r\n❯ human draft\x1b[1;20H").as_bytes(),
+        );
+        assert!(!input_matches(session, text));
+    }
+
+    #[test]
+    fn short_message_must_match_the_whole_input() {
+        let text = "[REMINDER: ok]";
+        let mut h = Harness::new(text);
+        let session = h.sessions.get_mut("target").unwrap();
+        session.inject_screen_data(format!("\x1b[2J\x1b[H❯ {text} human draft").as_bytes());
+        assert!(!input_matches(session, text));
+    }
+
+    #[test]
+    fn framed_composer_can_identify_input_with_a_hidden_cursor() {
+        let text = "[CRON job-7]: check the pending work";
+        let mut h = Harness::new(text);
+        let session = h.sessions.get_mut("target").unwrap();
+        session.inject_screen_data(format!(
+            "\x1b[2J\x1b[HOld conversation\r\n────────────────────\r\n❯ {text}\r\n────────────────────\r\n  status footer\x1b[?25l"
+        ).as_bytes());
+        assert!(input_matches(session, text));
+        h.tick(100);
+        h.tick(1100);
+        assert_eq!(h.backend().enters, 2);
+    }
+
+    #[test]
+    fn framed_history_does_not_identify_a_different_current_composer() {
+        let text = "[CRON job-7]: check the pending work";
+        let mut h = Harness::new(text);
+        let session = h.sessions.get_mut("target").unwrap();
+        session.inject_screen_data(format!(
+            "\x1b[2J\x1b[H❯ {text}\r\nAccepted\r\n────────────────────\r\n❯ different input\r\n────────────────────\r\n  status footer\x1b[?25l"
+        ).as_bytes());
+        assert!(!input_matches(session, text));
+    }
+
+    #[test]
+    fn matching_uses_the_actual_prompt_column_for_tabs() {
+        let text = r"[REMINDER: \tcheck]";
+        let mut h = Harness::new(text);
+        assert!(input_matches(h.sessions.get("target").unwrap(), text));
+        h.tick(100);
+        h.tick(1100);
+        assert_eq!(h.backend().enters, 2);
+    }
+
+    #[test]
+    fn a_narrow_fragment_is_not_a_distinctive_prefix() {
+        let text = "[CRON job-7]: check the pending work";
+        let mut h = Harness::new(text);
+        let session = h.sessions.get_mut("target").unwrap();
+        session.resize(10, 24).unwrap();
+        session.inject_screen_data(format!("\x1b[2J\x1b[H❯ {text}").as_bytes());
+        assert!(!input_matches(session, text));
+    }
+
+    #[test]
+    fn backpressured_keyboard_input_blocks_retry_before_a_pty_write() {
+        let mut h = Harness::new("[CRON job-7]: check the pending work");
+        h.tick(100);
+        drain_delayed_enters(
+            &mut h.pending,
+            &mut h.sessions,
+            &mut h.logger,
+            h.start + Duration::from_millis(1100),
+            |id| id == "target",
+        );
+        assert_eq!(h.backend().enters, 1);
+        assert!(h.pending.is_empty());
+        assert!(h.logger.0[0]
+            .data
+            .starts_with(b"[ENTER-GAVE-UP] intervening input"));
+    }
+
+    #[test]
+    fn indented_output_is_not_a_continuation_of_pending_input() {
+        let text = "[CRON job-7]: check the pending work and report any progress";
+        let mut h = Harness::new(text);
+        let session = h.sessions.get_mut("target").unwrap();
+        session.inject_screen_data(
+            format!("\x1b[2J\x1b[H❯ {text}\r\n  accepted and working").as_bytes(),
+        );
+        assert!(!input_matches(session, text));
+    }
+
+    #[test]
+    fn scheduler_leading_enter_is_excluded_from_message_identity() {
+        for text in [
+            "[ENTER][CRON job-7]: check the pending work",
+            "[ENTER][REMINDER: check the pending work]",
+        ] {
+            let mut h = Harness::new(text);
+            h.tick(100);
+            h.tick(1100);
+            assert_eq!(h.backend().enters, 2);
+            assert!(h.backend().submitted);
+        }
+    }
+
+    #[test]
+    fn failed_initial_enter_keeps_existing_drop_event_and_does_not_arm_retries() {
+        for gone in [false, true] {
+            let mut h = Harness::new("[CRON job-7]: check the pending work");
+            if gone {
+                h.sessions = SessionManager::new();
+            } else {
+                h.sessions
+                    .get_mut("target")
+                    .unwrap()
+                    .backend_mut()
+                    .fail_writes = true;
+            }
+            h.tick(100);
+            h.tick(1100);
+            assert!(h.pending.is_empty());
+            assert_eq!(h.logger.0.len(), 1);
+            assert!(h.logger.0[0].data.starts_with(b"[NOTIFICATION-DROPPED]"));
+        }
+    }
+
+    #[test]
+    fn a_late_event_loop_tick_does_not_burst_retries() {
+        let mut h = Harness::new("[CRON job-7]: check the pending work");
+        h.sessions
+            .get_mut("target")
+            .unwrap()
+            .backend_mut()
+            .ignore_enters = usize::MAX;
+        h.tick(100);
+        h.tick(10000);
+        assert_eq!(h.backend().enters, 2);
+        h.tick(10000);
+        h.tick(11999);
+        assert_eq!(h.backend().enters, 2);
+        h.tick(12000);
+        assert_eq!(h.backend().enters, 3);
     }
 }
