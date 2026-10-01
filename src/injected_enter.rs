@@ -234,6 +234,13 @@ pub(crate) fn drain_delayed_enters<B: PtyBackend>(
         if !input_matches(session, &enter.text) {
             // This includes successful submission: history is never sufficient
             // evidence to send another Enter. Do not claim submission succeeded.
+            enter.log(
+                logger,
+                format!(
+                    "[ENTER-VERIFY] no matching input, stopping ({} retries)",
+                    enter.retries
+                ),
+            );
             return false;
         }
         if enter.checks == RETRY_DELAYS.len() {
