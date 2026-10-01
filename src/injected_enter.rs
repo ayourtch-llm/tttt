@@ -148,17 +148,33 @@ fn input_matches<B: PtyBackend>(session: &PtySession<B>, text: &str) -> bool {
     if prefix.chars().count() < expected_text.chars().count().min(16) || prefix.is_empty() {
         return false;
     }
-    let actual_first = screen
-        .rows(input_col, cols - input_col)
-        .nth(start)
-        .unwrap_or_default();
+    let mut content_start = start;
+    let mut input_lines = screen.rows(input_col, cols - input_col).skip(start);
+    let mut actual_first = input_lines.next().unwrap_or_default();
+    if let Some(end) = framed_end {
+        // A leading Enter in a pasted injection can leave the prompt empty.
+        // Only a frame lets us skip blank lines without entering output/history.
+        while actual_first.trim().is_empty() && content_start < end {
+            content_start += 1;
+            if !screen
+                .rows(0, input_col)
+                .nth(content_start)
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                return false;
+            }
+            actual_first = input_lines.next().unwrap_or_default();
+        }
+    }
     if !actual_first.trim_start().starts_with(&prefix) {
         return false;
     }
     // Short messages must not match longer replacement drafts. For cursor-based
     // multiline input, also distinguish continuations from indented output.
     if expected_text.chars().count() <= 40 || (framed_end.is_none() && end as usize > start) {
-        let actual = screen.contents_between(start as u16, input_col, end, cols);
+        let actual = screen.contents_between(content_start as u16, input_col, end, cols);
         return normalized_input(&actual) == expected_text;
     }
     true
@@ -244,7 +260,7 @@ pub(crate) fn drain_delayed_enters<B: PtyBackend>(
             );
         }
         enter.checks += 1;
-        enter.quiet_since = Some(Instant::now());
+        enter.quiet_since = Some(now);
         enter.fire_at = now
             + RETRY_DELAYS
                 .get(enter.checks)
@@ -355,11 +371,15 @@ mod tests {
         }
 
         fn tick(&mut self, ms: u64) {
+            self.tick_at(self.start + Duration::from_millis(ms));
+        }
+
+        fn tick_at(&mut self, now: Instant) {
             drain_delayed_enters(
                 &mut self.pending,
                 &mut self.sessions,
                 &mut self.logger,
-                self.start + Duration::from_millis(ms),
+                now,
                 |_| false,
             );
         }
@@ -574,11 +594,16 @@ mod tests {
     fn continuous_output_is_bounded_without_any_retry() {
         let mut h = Harness::new("[CRON job-7]: check the pending work");
         h.tick(100);
-        for ms in [1100, 3100, 7100, 8100] {
+        for _ in 0..4 {
             let session = h.sessions.get_mut("target").unwrap();
             session.backend_mut().io.queue_output(b"\x1b[0m");
             session.pump().unwrap();
-            h.tick(ms);
+            // Pump timestamps use the real clock. Accelerate only the deadline
+            // so every redraw occurs after the previous quiet interval began.
+            let now = Instant::now();
+            h.pending[0].fire_at = now;
+            h.tick_at(now);
+            assert_eq!(h.backend().enters, 1);
         }
         assert_eq!(h.backend().enters, 1);
         assert!(h.pending.is_empty());
