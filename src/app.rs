@@ -3614,6 +3614,150 @@ fn copy_to_clipboard_osc52(text: &str) -> ClipboardResult {
 mod tests {
     use super::*;
 
+    // Construct only in-memory state, without terminal modes or listeners.
+    fn viewer_test_app() -> App {
+        let config = Config::default();
+        let display_config = config.display_config();
+        let (cols, rows) = (80, 24);
+        let (pty_cols, pty_rows) = (80, 24);
+        let terminal = Terminal::with_options(
+            CrosstermBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, cols, rows)),
+            },
+        )
+        .unwrap();
+        App {
+            sessions: Arc::new(Mutex::new(SessionManager::with_max_sessions(
+                config.max_sessions,
+            ))),
+            input_parser: InputParser::new(display_config),
+            pty_dims: (pty_cols, pty_rows),
+            terminal,
+            logger: MultiLogger::new(),
+            sqlite_logger: None,
+            scheduler: Arc::new(Mutex::new(Scheduler::new())),
+            notifications: Arc::new(Mutex::new(NotificationRegistry::new())),
+            scratchpad: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            sidebar_messages: Arc::new(Mutex::new(Vec::new())),
+            sidebar_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_state: Arc::new(tttt_mcp::TuiState::new()),
+            active_session: None,
+            session_order: Vec::new(),
+            visible_sessions: Vec::new(),
+            screen_cols: cols,
+            screen_rows: rows,
+            viewer_listener: None,
+            viewer_clients: Vec::new(),
+            socket_path: None,
+            mcp_listener: None,
+            mcp_socket_path: None,
+            server_render_dirty: false,
+            last_root_screen: None,
+            first_dirty_time: None,
+            pending_injection_queue: std::collections::VecDeque::new(),
+            last_injection_time: None,
+            last_pty_data_time: None,
+            reload_requested: false,
+            restart_root_requested: false,
+            server_start_time: Instant::now(),
+            showing_help: false,
+            selection: None,
+            scroll_offset: 0,
+            selection_scroll_base: 0,
+            ctrl_c_hint_until: None,
+            ctrl_c_hint_message: None,
+            last_session_snapshot: Vec::new(),
+            deferred_scheduler_events: Vec::new(),
+            pending_delayed_enters: Vec::new(),
+            pending_user_input: std::collections::HashMap::new(),
+            context_refresh_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            startup_messages: Vec::new(),
+            web_status: None,
+            web_url: None,
+            web_handle: None,
+            web_dialog: None,
+            config,
+        }
+    }
+
+    #[test]
+    fn stalled_viewer_update_is_bounded_and_releases_sessions() {
+        use std::io::{Read, Write};
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let mut app = viewer_test_app();
+        use std::os::fd::IntoRawFd;
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let _slave = pty.slave;
+        let backend = tttt_pty::RestoredPty::from_raw_fd(pty.master.into_raw_fd(), None).unwrap();
+        let session = PtySession::new(
+            "test".into(),
+            AnyPty::Restored(backend),
+            "test".into(),
+            80,
+            24,
+        );
+        app.sessions.lock().unwrap().add_session(session).unwrap();
+        let sessions = app.sessions.clone();
+        let (mut stalled, peer) = UnixStream::pair().unwrap();
+        stalled.set_nonblocking(true).unwrap();
+        // Fill the send buffer before updating, without ever reading from peer.
+        loop {
+            match stalled.write(&[0; 4096]) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("prefill failed: {e}"),
+            }
+        }
+        let (healthy, mut reader) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        for stream in [stalled, healthy] {
+            let mut viewer = ViewerClient::new(stream, 80, 24, 0);
+            viewer.active_session = Some("test".into());
+            app.viewer_clients.push(viewer);
+        }
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let start = Instant::now();
+            started_tx.send(()).unwrap();
+            app.update_viewers();
+            done_tx.send(start.elapsed()).unwrap();
+            app.viewer_clients
+                .iter()
+                .map(|v| v.connected)
+                .collect::<Vec<_>>()
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let sessions_available = sessions.try_lock().is_ok();
+        let elapsed = done_rx.recv_timeout(Duration::from_secs(1));
+        // Release the old implementation on failure so the red test cannot hang.
+        peer.shutdown(Shutdown::Both).unwrap();
+        drop(peer);
+        let connected = worker.join().unwrap();
+        assert!(
+            elapsed.is_ok(),
+            "update_viewers exceeded the one-second budget"
+        );
+        assert!(
+            sessions_available,
+            "sessions lock held during stalled viewer I/O"
+        );
+        assert_eq!(connected, vec![false, true]);
+        let mut len = [0; 4];
+        reader.read_exact(&mut len).unwrap();
+        let mut body = vec![0; u32::from_be_bytes(len) as usize];
+        reader.read_exact(&mut body).unwrap();
+        let msg: protocol::ServerMsg = serde_json::from_slice(&body).unwrap();
+        assert!(matches!(msg, protocol::ServerMsg::ScreenUpdate { .. }));
+    }
+
     #[test]
     fn test_parse_dialog_keys() {
         // Plain text becomes chars.
