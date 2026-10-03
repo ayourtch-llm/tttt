@@ -90,6 +90,8 @@ impl Grid {
         self.row_clamp_top(false);
         self.row_clamp_bottom(false);
         self.col_clamp();
+        self.saved_pos.row = self.saved_pos.row.min(size.rows - 1);
+        self.saved_pos.col = self.saved_pos.col.min(size.cols - 1);
     }
 
     pub fn pos(&self) -> Pos {
