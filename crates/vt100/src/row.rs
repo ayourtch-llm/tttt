@@ -72,6 +72,9 @@ impl Row {
 
     pub fn resize(&mut self, len: u16, cell: crate::cell::Cell) {
         self.cells.resize(usize::from(len), cell);
+        if let Some(last_cell) = self.cells.last_mut().filter(|cell| cell.is_wide()) {
+            last_cell.clear(*last_cell.attrs());
+        }
         self.wrapped = false;
     }
 
