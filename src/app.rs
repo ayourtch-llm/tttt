@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::injected_enter::PendingEnter;
+use crate::pending_input::{PendingInput, SchedulerInputConfig};
 use crate::reload::{self, SavedState, SavedSession, SavedCronJob, SavedWatcher};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -696,10 +697,10 @@ pub struct App {
     /// Pending Enter keystrokes for injections (cron, reminder, notification),
     /// sent after a delay so the target app processes the text before submission.
     pending_delayed_enters: Vec<PendingEnter>,
-    /// Direct keyboard input waiting for a non-blocking PTY write. Bytes are
-    /// ordered per session so a busy child cannot stall the TUI event loop.
-    pending_user_input:
-        std::collections::HashMap<String, std::collections::VecDeque<u8>>,
+    /// Keyboard bytes and paced scheduler text waiting for non-blocking writes.
+    /// User input retains priority and its original unpaced delivery.
+    pending_input: std::collections::HashMap<String, PendingInput>,
+    scheduler_input_config: SchedulerInputConfig,
     /// Context refresh requests scheduled by the MCP handoff tool.
     context_refresh_queue: SharedContextRefreshQueue,
     /// Startup messages (web URL, listener warnings) queued before the root
@@ -850,7 +851,8 @@ impl App {
             last_session_snapshot: Vec::new(),
             deferred_scheduler_events: Vec::new(),
             pending_delayed_enters: Vec::new(),
-            pending_user_input: std::collections::HashMap::new(),
+            pending_input: std::collections::HashMap::new(),
+            scheduler_input_config: SchedulerInputConfig::from_env(),
             context_refresh_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             startup_messages: Vec::new(),
             web_status: None,
@@ -1647,7 +1649,7 @@ impl App {
         self.render_frame()?;
 
         loop {
-            self.drain_pending_user_input();
+            self.drain_pending_input();
 
             // Get active PTY fd for polling (short lock)
             let pty_fd = self.active_session.as_ref().and_then(|id| {
@@ -1659,12 +1661,17 @@ impl App {
                 unsafe { BorrowedFd::borrow_raw(stdin_fd) }, PollFlags::POLLIN,
             );
             // Shorter poll timeout when we have a pending render (for debounce responsiveness)
-            let poll_timeout_ms =
-                if self.server_render_dirty || !self.pending_user_input.is_empty() {
-                    10u16
-                } else {
-                    50u16
-                };
+            let user_input_waiting = self.pending_input.values().any(|input| !input.user.is_empty());
+            let poll_timeout_ms = if self.server_render_dirty || user_input_waiting {
+                10u16
+            } else {
+                50u16
+            };
+
+            let now = Instant::now();
+            let poll_timeout_ms = self.pending_input.values().fold(
+                poll_timeout_ms, |timeout, input| input.poll_timeout_ms(now, timeout),
+            );
 
             let poll_result = if let Some(pty_raw_fd) = pty_fd {
                 let pty_pfd = PollFd::new(
@@ -1719,7 +1726,7 @@ impl App {
                                     }
                                 }
                             }
-                            self.drain_pending_user_input();
+                            self.drain_pending_input();
                         }
                         Err(nix::errno::Errno::EAGAIN) => {}
                         Err(e) => return Err(Box::new(e)),
@@ -1972,43 +1979,44 @@ impl App {
     }
 
     fn queue_user_input(&mut self, session_id: &str, data: &[u8]) {
-        self.pending_user_input
+        self.pending_input
             .entry(session_id.to_string())
             .or_default()
+            .user
             .extend(data);
     }
 
     /// Make one non-blocking write attempt for each session with queued input.
-    fn drain_pending_user_input(&mut self) {
-        let ids: Vec<String> = self.pending_user_input.keys().cloned().collect();
+    fn drain_pending_input(&mut self) {
+        let ids: Vec<String> = self.pending_input.keys().cloned().collect();
         let mut failed = Vec::new();
         {
             let mut mgr = self.sessions.lock().unwrap();
             for id in &ids {
-                let Some(queue) = self.pending_user_input.get_mut(id) else {
+                let Some(queue) = self.pending_input.get_mut(id) else {
                     continue;
                 };
                 let result = match mgr.get_mut(id) {
-                    Ok(session) => session.try_send_raw(queue.make_contiguous()),
+                    Ok(session) => {
+                        queue.drain(session, &mut self.pending_delayed_enters, Instant::now())
+                    }
                     Err(e) => Err(e),
                 };
                 match result {
-                    Ok(n) => {
-                        queue.drain(..n.min(queue.len()));
-                    }
+                    Ok(()) => {}
                     Err(e) => failed.push((id.clone(), e.to_string())),
                 }
             }
         }
 
-        self.pending_user_input.retain(|id, queue| {
+        self.pending_input.retain(|id, queue| {
             !queue.is_empty() && !failed.iter().any(|(failed_id, _)| failed_id == id)
         });
         for (id, error) in failed {
             let _ = self.logger.log_event(&LogEvent::new(
                 id,
                 LogDirection::Meta,
-                format!("Interactive input dropped: {error}").into_bytes(),
+                format!("Pending input dropped: {error}").into_bytes(),
             ));
         }
     }
@@ -2974,12 +2982,11 @@ impl App {
                             self.deferred_scheduler_events.push(event);
                             return;
                         }
-                        let text = format!("[ENTER][REMINDER: {}]", reminder.message);
-                        if session.send_keys(&text).is_ok() {
-                            self.pending_delayed_enters.push(PendingEnter::new(
-                                session, &text, Instant::now(),
-                            ));
-                        }
+                        let _ = self.pending_input.entry(session.id.clone()).or_default()
+                            .send_scheduler(
+                                &event, session, self.scheduler_input_config,
+                                &mut self.pending_delayed_enters, Instant::now(),
+                            );
                     }
                 }
             }
@@ -3005,15 +3012,11 @@ impl App {
                             }
                             return;
                         }
-                        // Send text first, then queue a delayed [ENTER] so the target
-                        // app has time to process the text before submission.
-                        let cmd = job.command.trim_end_matches(|c| c == '\r' || c == '\n');
-                        let text = format!("[ENTER][CRON {}]: {}", job.id, cmd);
-                        if session.send_keys(&text).is_ok() {
-                            self.pending_delayed_enters.push(PendingEnter::new(
-                                session, &text, Instant::now(),
-                            ));
-                        }
+                        let _ = self.pending_input.entry(session.id.clone()).or_default()
+                            .send_scheduler(
+                                &event, session, self.scheduler_input_config,
+                                &mut self.pending_delayed_enters, Instant::now(),
+                            );
                     }
                 }
             }
@@ -3061,33 +3064,15 @@ impl App {
                 }
             };
             if is_idle && target_id.is_some() {
-                // Inject now
-                match &event {
-                    SchedulerEvent::ReminderFired(reminder) => {
-                        let sid = target_id.unwrap();
-                        let mut mgr = self.sessions.lock().unwrap();
-                        if let Ok(session) = mgr.get_mut(&sid) {
-                            let text = format!("[ENTER][REMINDER: {}]", reminder.message);
-                            if session.send_keys(&text).is_ok() {
-                                self.pending_delayed_enters.push(PendingEnter::new(
-                                    session, &text, Instant::now(),
-                                ));
-                            }
-                        }
-                    }
-                    SchedulerEvent::CronFired(job) => {
-                        let sid = target_id.unwrap();
-                        let mut mgr = self.sessions.lock().unwrap();
-                        if let Ok(session) = mgr.get_mut(&sid) {
-                            let cmd = job.command.trim_end_matches(|c| c == '\r' || c == '\n');
-                            let text = format!("[ENTER][CRON {}]: {}", job.id, cmd);
-                            if session.send_keys(&text).is_ok() {
-                                self.pending_delayed_enters.push(PendingEnter::new(
-                                    session, &text, Instant::now(),
-                                ));
-                            }
-                        }
-                    }
+                // Use the same paced delivery for deferred cron and reminder events.
+                let sid = target_id.unwrap();
+                let mut mgr = self.sessions.lock().unwrap();
+                if let Ok(session) = mgr.get_mut(&sid) {
+                    let _ = self.pending_input.entry(sid).or_default()
+                        .send_scheduler(
+                            &event, session, self.scheduler_input_config,
+                            &mut self.pending_delayed_enters, Instant::now(),
+                        );
                 }
             } else {
                 still_deferred.push(event);
@@ -3103,7 +3088,7 @@ impl App {
             &mut self.sessions.lock().unwrap(),
             &mut self.logger,
             Instant::now(),
-            |id| self.pending_user_input.get(id).is_some_and(|input| !input.is_empty()),
+            |id| self.pending_input.get(id).is_some_and(|input| !input.is_empty()),
         );
     }
 

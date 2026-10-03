@@ -4,6 +4,7 @@ mod config;
 pub mod ctl;
 mod diag;
 mod injected_enter;
+mod pending_input;
 mod reload;
 mod replay_tui;
 mod web;
