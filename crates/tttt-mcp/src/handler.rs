@@ -1684,6 +1684,76 @@ mod tests {
     }
 
     #[test]
+    fn timeout_idle_negative_returns_mcp_error() {
+        let mut handler = make_handler_with_session();
+        let result = handler.handle_tool_call(
+            "tttt_pty_wait_for_idle",
+            &json!({"session_id": "pty-1", "timeout": -1}),
+        );
+        assert!(matches!(result, Err(McpError::InvalidParams(_))));
+    }
+
+    #[test]
+    fn timeout_idle_huge_does_not_panic() {
+        let mut handler = make_handler_with_session();
+        let result = handler
+            .handle_tool_call(
+                "tttt_pty_wait_for_idle",
+                &json!({"session_id": "pty-1", "idle_seconds": 0, "timeout": f64::MAX}),
+            )
+            .unwrap();
+        assert_eq!(result["status"], "idle");
+    }
+
+    #[test]
+    fn timeout_milliseconds_negative_returns_mcp_error() {
+        let mut handler = make_handler_with_session();
+        let result = handler.handle_tool_call(
+            "tttt_pty_wait_for",
+            &json!({"session_id": "pty-1", "pattern": "", "timeout_ms": -1}),
+        );
+        assert!(matches!(result, Err(McpError::InvalidParams(_))));
+    }
+
+    #[test]
+    fn timeout_milliseconds_huge_does_not_panic() {
+        let mut handler = make_handler_with_session();
+        let result = handler
+            .handle_tool_call(
+                "tttt_pty_wait_for",
+                &json!({"session_id": "pty-1", "pattern": "", "timeout_ms": u64::MAX}),
+            )
+            .unwrap();
+        assert_eq!(result["status"], "matched");
+    }
+
+    #[test]
+    fn timeout_reminder_huge_is_clamped_to_one_day() {
+        let mut handler = SchedulerToolHandler::new_owned(Scheduler::new());
+        handler
+            .handle_tool_call(
+                "tttt_reminder_set",
+                &json!({"message": "test", "delay_seconds": u64::MAX}),
+            )
+            .unwrap();
+        let scheduler = handler.scheduler().lock().unwrap();
+        let reminders = scheduler.list_reminders(Instant::now());
+        assert_eq!(reminders.len(), 1);
+        assert!(reminders[0].1 <= Duration::from_secs(86_400));
+        assert!(reminders[0].1 >= Duration::from_secs(86_399));
+    }
+
+    #[test]
+    fn timeout_reminder_negative_returns_mcp_error() {
+        let mut handler = SchedulerToolHandler::new_owned(Scheduler::new());
+        let result = handler.handle_tool_call(
+            "tttt_reminder_set",
+            &json!({"message": "test", "delay_seconds": -1}),
+        );
+        assert!(matches!(result, Err(McpError::InvalidParams(_))));
+    }
+
+    #[test]
     fn test_pty_launch_mock() {
         let handler = make_handler();
         let result = handler.handle_pty_launch_mock(&json!({})).unwrap();
