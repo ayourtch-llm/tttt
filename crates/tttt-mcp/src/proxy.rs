@@ -694,7 +694,10 @@ mod tests {
         }
     }
 
-    fn read_test_response(client: &mut UnixStream, ndjson: bool) -> std::io::Result<serde_json::Value> {
+    fn read_test_response(
+        client: &mut UnixStream,
+        ndjson: bool,
+    ) -> std::io::Result<serde_json::Value> {
         let mut body = Vec::new();
         if ndjson {
             std::io::BufRead::read_until(&mut BufReader::new(client), b'\n', &mut body)?;
@@ -720,16 +723,18 @@ mod tests {
                 .handle_tool_call("tttt_pty_launch", &serde_json::json!({}))
                 .unwrap();
             let manager = handler.manager().clone();
-            let worker =
-                std::thread::spawn(move || handle_proxy_client(server, &mut handler, "test").unwrap());
+            let worker = std::thread::spawn(move || {
+                handle_proxy_client(server, &mut handler, "test").unwrap()
+            });
             let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tttt_pty_send_keys","arguments":{"session_id":"pty-1","keys":"quote notifications/cancelled"}}}"#;
             send_test_request(&mut client, request, ndjson);
             let response = read_test_response(&mut client, ndjson);
             client.shutdown(std::net::Shutdown::Both).unwrap();
             drop(client);
             worker.join().unwrap();
-            let response = response
-                .expect("tools/call must receive a response even when arguments quote cancellation");
+            let response = response.expect(
+                "tools/call must receive a response even when arguments quote cancellation",
+            );
             assert_eq!(response["id"], 1);
             assert!(response.get("error").is_none(), "{response}");
             let manager = manager.lock().unwrap();
@@ -791,8 +796,9 @@ mod tests {
                 token: None,
                 started,
             };
-            let worker =
-                std::thread::spawn(move || handle_proxy_client(server, &mut handler, "test").unwrap());
+            let worker = std::thread::spawn(move || {
+                handle_proxy_client(server, &mut handler, "test").unwrap()
+            });
             let request = r#"{"jsonrpc":"2.0","id":7,"method"  :  "tools/call","params":{"name":"wait","arguments":{}}}"#;
             send_test_request(&mut client, request, ndjson);
             ready.recv_timeout(Duration::from_secs(1)).unwrap();
