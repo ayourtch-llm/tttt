@@ -889,6 +889,79 @@ fn status_str(status: &SessionStatus) -> String {
 mod tests {
     use super::*;
 
+    async fn ws_handshake_status(origin: Option<&str>, token: Option<&str>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_, snapshot_rx) = tokio::sync::watch::channel(Arc::new(Snapshot::default()));
+        let mut auth = auth::Auth::none();
+        if let Some(token) = token {
+            auth.set_token(token.to_string());
+        }
+        let state = WebState {
+            sessions: Arc::new(Mutex::new(SessionManager::new())),
+            auth: Arc::new(auth),
+            work_dir: PathBuf::from("."),
+            snapshot_rx,
+            watched: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let app = Router::new().route("/ws", get(ws_handler)).with_state(state);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Use a fixed Host header; only the test's ephemeral listener is contacted.
+        let mut request = String::from(
+            "GET /ws HTTP/1.1\r\nHost: localhost:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+        );
+        if let Some(origin) = origin {
+            request.push_str(&format!("Origin: {origin}\r\n"));
+        }
+        if let Some(token) = token {
+            request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut response = Vec::new();
+            while !response.ends_with(b"\r\n\r\n") {
+                response.push(stream.read_u8().await.unwrap());
+            }
+            String::from_utf8(response).unwrap()
+        })
+        .await
+        .unwrap();
+        server.abort();
+        response.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn ws_cross_origin_is_forbidden() {
+        for token in [None, Some("test-token")] {
+            for origin in ["https://evil.example", "http://localhost:8081", "null"] {
+                assert_eq!(ws_handshake_status(Some(origin), token).await, 403);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_same_origin_upgrades() {
+        for token in [None, Some("test-token")] {
+            assert_eq!(
+                ws_handshake_status(Some("http://localhost:8080"), token).await,
+                101
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_without_origin_upgrades() {
+        for token in [None, Some("test-token")] {
+            assert_eq!(ws_handshake_status(None, token).await, 101);
+        }
+    }
+
     #[test]
     fn test_is_loopback() {
         assert!(is_loopback("127.0.0.1"));
