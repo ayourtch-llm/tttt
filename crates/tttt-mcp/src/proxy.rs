@@ -431,7 +431,7 @@ fn spawn_tui_socket_reader(
 
             // Check for cancel notifications inline and set the token immediately
             let req_str = String::from_utf8_lossy(&req_buf);
-            if req_str.contains("notifications/cancelled") {
+            if has_method(&req_buf, "notifications/cancelled") {
                 debug_log(&format!(
                     "cancel notification detected, setting token: {}",
                     truncate_str(&req_str, 200)
@@ -516,8 +516,7 @@ pub fn handle_proxy_client<H: crate::handler::ToolHandler>(
         ));
 
         // Check if this is a tools/call (potentially long-running)
-        let is_tools_call = req_str.contains("\"method\":\"tools/call\"")
-            || req_str.contains("\"method\": \"tools/call\"");
+        let is_tools_call = has_method(&req_buf, "tools/call");
 
         if is_tools_call {
             // Reset cancel token and set it on the handler before processing
@@ -588,6 +587,12 @@ pub fn handle_proxy_client<H: crate::handler::ToolHandler>(
     }
 
     Ok(())
+}
+
+fn has_method(request: &[u8], method: &str) -> bool {
+    serde_json::from_slice::<serde_json::Value>(request)
+        .ok()
+        .is_some_and(|request| request.get("method").and_then(|m| m.as_str()) == Some(method))
 }
 
 fn process_jsonrpc_request<H: crate::handler::ToolHandler>(
