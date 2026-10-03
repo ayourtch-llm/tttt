@@ -1,6 +1,52 @@
 #[cfg(test)]
 mod tests {
     #[test]
+    fn resize_clamps_saved_cursor_before_restore_and_print() {
+        for (save, restore) in [
+            (b"\x1b7".as_slice(), b"\x1b8".as_slice()),
+            (b"\x1b[s", b"\x1b[u"),
+        ] {
+            let mut parser = crate::Parser::new(24, 80, 0);
+            parser.process(b"\x1b[24;80H");
+            parser.process(save);
+            parser.set_size(5, 10);
+            parser.process(restore);
+            parser.process(b"X");
+            assert_eq!(parser.screen().cell(4, 9).unwrap().contents(), "X");
+        }
+    }
+
+    #[test]
+    fn resize_wide_boundary_can_erase_character() {
+        let mut parser = crate::Parser::new(2, 4, 0);
+        parser.process("ab界".as_bytes());
+        parser.set_size(2, 3);
+        parser.process(b"\x1b[1;3H\x1b[X");
+        assert_eq!(parser.screen().contents(), "ab");
+        assert!(!parser.screen().cell(0, 2).unwrap().is_wide());
+    }
+
+    #[test]
+    fn resize_wide_boundary_can_delete_character() {
+        let mut parser = crate::Parser::new(2, 4, 0);
+        parser.process("ab界".as_bytes());
+        parser.set_size(2, 3);
+        parser.process(b"\x1b[1;3H\x1b[P");
+        assert_eq!(parser.screen().contents(), "ab");
+        assert!(!parser.screen().cell(0, 2).unwrap().is_wide());
+    }
+
+    #[test]
+    fn resize_preserves_complete_wide_character() {
+        let mut parser = crate::Parser::new(2, 5, 0);
+        parser.process("ab界".as_bytes());
+        parser.set_size(2, 4);
+        assert_eq!(parser.screen().contents(), "ab界");
+        assert!(parser.screen().cell(0, 2).unwrap().is_wide());
+        assert!(parser.screen().cell(0, 3).unwrap().is_wide_continuation());
+    }
+
+    #[test]
     fn test_simple_newline() {
         let mut parser = crate::Parser::new(24, 80, 0);
 
