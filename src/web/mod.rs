@@ -908,9 +908,7 @@ mod tests {
     async fn ws_handshake_status(origin: Option<&str>, token: Option<&str>) -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (_, snapshot_rx) = tokio::sync::watch::channel(Arc::new(Snapshot::default()));
         let mut auth = auth::Auth::none();
@@ -924,7 +922,9 @@ mod tests {
             snapshot_rx,
             watched: Arc::new(Mutex::new(HashMap::new())),
         };
-        let app = Router::new().route("/ws", get(ws_handler)).with_state(state);
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .with_state(state);
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         // Use a fixed Host header; only the test's ephemeral listener is contacted.

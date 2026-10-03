@@ -124,7 +124,7 @@ pub fn pty_tool_definitions() -> Vec<Value> {
                 "properties": {
                     "session_id": { "type": "string", "description": "Target session ID" },
                     "pattern": { "type": "string", "description": "Regex pattern to match against screen content" },
-                    "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default: 30000)" }
+                    "timeout_ms": { "type": "integer", "description": "Nonnegative timeout in milliseconds (default: 30000); values above 86400000 (one day) are clamped" }
                 },
                 "required": ["session_id", "pattern"]
             }
@@ -137,7 +137,7 @@ pub fn pty_tool_definitions() -> Vec<Value> {
                 "properties": {
                     "session_id": { "type": "string", "description": "Target session ID" },
                     "idle_seconds": { "type": "number", "description": "Seconds of silence to consider idle (default: 10)" },
-                    "timeout": { "type": "number", "description": "Max seconds to wait before returning timeout (default: 300)" },
+                    "timeout": { "type": "number", "description": "Nonnegative seconds to wait before returning timeout (default: 300); values above 86400 (one day) are clamped" },
                     "ignore_pattern": { "type": "string", "description": "Optional regex: text matching this pattern is stripped before idle detection (e.g. '\\\\d{2}:\\\\d{2}:\\\\d{2}' to ignore HH:MM:SS timestamps)" }
                 },
                 "required": ["session_id"]
@@ -224,7 +224,7 @@ pub fn scheduler_tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "message": { "type": "string", "description": "Reminder message" },
-                    "delay_seconds": { "type": "integer", "description": "Seconds from now" },
+                    "delay_seconds": { "type": "integer", "description": "Nonnegative seconds from now; values above 86400 (one day) are clamped" },
                     "session_id": { "type": "string", "description": "Target session ID or name. If omitted, defaults to the first (oldest) session — never the session that happens to be focused when the reminder fires." }
                 },
                 "required": ["message", "delay_seconds"]

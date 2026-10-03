@@ -14,6 +14,48 @@ use tttt_scheduler::Scheduler;
 /// A token that can be checked by long-running tool handlers to detect cancellation.
 pub type CancelToken = Arc<AtomicBool>;
 
+/// Wait timeouts and reminder delays are capped at one day.
+const MAX_DELAY_SECONDS: u64 = 86_400;
+
+fn bounded_seconds(value: &Value) -> Result<Duration> {
+    let seconds = if value.is_null() {
+        300.0
+    } else {
+        value
+            .as_f64()
+            .ok_or_else(|| McpError::InvalidParams("timeout must be a nonnegative number".into()))?
+    };
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(McpError::InvalidParams(
+            "timeout must be a finite nonnegative number".into(),
+        ));
+    }
+    Ok(Duration::from_secs_f64(
+        seconds.min(MAX_DELAY_SECONDS as f64),
+    ))
+}
+
+fn bounded_integer(value: &Value, default: Option<u64>, maximum: u64, name: &str) -> Result<u64> {
+    if let Some(value) = value.as_u64() {
+        return Ok(value.min(maximum));
+    }
+    if value.is_null() {
+        if let Some(default) = default {
+            return Ok(default);
+        }
+    }
+    // JSON can represent integers larger than u64 as finite floating-point numbers.
+    if value
+        .as_f64()
+        .is_some_and(|n| n.is_finite() && n >= maximum as f64 && n.fract() == 0.0)
+    {
+        return Ok(maximum);
+    }
+    Err(McpError::InvalidParams(format!(
+        "{name} must be a nonnegative integer"
+    )))
+}
+
 /// Parse a rate limit reset time string from PTY screen text.
 /// Looks for patterns like "resets 2pm (Europe/Brussels)" or "resets 2:30pm (US/Pacific)".
 /// Returns `(hour_24, minute, timezone_str)` or `None` if not found.
@@ -262,13 +304,22 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         let pattern = args["pattern"]
             .as_str()
             .ok_or_else(|| McpError::InvalidParams("pattern required".to_string()))?;
-        let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(30000);
+        let timeout_ms = bounded_integer(
+            &args["timeout_ms"],
+            Some(30000),
+            MAX_DELAY_SECONDS * 1000,
+            "timeout_ms",
+        )?;
 
         let re = regex::Regex::new(pattern)
             .map_err(|e| McpError::InvalidParams(format!("invalid regex '{}': {}", pattern, e)))?;
 
         let start = Instant::now();
-        let deadline = start + Duration::from_millis(timeout_ms);
+        let deadline = start
+            .checked_add(Duration::from_millis(timeout_ms))
+            .ok_or_else(|| {
+                McpError::InvalidParams("timeout_ms exceeds this system's clock range".into())
+            })?;
 
         loop {
             if self.is_cancelled() {
@@ -316,6 +367,7 @@ impl<B: PtyBackend> PtyToolHandler<B> {
             .ok_or_else(|| McpError::InvalidParams("session_id required".to_string()))?;
         let idle_threshold = args["idle_seconds"].as_f64().unwrap_or(10.0);
         let timeout_secs = args["timeout"].as_f64().unwrap_or(300.0);
+        let timeout = bounded_seconds(&args["timeout"])?;
         debug_log(&format!("started: session={}, idle_threshold={}, timeout={}", session_id, idle_threshold, timeout_secs));
 
         let ignore_re = if let Some(pat) = args["ignore_pattern"].as_str() {
@@ -327,7 +379,9 @@ impl<B: PtyBackend> PtyToolHandler<B> {
         };
 
         let start = Instant::now();
-        let deadline = start + Duration::from_secs_f64(timeout_secs);
+        let deadline = start.checked_add(timeout).ok_or_else(|| {
+            McpError::InvalidParams("timeout exceeds this system's clock range".into())
+        })?;
 
         if let Some(re) = ignore_re {
             // Hash-based idle detection: strip ignore_pattern matches before hashing.
@@ -863,13 +917,20 @@ impl SchedulerToolHandler {
             .as_str()
             .ok_or_else(|| McpError::InvalidParams("message required".to_string()))?
             .to_string();
-        let delay_seconds = args["delay_seconds"]
-            .as_u64()
-            .ok_or_else(|| McpError::InvalidParams("delay_seconds required".to_string()))?;
+        let delay_seconds = bounded_integer(
+            &args["delay_seconds"],
+            None,
+            MAX_DELAY_SECONDS,
+            "delay_seconds",
+        )?;
 
         let session_id = args["session_id"].as_str().map(|s| s.to_string());
 
-        let fire_at = Instant::now() + Duration::from_secs(delay_seconds);
+        let fire_at = Instant::now()
+            .checked_add(Duration::from_secs(delay_seconds))
+            .ok_or_else(|| {
+                McpError::InvalidParams("delay_seconds exceeds this system's clock range".into())
+            })?;
         let mut sched = self
             .scheduler
             .lock()
@@ -1751,6 +1812,47 @@ mod tests {
             &json!({"message": "test", "delay_seconds": -1}),
         );
         assert!(matches!(result, Err(McpError::InvalidParams(_))));
+    }
+
+    #[test]
+    fn timeout_bounds_preserve_defaults_units_and_fractional_seconds() {
+        assert_eq!(
+            bounded_seconds(&Value::Null).unwrap(),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            bounded_seconds(&json!(0.125)).unwrap(),
+            Duration::from_millis(125)
+        );
+        assert_eq!(
+            bounded_seconds(&json!(f64::MAX)).unwrap(),
+            Duration::from_secs(86_400)
+        );
+        let max_ms = 86_400_000;
+        assert_eq!(
+            bounded_integer(&Value::Null, Some(30000), max_ms, "timeout_ms").unwrap(),
+            30000
+        );
+        assert_eq!(
+            bounded_integer(&json!(1000), None, max_ms, "timeout_ms").unwrap(),
+            1000
+        );
+        assert_eq!(
+            bounded_integer(&json!(u64::MAX), None, max_ms, "timeout_ms").unwrap(),
+            max_ms
+        );
+        assert_eq!(
+            bounded_integer(&json!(f64::MAX), None, max_ms, "timeout_ms").unwrap(),
+            max_ms
+        );
+        assert!(matches!(
+            bounded_integer(&json!(-1), None, max_ms, "timeout_ms"),
+            Err(McpError::InvalidParams(_))
+        ));
+        assert!(matches!(
+            bounded_integer(&json!(1.5), None, max_ms, "timeout_ms"),
+            Err(McpError::InvalidParams(_))
+        ));
     }
 
     #[test]
