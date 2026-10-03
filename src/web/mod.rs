@@ -377,6 +377,22 @@ async fn ws_handler(
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let same_origin = origin.to_str().ok().and_then(|origin| {
+            let origin: axum::http::Uri = origin.parse().ok()?;
+            if !matches!(origin.scheme_str(), Some("http" | "https"))
+                || origin.path() != "/"
+                || origin.query().is_some()
+            {
+                return None;
+            }
+            let host = headers.get(header::HOST)?.to_str().ok()?;
+            Some(origin.authority()?.as_str().eq_ignore_ascii_case(host))
+        });
+        if same_origin != Some(true) {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
     if state.auth.required() {
         // bcrypt verification is CPU-heavy (~tens of ms); keep it off the
         // small async worker pool so screen pushes aren't stalled.
