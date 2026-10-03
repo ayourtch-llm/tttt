@@ -73,8 +73,20 @@ impl ViewerClient {
             return false;
         }
 
+        self.send_screen_update_data(screen.contents_formatted(), cursor_row, cursor_col)
+    }
+
+    /// Send contents rendered while the session lock was held, after releasing it.
+    pub fn send_screen_update_data(
+        &mut self,
+        content: Vec<u8>,
+        cursor_row: u16,
+        cursor_col: u16,
+    ) -> bool {
+        if !self.connected {
+            return false;
+        }
         // Hash the screen content for change detection
-        let content = screen.contents_formatted();
         let hash = Self::hash_bytes(&content);
         let cursor = (cursor_row, cursor_col);
 
@@ -158,9 +170,27 @@ impl ViewerClient {
     /// Send an arbitrary protocol message to the client.
     pub fn send_msg(&mut self, msg: &ServerMsg) -> bool {
         let data = encode_message(msg);
-        // Temporarily set blocking for writes to ensure delivery
-        let _ = self.stream.set_nonblocking(false);
-        let result = match self.stream.write_all(&data) {
+        // Bound the whole message, including partial writes, to 250 ms.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let write_result = (|| {
+            self.stream.set_nonblocking(false)?;
+            let mut remaining = data.as_slice();
+            while !remaining.is_empty() {
+                let timeout = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .filter(|d| !d.is_zero())
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
+                self.stream.set_write_timeout(Some(timeout))?;
+                match self.stream.write(remaining) {
+                    Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                    Ok(n) => remaining = &remaining[n..],
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        })();
+        let result = match write_result {
             Ok(()) => {
                 let _ = self.stream.flush();
                 true

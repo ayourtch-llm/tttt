@@ -3451,17 +3451,21 @@ impl App {
     }
 
     fn update_viewers(&mut self) {
-        let mgr = self.sessions.lock().unwrap();
         for client in &mut self.viewer_clients {
             if !client.connected {
                 continue;
             }
             if let Some(ref sid) = client.active_session.clone() {
-                if let Ok(session) = mgr.get(sid) {
-                    let (row, col) = session.cursor_position();
-                    let screen = session.screen().screen();
-                    let screen_data_len = screen.contents_formatted().len();
-                    let sent = client.send_screen_update(screen, row, col);
+                let update = {
+                    let mgr = self.sessions.lock().unwrap();
+                    mgr.get(sid).ok().map(|session| {
+                        let (row, col) = session.cursor_position();
+                        (session.screen().screen().contents_formatted(), row, col)
+                    })
+                };
+                if let Some((content, row, col)) = update {
+                    let screen_data_len = content.len();
+                    let sent = client.send_screen_update_data(content, row, col);
                     let _ = self.logger.log_event(&LogEvent::new(
                         "viewer".to_string(), LogDirection::Meta,
                         format!("UPDATE: sid={}, sent={}, screen_data_len={}, cursor=({},{})", sid, sent, screen_data_len, row, col).into_bytes(),
